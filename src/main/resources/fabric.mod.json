@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "id": "blockbard",
+  "version": "${version}",
+  "name": "BlockBard",
+  "description": "Automated NoteBlock organ performer \u2014 load MIDI files, auto-tune your noteblocks, and play songs.",
+  "authors": [
+    "kyrielie"
+  ],
+  "contact": {
+    "homepage": "https://github.com/kyrielie/blockbard",
+    "sources": "https://github.com/kyrielie/blockbard"
+  },
+  "license": "MIT",
+  "icon": "assets/blockbard/icon.png",
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      {
+        "value": "kyrielie.blockbard.client.BlockBardClient",
+        "adapter": "kotlin"
+      }
+    ],
+    "modmenu": [
+      {
+        "value": "kyrielie.blockbard.client.gui.BlockBardModMenuIntegration",
+        "adapter": "kotlin"
+      }
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.19.3",
+    "minecraft": "~26.2",
+    "java": ">=25",
+    "fabric-api": "*",
+    "fabric-language-kotlin": "*"
+  },
+  "recommends": {
+    "modmenu": "*"
+  }
+}

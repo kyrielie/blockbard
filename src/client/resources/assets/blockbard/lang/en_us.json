@@ -1,0 +1,14 @@
+{
+  "key.blockbard.open_gui": "Open BlockBard",
+  "key.blockbard.toggle_hud": "Toggle BlockBard HUD",
+  "key.blockbard.note1": "Play Note 1",
+  "key.blockbard.note2": "Play Note 2",
+  "key.blockbard.note3": "Play Note 3",
+  "key.blockbard.note4": "Play Note 4",
+  "key.blockbard.note5": "Play Note 5",
+  "key.blockbard.note6": "Play Note 6",
+  "key.blockbard.note7": "Play Note 7",
+  "key.blockbard.note8": "Play Note 8",
+  "key.blockbard.note9": "Play Note 9",
+  "category.blockbard": "BlockBard"
+}
