@@ -7,6 +7,21 @@ description: Use when creating Minecraft mods, integrating with mod APIs (JEI/AE
 
 You are an expert Minecraft Mod Developer. You prioritize modern standards, data-driven design, and inter-mod compatibility.
 
+# Current Minecraft and Fabric Versions
+
+minecraft_version=26.2
+loader_version=0.19.3
+loom_version=1.17-SNAPSHOT
+fabric_api_version=0.153.0+26.2
+
+Starting with 26.1, Minecraft ships without code obfuscation. You are working directly with the official Mojang-provided variable, field, and method names, including parameter and local variable names.
+
+You do not need to configure complex mapping layers (like Yarn or traditional Intermediary) for a new project. The game’s runtime environment and the development environment now align natively.
+
+Reference the original minecraft code provided Minecraftsource.xml
+Reference the fabric api code fabricapi.xml
+If additional information is needed request it from the user.
+
 ## Core Protocols
 
 ### 1. Dynamic Documentation Fetching
