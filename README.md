@@ -4,6 +4,14 @@
 
 Load a MIDI or NBS file, let BlockBard scan your noteblock organ, auto-tune every block, and play your song hands-free.
 
+## LLM workflow
+
+1. stupid llm has no knowledge about current minecraft version. started from fabric template mod to get it to build at all https://fabricmc.net/develop/template/
+2. it used old classes from yarn mappings and old fabric api versions or hallucinated stuff. must include SKILL for minecraft coding, entire minecraft deobfuscated code (unzip clientonlysources.jar and repomix that) found in .gradle/loom-cache/minecraftmaven etc.
+3. use repomix for easier browser llm use, if not use rtk https://github.com/rtk-ai/rtk and claude-token-efficient https://github.com/drona23/claude-token-efficient
+4. find open source mods that are updated and reference their build.gradle because the llm will do dependencies wrong
+
+
 ## Features
 
 - **MIDI & NBS playback** — drop `.mid`/`.midi`/`.nbs` files into `config/blockbard/midis/` and pick them from the in-game GUI
