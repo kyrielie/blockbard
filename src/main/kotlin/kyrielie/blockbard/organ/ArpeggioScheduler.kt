@@ -1,6 +1,7 @@
 package kyrielie.blockbard.organ
 
 import net.minecraft.core.BlockPos
+import org.slf4j.LoggerFactory
 
 data class NoteRequest(
     val midiNote: Int,
@@ -15,6 +16,8 @@ data class NoteRequest(
  * [interactDelegate], which is wired by BlockBardClient on the client side to PlayerController.
  */
 object ArpeggioScheduler {
+
+    private val logger = LoggerFactory.getLogger("BlockBard/ArpeggioScheduler")
 
     /** Set by MidiToOrganMapper to map midiNote → the assigned BlockPos. */
     var assignment: Map<Int, BlockPos> = emptyMap()
@@ -32,23 +35,41 @@ object ArpeggioScheduler {
 
     /** Called every ClientTickEvent. Dispatches one queued note per tick. */
     fun onTick() {
-        if (queue.isEmpty()) return
-        val request = queue.removeFirst()
-        val age = System.currentTimeMillis() - request.enqueuedAtMs
-        if (age > staleTimeoutMs) {
-            onTick()  // skip stale, try next
+        // Iterative stale-skip — no recursion risk
+        while (queue.isNotEmpty()) {
+            val request = queue.removeFirst()
+            val age = System.currentTimeMillis() - request.enqueuedAtMs
+            if (age > staleTimeoutMs) {
+                logger.debug("ArpeggioScheduler: dropping stale note ${request.midiNote} (age ${age}ms > ${staleTimeoutMs}ms)")
+                continue
+            }
+            val pos = request.resolvedPos
+                ?: assignment[request.midiNote]
+                ?: NoteBlockRegistry.findBestForMidi(request.midiNote)?.pos
+
+            if (pos == null) {
+                logger.warn("ArpeggioScheduler: no block found for MIDI note ${request.midiNote} — skipping")
+                return
+            }
+
+            logger.debug("ArpeggioScheduler: dispatching MIDI ${request.midiNote} → $pos")
+            val dispatched = interactDelegate?.invoke(pos) ?: false
+            if (!dispatched) {
+                logger.warn("ArpeggioScheduler: interactDelegate returned false for $pos (MIDI ${request.midiNote})")
+            }
             return
         }
-        val pos = request.resolvedPos
-            ?: assignment[request.midiNote]
-            ?: NoteBlockRegistry.findBestForMidi(request.midiNote)?.pos
-            ?: return
-        interactDelegate?.invoke(pos)
     }
 
-    fun enqueue(request: NoteRequest) { queue.addLast(request) }
+    fun enqueue(request: NoteRequest) {
+        logger.debug("ArpeggioScheduler: enqueue MIDI ${request.midiNote} resolvedPos=${request.resolvedPos}")
+        queue.addLast(request)
+    }
 
-    fun clear() = queue.clear()
+    fun clear() {
+        logger.info("ArpeggioScheduler: queue cleared (had ${queue.size} items)")
+        queue.clear()
+    }
 
     fun isEmpty(): Boolean = queue.isEmpty()
 

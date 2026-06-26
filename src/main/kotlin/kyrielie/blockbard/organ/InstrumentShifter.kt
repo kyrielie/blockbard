@@ -1,5 +1,7 @@
 package kyrielie.blockbard.organ
 
+import kyrielie.blockbard.util.coversNatively
+
 enum class ShiftMode {
     EXACT_ONLY,       // Skip the note if no exact match
     INSTRUMENT_SHIFT, // Use a different instrument that natively covers this note
@@ -40,10 +42,14 @@ object InstrumentShifter {
             .filter { it.midiNote == midiNote }
             .minByOrNull { it.distanceFromPlayer }
 
-    /** Instrument shift: find any block whose instrument range natively covers this note. */
+    /**
+     * Instrument shift: find any block whose instrument natively covers this MIDI note,
+     * regardless of what the block's current tuning is (it will be re-tuned).
+     * This is distinct from findExact — it checks the instrument's *range*, not the current note.
+     */
     private fun findInstrumentShift(midiNote: Int, candidates: List<NoteBlockEntry>): ShiftResult? =
         candidates
-            .filter { it.midiNote == midiNote }
+            .filter { it.instrument.coversNatively(midiNote) }
             .minByOrNull { it.distanceFromPlayer }
             ?.let { ShiftResult(it, 0) }
 
