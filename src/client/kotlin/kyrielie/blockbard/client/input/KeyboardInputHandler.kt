@@ -4,7 +4,8 @@ import kyrielie.blockbard.client.config.ConfigManager
 import kyrielie.blockbard.organ.ArpeggioScheduler
 import kyrielie.blockbard.organ.NoteRequest
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents
-import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper
+// KeyBindingHelper → KeyMappingHelper (fabric-key-mapping-api-v1)
+import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper
 import net.minecraft.client.KeyMapping
 import net.minecraft.client.Minecraft
 import org.lwjgl.glfw.GLFW
@@ -15,11 +16,12 @@ object KeyboardInputHandler {
 
     fun register() {
         for (i in 1..9) {
-            val key = KeyBindingHelper.registerKeyBinding(
+            // KeyMapping constructor now takes KeyMapping.Category instead of a raw String
+            val key = KeyMappingHelper.registerKeyMapping(
                 KeyMapping(
                     "key.blockbard.note$i",
                     GLFW.GLFW_KEY_0 + i,
-                    "category.blockbard"
+                    KeyMapping.Category.MISC
                 )
             )
             keyBindings.add(key)
@@ -32,7 +34,8 @@ object KeyboardInputHandler {
 
     private fun onTick() {
         val mc = Minecraft.getInstance()
-        if (mc.screen != null) return  // Don't trigger during GUI
+        // Screen access: mc.gui.screen()
+        if (mc.gui.screen() != null) return  // Don't trigger during GUI
 
         val mappings = ConfigManager.config.keyMappings
         keyBindings.forEachIndexed { i, kb ->

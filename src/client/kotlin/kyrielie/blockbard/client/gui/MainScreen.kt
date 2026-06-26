@@ -5,13 +5,15 @@ import kyrielie.blockbard.client.playback.MidiFilePlayer
 import kyrielie.blockbard.client.playback.NbsFileLoader
 import kyrielie.blockbard.client.playback.NbsPlayer
 import kyrielie.blockbard.organ.*
+import kyrielie.blockbard.client.organ.OrganScanner
 import kyrielie.blockbard.client.player.CenterResult
 import kyrielie.blockbard.client.player.PlayerController
 import kyrielie.blockbard.util.midiNoteToName
 import net.fabricmc.loader.api.FabricLoader
-import net.minecraft.client.gui.GuiGraphics
+import net.minecraft.client.gui.GuiGraphicsExtractor          // was: GuiGraphics
 import net.minecraft.client.gui.components.Button
 import net.minecraft.client.gui.screens.Screen
+import net.minecraft.client.input.MouseButtonEvent             // new: event object for mouseClicked
 import net.minecraft.network.chat.Component
 import java.io.File
 
@@ -232,17 +234,19 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
         }
     }
 
-    override fun render(guiGraphics: GuiGraphics, mouseX: Int, mouseY: Int, partialTick: Float) {
-        renderBackground(guiGraphics, mouseX, mouseY, partialTick)
-        super.render(guiGraphics, mouseX, mouseY, partialTick)
+    // render() → extractRenderState()  (GuiGraphics → GuiGraphicsExtractor)
+    // renderBackground() → extractBackground()
+    override fun extractRenderState(graphics: GuiGraphicsExtractor, mouseX: Int, mouseY: Int, partialTick: Float) {
+        // Do NOT call extractBackground() here — the engine already calls it before invoking
+        // extractRenderState() via extractRenderStateWithTooltipAndSubtitles().
+        // Calling it again triggers "Can only blur once per frame".
+        super.extractRenderState(graphics, mouseX, mouseY, partialTick)
 
-        val font = minecraft!!.font
+        val font = minecraft.font
 
-        // Title
-        guiGraphics.drawString(font, "♪ BlockBard", 10, 10, 0xFFFFAA)
-
-        // File list header
-        guiGraphics.drawString(font, "MIDI / NBS Files:", 10, 26, 0xCCCCCC)
+        // text() replaces drawString()
+        graphics.text(font, "♪ BlockBard", 10, 10, 0xFFFFAA)
+        graphics.text(font, "MIDI / NBS Files:", 10, 26, 0xCCCCCC)
 
         // File list
         val visibleFiles = midiFiles.drop(scrollOffset).take(maxVisible)
@@ -252,35 +256,34 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
             val color = if (realIdx == selectedIndex) 0x55FF55 else 0xDDDDDD
             val prefix = if (realIdx == selectedIndex) "▶ " else "  "
             val label = prefix + file.name.take(30)
-            guiGraphics.drawString(font, label, 34, y, color)
-            // Clickable area handled in mouseClicked
+            graphics.text(font, label, 34, y, color)
         }
 
         if (midiFiles.isEmpty()) {
-            guiGraphics.drawString(font, "(no files — drop .mid/.nbs in config/blockbard/midis/)", 10, 36, 0xAAAAAA)
+            graphics.text(font, "(no files — drop .mid/.nbs in config/blockbard/midis/)", 10, 36, 0xAAAAAA)
         }
 
         // Organ status
         val organY = 175
-        guiGraphics.drawString(font, "─── Organ ───", 10, organY, 0x88AAFF)
-        guiGraphics.drawString(font, organScanMessage, 10, organY + 12, 0xFFFFFF)
+        graphics.text(font, "─── Organ ───", 10, organY, 0x88AAFF)
+        graphics.text(font, organScanMessage, 10, organY + 12, 0xFFFFFF)
 
         // Instrument counts
         val counts = NoteBlockRegistry.countPerInstrument()
         var cy = organY + 24
         counts.entries.take(5).forEach { (inst, count) ->
-            guiGraphics.drawString(font, "${inst.name}: $count", 10, cy, 0xDDDDDD)
+            graphics.text(font, "${inst.name}: $count", 10, cy, 0xDDDDDD)
             cy += 10
         }
 
         if (coverageMessage.isNotEmpty()) {
-            guiGraphics.drawString(font, coverageMessage, 10, cy + 2, 0xFFCC44)
+            graphics.text(font, coverageMessage, 10, cy + 2, 0xFFCC44)
             cy += 12
         }
 
         if (tuner != null) {
             val (done, total) = tuneProgress
-            guiGraphics.drawString(font, "Tuning $done/$total blocks...", 10, cy + 2, 0x44FF88)
+            graphics.text(font, "Tuning $done/$total blocks...", 10, cy + 2, 0x44FF88)
         }
 
         // Playback status
@@ -290,26 +293,32 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
             MidiFilePlayer.isPaused -> "⏸ PAUSED"
             else -> "⏹ IDLE"
         }
-        guiGraphics.drawString(font, status, 10, pbY, 0xAAFFAA)
-        guiGraphics.drawString(font, "Tempo: ${"%.1f".format(MidiFilePlayer.tempoMultiplier)}x", 200, pbY, 0xCCCCCC)
+        graphics.text(font, status, 10, pbY, 0xAAFFAA)
+        graphics.text(font, "Tempo: ${"%.1f".format(MidiFilePlayer.tempoMultiplier)}x", 200, pbY, 0xCCCCCC)
     }
 
-    override fun mouseClicked(mouseX: Double, mouseY: Double, button: Int): Boolean {
-        // Check file list clicks
-        val visibleFiles = midiFiles.drop(scrollOffset).take(maxVisible)
-        visibleFiles.forEachIndexed { i, file ->
-            val y = 36 + i * 14
-            if (mouseX >= 34 && mouseX <= width - 10 && mouseY >= y && mouseY < y + 14) {
-                selectFile(file)
-                return true
+    // mouseClicked now takes (MouseButtonEvent, Boolean) instead of (Double, Double, Int)
+    override fun mouseClicked(event: MouseButtonEvent, doubleClick: Boolean): Boolean {
+        val mouseX = event.x()
+        val mouseY = event.y()
+        // Check file list clicks — only on primary (left) button
+        if (event.button() == 0) {
+            val visibleFiles = midiFiles.drop(scrollOffset).take(maxVisible)
+            visibleFiles.forEachIndexed { i, file ->
+                val y = 36 + i * 14
+                if (mouseX >= 34 && mouseX <= width - 10 && mouseY >= y && mouseY < y + 14) {
+                    selectFile(file)
+                    return true
+                }
             }
         }
-        return super.mouseClicked(mouseX, mouseY, button)
+        return super.mouseClicked(event, doubleClick)
     }
 
     override fun onClose() {
         ConfigManager.save()
-        minecraft?.setScreen(parent)
+        // setScreen is now on mc.gui, not mc directly
+        minecraft.gui.setScreen(parent)
     }
 
     override fun isPauseScreen(): Boolean = false

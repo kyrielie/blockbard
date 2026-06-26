@@ -80,7 +80,12 @@ object PlayerController {
         organMap = OrganMap(best, reachMap)
 
         if (best != playerPos) {
-            player.moveTo(best.x + 0.5, best.y.toDouble(), best.z + 0.5, player.yRot, player.xRot)
+            // moveTo() was removed. Use setPos(Vec3) to reposition, preserving current rotation.
+            // setPos takes a Vec3; yRot/xRot are set separately via their setters.
+            player.setPos(Vec3(best.x + 0.5, best.y.toDouble(), best.z + 0.5))
+            // Keep existing rotation — read via getters, re-apply via setters
+            player.setYRot(player.getYRot())
+            player.setXRot(player.getXRot())
         }
 
         val reachable = reachMap.values.count { it.isReachable }
@@ -99,8 +104,9 @@ object PlayerController {
         if (delta.length() > REACH_DISTANCE) return false
 
         val (yaw, pitch) = reach?.let { Pair(it.yaw, it.pitch) } ?: vecToYawPitch(delta)
-        player.yRot = yaw
-        player.xRot = pitch
+        // Use setters rather than direct field assignment — they propagate rotation correctly
+        player.setYRot(yaw)
+        player.setXRot(pitch)
 
         val hitResult = BlockHitResult(target, Direction.UP, pos, false)
         mc.gameMode?.useItemOn(player, InteractionHand.MAIN_HAND, hitResult)
