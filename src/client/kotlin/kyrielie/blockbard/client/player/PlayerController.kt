@@ -12,6 +12,7 @@ import net.minecraft.core.Direction
 import net.minecraft.world.InteractionHand
 import net.minecraft.world.level.GameType
 import net.minecraft.world.phys.BlockHitResult
+import net.minecraft.world.phys.HitResult
 import net.minecraft.world.phys.Vec3
 import org.slf4j.LoggerFactory
 
@@ -60,151 +61,64 @@ object PlayerController {
         )
     }
 
-    // RESOLVED — checked against LocalPlayer.java in the decompiled source:
-    // player.setPos() itself does NOT send any packet — it only mutates the client-side
-    // entity. But LocalPlayer.tick() unconditionally calls sendPosition() every tick
-    // (when isControlledCamera(), i.e. not spectating another entity, which is always
-    // true for normal BlockBard usage), and sendPosition() compares the current position
-    // against the last-sent one and fires a ServerboundMovePlayerPacket (Pos/PosRot)
-    // whenever the delta exceeds a tiny threshold (2e-4 blocks squared). A setPos() call
-    // from centerOnOrgan() therefore gets picked up and sent to the server automatically
-    // on the very next client tick — no explicit packet send is needed here, and Baritone
-    // (which also never calls setPos+send manually, only listens for the resulting
-    // ServerboundMovePlayerPacket) confirms this is the normal way mods drive movement.
-    //
-    // The one way this CAN still go wrong: if interactWith() is ever called in the same
-    // tick as centerOnOrgan() (before LocalPlayer.tick() has run again), the server would
-    // see the click before it sees the new position. In the current design this can't
-    // happen — centerOnOrgan() runs synchronously from a GUI button click, and all
-    // interacts are dispatched later via ArpeggioScheduler.onTick() in END_CLIENT_TICK,
-    // which is always at least one full tick later. So the original client/server position
-    // desync hypothesis for items 2 and 4 is NOT confirmed by the source — no code fix is
-    // needed here. If items 2/4 still reproduce on a public server after this logging pass,
-    // the cause is something else (server-side anti-cheat reach checks, server-side click
-    // rate limiting, an actual case of the same-tick ordering above, etc.) and the new
-    // interactWith()/tickScale() logging from this round should make that visible.
+    /**
+     * Builds the OrganMap from the player's current actual position.
+     *
+     * Does NOT move the player. setPos() is rejected by public servers (Netherite-Paper /
+     * Velocity rubber-bands the player back within one tick), so any position we set is
+     * immediately overwritten before the first interact fires. The map is built from
+     * wherever the player is standing right now — which is where they'll actually be
+     * during playback.
+     */
     fun centerOnOrgan(): CenterResult {
         val mc = Minecraft.getInstance()
         val player = mc.player ?: run {
             logger.warn("centerOnOrgan: no player")
             return CenterResult.NoPlayer
         }
-        val world = mc.level ?: run {
-            logger.warn("centerOnOrgan: no world")
-            return CenterResult.NoPlayer
-        }
 
         logEnvironmentBanner("centerOnOrgan")
 
-        logger.info("centerOnOrgan: entry pos=${player.position()} yRot=${player.yRot} xRot=${player.xRot} ping=${currentPingMs()}")
-
         val playableBlocks = NoteBlockRegistry.allPlayable()
-        logger.info("centerOnOrgan: ${playableBlocks.size} playable blocks found")
+        logger.info("centerOnOrgan: ${playableBlocks.size} playable blocks, player at ${player.position()} eyeHeight=${player.getEyeHeight()} ping=${currentPingMs()}")
         if (playableBlocks.isEmpty()) return CenterResult.NoBlocks
 
         val playerPos = player.blockPosition()
+        buildOrganMap(playableBlocks, playerPos, player.getEyeHeight())
 
-        // Helper: count reachable blocks from a given stand position.
-        // Uses player.getEyeHeight() (live, pose-aware) rather than a hardcoded 1.62 —
-        // interactWith() uses player.eyePosition, which is also pose-aware. Using a
-        // fixed constant here would silently disagree with interactWith if the player
-        // is crouching (or otherwise not in the STANDING pose) at Center time, which is
-        // a real candidate for the "wrong aim" bug in item 1: the precomputed reach/yaw/
-        // pitch would be built from the wrong eye height and stay wrong until re-centered.
-        fun countReachable(standPos: BlockPos): Int {
-            val eyePos = Vec3(standPos.x + 0.5, standPos.y + player.getEyeHeight().toDouble(), standPos.z + 0.5)
-            return playableBlocks.count { entry ->
-                val target = Vec3(entry.pos.x + 0.5, entry.pos.y + 1.0, entry.pos.z + 0.5)
-                eyePos.distanceTo(target) <= REACH_DISTANCE
+        val map = organMap!!
+        val reachableCount = map.reachableCount()
+        val unreachable = playableBlocks.filter { !map.isReachable(it.pos) }
+        if (unreachable.isNotEmpty()) {
+            logger.warn("centerOnOrgan: ${unreachable.size} blocks out of reach from $playerPos:")
+            unreachable.forEach { e ->
+                val dist = player.eyePosition.distanceTo(Vec3(e.pos.x + 0.5, e.pos.y + 1.0, e.pos.z + 0.5))
+                logger.warn("  unreachable: ${e.pos} dist=${"%.2f".format(dist)} instrument=${e.instrument.name}")
             }
         }
 
-        // Always start by evaluating the player's current block
-        val currentBlockReachable = countReachable(playerPos)
-        logger.info("centerOnOrgan: current block $playerPos covers $currentBlockReachable/${playableBlocks.size} blocks")
-
-        // If the player's current block already covers everything, just snap to block center — no teleport
-        if (currentBlockReachable == playableBlocks.size) {
-            logger.info("centerOnOrgan: current block is optimal — snapping to block center only")
-            val centeredX = playerPos.x + 0.5
-            val centeredZ = playerPos.z + 0.5
-            val currentX = player.x
-            val currentZ = player.z
-            logger.info("centerOnOrgan: [optimal branch] before setPos pos=${player.position()}")
-            // Only move if not already within the block (within 0.4 of center)
-            if (Math.abs(currentX - centeredX) > 0.05 || Math.abs(currentZ - centeredZ) > 0.05) {
-                player.setPos(Vec3(centeredX, player.y, centeredZ))
-                logger.info("centerOnOrgan: snapped to center of current block $playerPos")
-            } else {
-                logger.info("centerOnOrgan: already centered in block — no movement")
-            }
-            // Re-read rather than assume the setPos value took — something else (collision,
-            // server correction, another mod) may override it same-tick.
-            logger.info("centerOnOrgan: [optimal branch] after setPos pos=${player.position()} (re-read, not assumed)")
-            buildOrganMap(playableBlocks, playerPos, player.getEyeHeight())
-            return CenterResult.Centered(playerPos, currentBlockReachable, playableBlocks.size)
-        }
-
-        // Current block isn't optimal — search nearby for a better stand position
-        val avgX = playableBlocks.map { it.pos.x + 0.5 }.average()
-        val avgZ = playableBlocks.map { it.pos.z + 0.5 }.average()
-        val cX = avgX.toInt()
-        val cZ = avgZ.toInt()
-        val searchRadius = 6
-
-        val candidates = mutableListOf<BlockPos>()
-        for (x in -searchRadius..searchRadius) {
-            for (z in -searchRadius..searchRadius) {
-                val testPos = BlockPos(cX + x, playerPos.y, cZ + z)
-                val feetState = world.getBlockState(testPos)
-                val headState = world.getBlockState(testPos.above())
-                val floorState = world.getBlockState(testPos.below())
-                if (!feetState.isAir || !headState.isAir) continue
-                if (!floorState.canOcclude()) continue
-                candidates.add(testPos)
-            }
-        }
-
-        // Add current block as a candidate so it's always considered
-        if (playerPos !in candidates) candidates.add(playerPos)
-        logger.info("centerOnOrgan: ${candidates.size} stand position candidates")
-
-        val best = candidates.maxByOrNull { countReachable(it) } ?: playerPos
-        val bestReachable = countReachable(best)
-
-        buildOrganMap(playableBlocks, best, player.getEyeHeight())
-
-        logger.info("centerOnOrgan: [search branch] before setPos pos=${player.position()} chosenStand=$best")
-        if (best == playerPos) {
-            // Best position is the current block — just snap to center
-            val centeredX = playerPos.x + 0.5
-            val centeredZ = playerPos.z + 0.5
-            player.setPos(Vec3(centeredX, player.y, centeredZ))
-            logger.info("centerOnOrgan: current block is best ($bestReachable reachable) — snapped to center")
-        } else {
-            // Need to move to a different block
-            player.setPos(Vec3(best.x + 0.5, best.y.toDouble(), best.z + 0.5))
-            logger.info("centerOnOrgan: moved to $best ($bestReachable/${playableBlocks.size} reachable)")
-        }
-        // Re-read rather than assume — if this differs from what was just set, something
-        // else (collision, server correction, another mod) is overriding the position.
-        logger.info("centerOnOrgan: [search branch] after setPos pos=${player.position()} (re-read, not assumed)")
-
-        return CenterResult.Centered(best, bestReachable, playableBlocks.size)
+        logger.info("centerOnOrgan: map built — $reachableCount/${playableBlocks.size} reachable from player position")
+        return CenterResult.Centered(playerPos, reachableCount, playableBlocks.size)
     }
 
     private fun buildOrganMap(playableBlocks: List<kyrielie.blockbard.organ.NoteBlockEntry>, standPos: BlockPos, eyeHeight: Float) {
-        val eyePos = Vec3(standPos.x + 0.5, standPos.y + eyeHeight.toDouble(), standPos.z + 0.5)
+        // Use actual player position for the eye, not block-center. The player is never
+        // exactly at block center on a public server (setPos is rubber-banded), so computing
+        // reach from block-center produces distances that disagree with the live check in
+        // interactWith(). We still receive standPos for the BlockPos record in OrganMap.
+        val mc = Minecraft.getInstance()
+        val actualEyePos = mc.player?.eyePosition
+            ?: Vec3(standPos.x + 0.5, standPos.y + eyeHeight.toDouble(), standPos.z + 0.5)
         val reachMap = playableBlocks.associate { entry ->
             val target = Vec3(entry.pos.x + 0.5, entry.pos.y + 1.0, entry.pos.z + 0.5)
-            val delta = target.subtract(eyePos)
+            val delta = target.subtract(actualEyePos)
             val distance = delta.length()
             val isReachable = distance <= REACH_DISTANCE
             val (yaw, pitch) = if (isReachable) vecToYawPitch(delta) else Pair(0f, 0f)
             entry.pos to ReachInfo(isReachable, yaw, pitch, distance)
         }
         organMap = OrganMap(standPos, reachMap)
-        logger.info("buildOrganMap: ${reachMap.values.count { it.isReachable }}/${playableBlocks.size} reachable from $standPos (eyeHeight=$eyeHeight)")
+        logger.info("buildOrganMap: ${reachMap.values.count { it.isReachable }}/${playableBlocks.size} reachable from actualEye=$actualEyePos (standPos=$standPos)")
     }
 
     /**
@@ -229,16 +143,30 @@ object PlayerController {
         val delta = target.subtract(eyePos)
         val reach = organMap?.getReachInfo(pos)
         val (yaw, pitch) = reach?.let { Pair(it.yaw, it.pitch) } ?: vecToYawPitch(delta)
+        val yRotBefore = player.yRot
+        val xRotBefore = player.xRot
         player.setYRot(yaw)
         player.setXRot(pitch)
+        val yRotAfter = player.yRot
+        val xRotAfter = player.xRot
         primedRotation = Triple(pos, yaw, pitch)
-        logger.debug("primeRotation $pos: yaw=${"%.1f".format(yaw)} pitch=${"%.1f".format(pitch)}")
+        // Rotation readback: if after != what we set, something is overriding us this tick.
+        if (yRotAfter != yaw || xRotAfter != pitch) {
+            logger.warn(
+                "primeRotation $pos: rotation did not take! wanted yaw=${"%.2f".format(yaw)} pitch=${"%.2f".format(pitch)}" +
+                    " got yaw=${"%.2f".format(yRotAfter)} pitch=${"%.2f".format(xRotAfter)}" +
+                    " (before: yaw=${"%.2f".format(yRotBefore)} pitch=${"%.2f".format(xRotBefore)})"
+            )
+        } else {
+            logger.debug(
+                "primeRotation $pos: yaw ${"%.2f".format(yRotBefore)}->${"%.2f".format(yRotAfter)}" +
+                    " pitch ${"%.2f".format(xRotBefore)}->${"%.2f".format(xRotAfter)}"
+            )
+        }
     }
 
     /**
      * Sends a right-click interact to a noteblock.
-     * Uses Direction.UP always — noteblocks advance their note via useWithoutItem,
-     * which doesn't care about hit face direction.
      *
      * IMPORTANT: The player must have empty hands for useWithoutItem to be reached.
      * If the player holds any item, performUseItemOn() may short-circuit before
@@ -260,23 +188,17 @@ object PlayerController {
             return false
         }
 
-        // Phase 1: always use live distance — the organMap reachability flag was computed at
-        // Center time from a stand position the server may have since corrected. A block marked
-        // unreachable in the map can still be within actual reach if the player is at a slightly
-        // different position, and blocking on the stale flag was silently dropping every note on
-        // public servers where setPos() is overridden by server position correction.
         if (organMap == null) {
-            logger.warn("interactWith $pos: organMap is null (Center not pressed or cleared) — using live distance only")
+            logger.warn("interactWith $pos: organMap is null — Center not pressed yet")
         }
 
         val eyePos = player.eyePosition
         val target = Vec3(pos.x + 0.5, pos.y + 1.0, pos.z + 0.5)
         val delta = target.subtract(eyePos)
         val distance = delta.length()
-
-        // Log map distance alongside live distance so stale-map divergence is visible in logs.
         val reach = organMap?.getReachInfo(pos)
-        val mapDistStr = reach?.distance?.let { "%.2f".format(it) } ?: "n/a(no map)"
+        val mapDistStr = reach?.distance?.let { "%.2f".format(it) } ?: "n/a"
+
         if (distance > REACH_DISTANCE) {
             logger.warn(
                 "interactWith $pos: too far liveDist=${"%.2f".format(distance)} mapDist=$mapDistStr " +
@@ -285,21 +207,66 @@ object PlayerController {
             return false
         }
 
-        // Phase 2: rotation was primed one tick earlier by primeRotation() — read it back
-        // rather than recomputing, so the yaw/pitch sent in this tick's use packet matches
-        // exactly what was in the previous tick's movement packet (which the server used for
-        // hit validation). Fall back to live computation if primed rotation is stale/absent.
+        // Determine target rotation — prefer primed value (set one tick earlier in START_CLIENT_TICK),
+        // fall back to map precompute, fall back to live computation.
         val (yaw, pitch) = primedRotation?.takeIf { it.first == pos }
             ?.let { Pair(it.second, it.third) }
             ?: (reach?.let { Pair(it.yaw, it.pitch) } ?: vecToYawPitch(delta))
         primedRotation = null
 
-        // Direction.UP is correct for noteblocks — useWithoutItem ignores hit face
-        val hitResult = BlockHitResult(target, Direction.UP, pos, false)
-        logger.debug(
-            "interactWith $pos: useItemOn liveDist=${"%.2f".format(distance)} mapDist=$mapDistStr " +
-                "yaw=${"%.1f".format(yaw)} pitch=${"%.1f".format(pitch)} ping=${currentPingMs()}"
+        // Re-apply rotation immediately before firing useItemOn — same approach as the old
+        // working version. The primeRotation in START_CLIENT_TICK gets the rotation into the
+        // movement packet; re-applying here ensures the rotation is correct for the use packet
+        // regardless of whether anything overwrote it between START and END tick.
+        val yRotBefore = player.yRot
+        val xRotBefore = player.xRot
+        player.setYRot(yaw)
+        player.setXRot(pitch)
+        val yRotAfter = player.yRot
+        val xRotAfter = player.xRot
+        if (yRotAfter != yaw || xRotAfter != pitch) {
+            logger.warn(
+                "interactWith $pos: rotation override detected — wanted yaw=${"%.2f".format(yaw)} pitch=${"%.2f".format(pitch)}" +
+                    " got yaw=${"%.2f".format(yRotAfter)} pitch=${"%.2f".format(xRotAfter)}"
+            )
+        }
+        logger.info(
+            "interactWith $pos: rot ${"%.2f".format(yRotBefore)},${"%.2f".format(xRotBefore)}" +
+                " -> ${"%.2f".format(yRotAfter)},${"%.2f".format(xRotAfter)}" +
+                " liveDist=${"%.2f".format(distance)} mapDist=$mapDistStr ping=${currentPingMs()}"
         )
+
+        // Derive hit face from approach direction — same as old working version.
+        // Direction.UP is wrong for blocks approached horizontally.
+        val hitFace = when {
+            Math.abs(delta.x) > Math.abs(delta.y) && Math.abs(delta.x) > Math.abs(delta.z) ->
+                if (delta.x > 0) Direction.WEST else Direction.EAST
+            Math.abs(delta.y) > Math.abs(delta.z) ->
+                if (delta.y > 0) Direction.DOWN else Direction.UP
+            else ->
+                if (delta.z > 0) Direction.NORTH else Direction.SOUTH
+        }
+
+        // Use mc.hitResult when it's pointing at our block — the server-side validation
+        // may check that the hit position is consistent with the player's facing.
+        val liveHit = mc.hitResult
+        val hitResult: BlockHitResult = if (
+            liveHit is BlockHitResult &&
+            liveHit.blockPos == pos &&
+            liveHit.type == HitResult.Type.BLOCK
+        ) {
+            logger.debug("interactWith $pos: using live hitResult face=${liveHit.direction}")
+            liveHit
+        } else {
+            val liveDesc = when (liveHit) {
+                is BlockHitResult -> "BlockHit(${liveHit.blockPos},${liveHit.direction})"
+                null -> "null"
+                else -> liveHit.type.name
+            }
+            logger.debug("interactWith $pos: hitResult not on target ($liveDesc) — using synthetic face=$hitFace")
+            BlockHitResult(target, hitFace, pos, false)
+        }
+
         mc.gameMode?.useItemOn(player, InteractionHand.MAIN_HAND, hitResult)
         return true
     }
