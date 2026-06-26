@@ -62,6 +62,11 @@ src/
             input/
               KeyboardInputHandler.kt
               MidiInputHandler.kt
+            midi/
+              FallbackMapper.kt
+              MidiChannelResolver.kt
+              MidiInstrumentMap.kt
+              OrganReadinessChecker.kt
             organ/
               OrganScanner.kt
             playback/
@@ -115,6 +120,776 @@ SKILL.md
 
 <files>
 This section contains the contents of the repository's files.
+
+<file path="src/client/kotlin/kyrielie/blockbard/client/midi/FallbackMapper.kt">
+package kyrielie.blockbard.midi
+
+import kyrielie.blockbard.organ.NoteBlockRegistry
+import kyrielie.blockbard.util.midiBase
+import net.minecraft.world.level.block.state.properties.NoteBlockInstrument
+import org.slf4j.LoggerFactory
+
+/**
+ * A remapped event ready for [kyrielie.blockbard.organ.ArpeggioScheduler].
+ * [originalMidiNote] is kept for debugging; [remappedMidiNote] is what will
+ * actually be looked up in [NoteBlockRegistry].
+ */
+data class RemappedNoteEvent(
+    val tick: Long,
+    val originalInstrument: NoteBlockInstrument,
+    val originalMidiNote: Int,
+    val remappedInstrument: NoteBlockInstrument,
+    val remappedMidiNote: Int,
+    /** True when the pitch was clamped to the edge of the nearest available range. */
+    val wasClamped: Boolean = false
+)
+
+/**
+ * Describes what the fallback mapper did so the GUI can show a meaningful warning.
+ */
+data class FallbackPlan(
+    val events: List<RemappedNoteEvent>,
+    /**
+     * How many (instrument, midiNote) pairs were resolved by shifting to a
+     * different instrument rather than changing the pitch.
+     */
+    val shiftedNotes: Int,
+    /**
+     * How many notes could not be covered by any available instrument even after
+     * instrument shift, and were clamped to the nearest range edge instead.
+     */
+    val clampedNotes: Int
+) {
+    fun summary(): String = buildString {
+        if (shiftedNotes == 0 && clampedNotes == 0) {
+            appendLine("All notes covered by instrument shift without pitch change.")
+        } else {
+            if (shiftedNotes > 0)
+                appendLine("$shiftedNotes note(s) shifted to a different instrument (pitch preserved).")
+            if (clampedNotes > 0)
+                appendLine("$clampedNotes note(s) pitch-clamped (no instrument covers that note).")
+        }
+    }
+}
+
+/**
+ * Remaps [ResolvedNoteEvent]s to whatever [NoteBlockInstrument]s are actually
+ * present in the organ, prioritizing pitch accuracy over timbre:
+ *
+ * ## Stage 1 — Instrument shift (pitch-preserving)
+ * For each note, walk the [PITCH_LADDER] — an ascending list of all pitched MC
+ * instruments ordered by their midiBase — and find the first instrument in the
+ * ladder that:
+ *   (a) is present in the organ, AND
+ *   (b) covers the exact MIDI note (i.e. midiNote in [midiBase, midiBase + 24]).
+ *
+ * Walking upward from the note's original instrument finds the nearest higher
+ * instrument first; walking downward finds the nearest lower one. The shift that
+ * moves the fewest semitones in instrument-space wins.
+ *
+ * The ladder and midiBase values come from [kyrielie.blockbard.util.midiBase],
+ * which documents the wiki-sourced per-instrument ranges for the actual
+ * Minecraft `NoteBlockInstrument` enum. This is intentionally NOT modeled on
+ * NoteBlockLib's `MinecraftDefinitions.instrumentShiftNote` — that method
+ * operates on a different type (NoteBlockLib's own `MinecraftInstrument`),
+ * assumes every instrument shares one fixed 24-semitone range, and substitutes
+ * instruments via a hardcoded per-instrument table rather than checking what's
+ * actually present in an organ. None of that fits this mod's model, where each
+ * instrument has its own midiBase and "available" is determined dynamically
+ * from [NoteBlockRegistry].
+ *
+ * ## Stage 2 — Octave clamp (pitch-approximate, last resort)
+ * If no instrument on the ladder covers the note (the note is above all available
+ * ranges or below all of them), clamp to the nearest edge of the closest available
+ * instrument's range.
+ *
+ * ## Unpitched percussion
+ * BASEDRUM, SNARE, and HAT are not on the pitch ladder. If the required instrument
+ * is one of these and it is absent, the note is silently dropped — there is no
+ * meaningful pitch-preserving substitute for an unpitched instrument.
+ */
+object FallbackMapper {
+
+    private val logger = LoggerFactory.getLogger("BlockBard/FallbackMapper")
+
+    /**
+     * All pitched instruments in ascending midiBase order.
+     * Each step up adds 12 semitones (one octave) to the base.
+     *
+     * Ranges per [kyrielie.blockbard.util.midiBase] (wiki-sourced, confirmed against
+     * decompiled NoteBlockInstrument.java for this build):
+     *
+     *   midiBase 30  → BASS, DIDGERIDOO                                  (F#1–F#3)
+     *   midiBase 42  → GUITAR, TRUMPET, TRUMPET_EXPOSED,
+     *                  TRUMPET_OXIDIZED, TRUMPET_WEATHERED               (F#2–F#4)
+     *   midiBase 54  → HARP, IRON_XYLOPHONE, BIT, BANJO, PLING           (F#3–F#5)
+     *   midiBase 66  → FLUTE, COW_BELL                                  (F#4–F#6)
+     *   midiBase 78  → BELL, CHIME, XYLOPHONE                           (F#5–F#7)
+     *
+     * BASEDRUM, SNARE, and HAT also share midiBase 54 but are excluded from this
+     * ladder — see [UNPITCHED].
+     *
+     * Within a midiBase tier, order reflects timbral preference when multiple
+     * instruments at the same pitch level are available. The ladder is used
+     * directionally: walk up to find a higher-pitched substitute, walk down for
+     * a lower-pitched one.
+     */
+    val PITCH_LADDER: List<NoteBlockInstrument> = listOf(
+        // midiBase 30
+        NoteBlockInstrument.BASS,
+        NoteBlockInstrument.DIDGERIDOO,
+        // midiBase 42
+        NoteBlockInstrument.GUITAR,
+        NoteBlockInstrument.TRUMPET,
+        NoteBlockInstrument.TRUMPET_EXPOSED,
+        NoteBlockInstrument.TRUMPET_WEATHERED,
+        NoteBlockInstrument.TRUMPET_OXIDIZED,
+        // midiBase 54
+        NoteBlockInstrument.HARP,
+        NoteBlockInstrument.IRON_XYLOPHONE,
+        NoteBlockInstrument.BIT,
+        NoteBlockInstrument.BANJO,
+        NoteBlockInstrument.PLING,
+        // midiBase 66
+        NoteBlockInstrument.FLUTE,
+        NoteBlockInstrument.COW_BELL,
+        // midiBase 78
+        NoteBlockInstrument.BELL,
+        NoteBlockInstrument.CHIME,
+        NoteBlockInstrument.XYLOPHONE
+    )
+
+    private val UNPITCHED: Set<NoteBlockInstrument> = setOf(
+        NoteBlockInstrument.BASEDRUM,
+        NoteBlockInstrument.SNARE,
+        NoteBlockInstrument.HAT
+    )
+
+    fun plan(events: List<ResolvedNoteEvent>): FallbackPlan {
+        // Query the organ once; build a fast lookup: instrument → set of MIDI notes present.
+        val organNotes: Map<NoteBlockInstrument, Set<Int>> =
+            NoteBlockRegistry.allPlayable()
+                .groupBy { it.instrument }
+                .mapValues { (_, entries) -> entries.map { it.midiNote }.toSet() }
+
+        val availablePitched: List<NoteBlockInstrument> =
+            PITCH_LADDER.filter { it in organNotes }
+
+        if (organNotes.isEmpty()) {
+            logger.warn("FallbackMapper: organ is empty — all notes will be dropped")
+            return FallbackPlan(emptyList(), 0, 0)
+        }
+
+        val remapped  = mutableListOf<RemappedNoteEvent>()
+        var shifted   = 0
+        var clamped   = 0
+
+        for (event in events) {
+
+            // ── Unpitched percussion ──────────────────────────────────────────
+            if (event.instrument in UNPITCHED) {
+                val notes = organNotes[event.instrument]
+                if (notes != null) {
+                    // Unpitched — note index doesn't matter; use any available note.
+                    remapped.add(event.toRemapped(event.instrument, notes.first()))
+                }
+                // else: drop silently — no meaningful substitute for unpitched
+                continue
+            }
+
+            // ── Stage 1: instrument shift ─────────────────────────────────────
+            val shifted1 = instrumentShift(event.midiNote, event.instrument, availablePitched, organNotes)
+            if (shifted1 != null) {
+                val wasShifted = shifted1.first != event.instrument
+                if (wasShifted) shifted++
+                remapped.add(event.toRemapped(shifted1.first, shifted1.second, wasClamped = false))
+                continue
+            }
+
+            // ── Stage 2: octave clamp ─────────────────────────────────────────
+            val clamped1 = octaveClamp(event.midiNote, availablePitched, organNotes)
+            if (clamped1 != null) {
+                clamped++
+                remapped.add(event.toRemapped(clamped1.first, clamped1.second, wasClamped = true))
+            }
+            // else: no pitched instruments at all — note dropped
+        }
+
+        logger.info(
+            "FallbackMapper: ${remapped.size} events — $shifted instrument-shifted, $clamped pitch-clamped"
+        )
+        return FallbackPlan(remapped, shifted, clamped)
+    }
+
+    // ── Core algorithms ───────────────────────────────────────────────────────
+
+    /**
+     * Finds the instrument on the [ladder] that covers [midiNote] exactly and is
+     * closest to [original] in ladder position. Returns (instrument, midiNote) or
+     * null if no instrument covers the note.
+     *
+     * Tie-breaking: when an instrument above and below the original are equidistant
+     * on the ladder, prefer the one above. This is an arbitrary but consistent choice;
+     * it is not based on any documented Minecraft or NoteBlockLib behavior.
+     */
+    private fun instrumentShift(
+        midiNote: Int,
+        original: NoteBlockInstrument,
+        ladder: List<NoteBlockInstrument>,
+        organNotes: Map<NoteBlockInstrument, Set<Int>>
+    ): Pair<NoteBlockInstrument, Int>? {
+        if (ladder.isEmpty()) return null
+
+        // Find original's position; if not on the ladder, treat as the closest
+        // ladder position by midiBase.
+        val originIdx = ladder.indexOfFirst { it == original }
+            .takeIf { it >= 0 }
+            ?: ladder.indexOfFirst { it.midiBase >= original.midiBase }
+                .takeIf { it >= 0 }
+            ?: ladder.lastIndex
+
+        // Walk outward from originIdx, checking up then down at each distance.
+        // This returns the nearest instrument (in ladder steps) that covers the note.
+        for (distance in 0..ladder.lastIndex) {
+            val candidates = buildList {
+                val up   = originIdx + distance
+                val down = originIdx - distance
+                if (distance == 0) {
+                    add(up)
+                } else {
+                    if (up   <= ladder.lastIndex) add(up)
+                    if (down >= 0)                add(down)
+                }
+            }
+            for (idx in candidates) {
+                val instr = ladder[idx]
+                val notes = organNotes[instr] ?: continue
+                if (midiNote in notes) return instr to midiNote
+            }
+        }
+        return null
+    }
+
+    /**
+     * Clamps [midiNote] to the nearest edge of any available instrument's range.
+     * Returns (instrument, clampedNote) where clampedNote is the closest MIDI
+     * note that exists in the organ: if the note is below all ranges, snaps to
+     * the lowest available note; if above all ranges, snaps to the highest.
+     */
+    private fun octaveClamp(
+        midiNote: Int,
+        ladder: List<NoteBlockInstrument>,
+        organNotes: Map<NoteBlockInstrument, Set<Int>>
+    ): Pair<NoteBlockInstrument, Int>? {
+        // Collect all (instrument, note) pairs and pick the one closest to midiNote.
+        var bestInstr: NoteBlockInstrument? = null
+        var bestNote  = 0
+        var bestDist  = Int.MAX_VALUE
+
+        for (instr in ladder) {
+            val notes = organNotes[instr] ?: continue
+            val closest = notes.minByOrNull { kotlin.math.abs(it - midiNote) } ?: continue
+            val dist    = kotlin.math.abs(closest - midiNote)
+            if (dist < bestDist) {
+                bestDist  = dist
+                bestNote  = closest
+                bestInstr = instr
+            }
+        }
+
+        return bestInstr?.let { it to bestNote }
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    private fun ResolvedNoteEvent.toRemapped(
+        instrument: NoteBlockInstrument,
+        midiNote: Int,
+        wasClamped: Boolean = false
+    ) = RemappedNoteEvent(
+        tick               = this.tick,
+        originalInstrument = this.instrument,
+        originalMidiNote   = this.midiNote,
+        remappedInstrument = instrument,
+        remappedMidiNote   = midiNote,
+        wasClamped         = wasClamped
+    )
+}
+</file>
+
+<file path="src/client/kotlin/kyrielie/blockbard/client/midi/MidiChannelResolver.kt">
+package kyrielie.blockbard.midi
+
+import kyrielie.blockbard.client.playback.LoadedMidi
+import kyrielie.blockbard.client.playback.TimedNoteEvent
+import net.minecraft.world.level.block.state.properties.NoteBlockInstrument
+import org.slf4j.LoggerFactory
+import javax.sound.midi.MetaMessage
+import javax.sound.midi.MidiSystem
+import javax.sound.midi.ShortMessage
+import java.io.File
+
+private val logger = LoggerFactory.getLogger("BlockBard/MidiChannelResolver")
+
+/** A MIDI event with its channel and GM program resolved to a NoteBlockInstrument. */
+data class ResolvedNoteEvent(
+    val tick: Long,
+    val midiNote: Int,
+    val instrument: NoteBlockInstrument
+)
+
+/**
+ * Reads a MIDI file and resolves each NOTE_ON event to the [NoteBlockInstrument]
+ * that the minecraft3.sf2 soundfont would use for that channel's program.
+ *
+ * Channel 10 (index 9) is always treated as percussion regardless of program.
+ *
+ * This is intentionally separate from [MidiFilePlayer] — that class only cares about
+ * note timing; this one cares about which instrument each note belongs to.
+ */
+object MidiChannelResolver {
+
+    /**
+     * Reads [file] and returns every NOTE_ON event with its instrument resolved.
+     * Program-change events are tracked per-channel and applied from the point
+     * they appear; notes before the first program change use program 0 (piano → harp).
+     */
+    fun resolve(file: File): List<ResolvedNoteEvent> {
+        val sequence = MidiSystem.getSequence(file)
+        // channel -> current GM program (default 0)
+        val channelProgram = IntArray(16) { 0 }
+
+        val events = mutableListOf<Pair<Long, ShortMessage>>() // tick, message
+
+        // Collect all channel-voice messages in tick order across all tracks
+        sequence.tracks.forEach { track ->
+            for (i in 0 until track.size()) {
+                val event = track.get(i)
+                val msg = event.message
+                if (msg is ShortMessage) {
+                    events.add(event.tick to msg)
+                }
+            }
+        }
+        events.sortBy { it.first }
+
+        val resolved = mutableListOf<ResolvedNoteEvent>()
+        for ((tick, msg) in events) {
+            when (msg.command) {
+                ShortMessage.PROGRAM_CHANGE -> {
+                    channelProgram[msg.channel] = msg.data1
+                }
+                ShortMessage.NOTE_ON -> {
+                    if (msg.data2 == 0) continue // velocity-0 note-on = note-off
+                    val instrument = if (msg.channel == 9) {
+                        MidiInstrumentMap.percussionInstrument(msg.data1)
+                    } else {
+                        MidiInstrumentMap.primaryFor(channelProgram[msg.channel])
+                    }
+                    resolved.add(ResolvedNoteEvent(tick, msg.data1, instrument))
+                }
+            }
+        }
+
+        logger.info("MidiChannelResolver: ${resolved.size} events from ${file.name}")
+        return resolved
+    }
+
+    /**
+     * Returns the distinct (instrument, midiNote) pairs that [file] requires.
+     * This is the input to [OrganReadinessChecker.check].
+     */
+    fun resolveRequirements(file: File): Set<MidiNoteRequirement> =
+        resolve(file).map { MidiNoteRequirement(it.instrument, it.midiNote) }.toSet()
+
+    /**
+     * Returns per-channel program assignments as a human-readable summary for the GUI,
+     * e.g. "Ch1: piano 1 → HARP, Ch10: percussion".
+     */
+    fun channelSummary(file: File): List<String> {
+        val sequence = MidiSystem.getSequence(file)
+        val channelProgram = IntArray(16) { 0 }
+        val channelsSeen = mutableSetOf<Int>()
+
+        sequence.tracks.forEach { track ->
+            for (i in 0 until track.size()) {
+                val event = track.get(i)
+                val msg = event.message
+                if (msg is ShortMessage) {
+                    when (msg.command) {
+                        ShortMessage.PROGRAM_CHANGE -> channelProgram[msg.channel] = msg.data1
+                        ShortMessage.NOTE_ON -> if (msg.data2 > 0) channelsSeen.add(msg.channel)
+                    }
+                }
+            }
+        }
+
+        return channelsSeen.sorted().map { ch ->
+            if (ch == 9) {
+                "Ch10: percussion"
+            } else {
+                val prog = channelProgram[ch]
+                val instr = MidiInstrumentMap.primaryFor(prog)
+                "Ch${ch + 1}: prog $prog → ${instr.name}"
+            }
+        }
+    }
+}
+</file>
+
+<file path="src/client/kotlin/kyrielie/blockbard/client/midi/MidiInstrumentMap.kt">
+package kyrielie.blockbard.midi
+
+import net.minecraft.world.level.block.state.properties.NoteBlockInstrument
+
+/**
+ * Maps General MIDI program numbers (0–127) and channel 10 percussion
+ * to the NoteBlockInstrument(s) used by the minecraft3.sf2 soundfont.
+ *
+ * Multi-instrument entries reflect layered zones in the SF2 — the soundfont
+ * splits those programs across pitch ranges, each zone pointing to a different
+ * MC sample. The list is ordered by how central that instrument is to the
+ * timbre: index 0 is the "primary" instrument used when only one is available.
+ *
+ * Source: SF2 instrument→sample chain parsed from minecraft3.sf2.
+ * Percussion (MIDI channel 10, program ignored) maps via [percussionInstrument].
+ */
+object MidiInstrumentMap {
+
+    /**
+     * Returns the ordered list of NoteBlockInstruments that the SF2 uses for
+     * [program] (0-indexed General MIDI program number, bank 0).
+     * The first element is the best single-instrument substitute.
+     */
+    fun forProgram(program: Int): List<NoteBlockInstrument> = GM_MAP.getOrElse(program) {
+        listOf(NoteBlockInstrument.HARP) // safe fallback for any unmapped program
+    }
+
+    /**
+     * Single best-fit instrument for a GM program — used when the organ does not
+     * have all layers available and needs to pick one.
+     */
+    fun primaryFor(program: Int): NoteBlockInstrument = forProgram(program).first()
+
+    /**
+     * Channel 10 percussion is a bank-128 preset in the SF2 with 32 zones mapped
+     * across the standard GM drum map. Returns the most appropriate pitched
+     * MC instrument for [midiNote] on the drum channel.
+     *
+     * Percussion instruments that are not pitched (snare, hat, basedrum) are
+     * returned here anyway — the caller can choose to skip non-melodic notes.
+     */
+    fun percussionInstrument(midiNote: Int): NoteBlockInstrument = when (midiNote) {
+        // Kick / Bass Drum
+        35, 36 -> NoteBlockInstrument.BASEDRUM
+        // Snare family
+        38, 40 -> NoteBlockInstrument.SNARE
+        // Hi-hat family (open and closed)
+        42, 44, 46 -> NoteBlockInstrument.HAT
+        // Toms — map to snare (closest unpitched equivalent)
+        41, 43, 45, 47, 48, 50 -> NoteBlockInstrument.SNARE
+        // Cowbell
+        56 -> NoteBlockInstrument.COW_BELL
+        // Xylophone / woodblock family
+        76, 77 -> NoteBlockInstrument.XYLOPHONE
+        // Iron xylophone / agogo / anvil
+        67, 68, 113 -> NoteBlockInstrument.IRON_XYLOPHONE
+        // Bell / triangle / chime
+        80, 81 -> NoteBlockInstrument.BELL
+        // Everything else: basedrum
+        else -> NoteBlockInstrument.BASEDRUM
+    }
+
+    // ── General MIDI bank 0 map ────────────────────────────────────────────────
+    // Lists are ordered: [primary, secondary, ...] matching SF2 zone layout.
+    // Programs with a single-sample SF2 preset have a one-element list.
+    private val GM_MAP: Map<Int, List<NoteBlockInstrument>> = mapOf(
+        // ── Piano ──────────────────────────────────────────────────────────────
+        // SF2 layers: harp (mid), bell (high), guitar (low-mid), bass (low)
+        0  to listOf(NoteBlockInstrument.HARP, NoteBlockInstrument.BELL,
+                     NoteBlockInstrument.GUITAR, NoteBlockInstrument.BASS),   // Acoustic Grand Piano
+        1  to listOf(NoteBlockInstrument.HARP, NoteBlockInstrument.BELL,
+                     NoteBlockInstrument.GUITAR, NoteBlockInstrument.BASS),   // Bright Acoustic Piano
+        2  to listOf(NoteBlockInstrument.PLING, NoteBlockInstrument.BIT,
+                     NoteBlockInstrument.CHIME, NoteBlockInstrument.BASS),    // Electric Grand Piano
+        3  to listOf(NoteBlockInstrument.BANJO, NoteBlockInstrument.XYLOPHONE,
+                     NoteBlockInstrument.DIDGERIDOO, NoteBlockInstrument.GUITAR), // Honky-tonk Piano
+        4  to listOf(NoteBlockInstrument.PLING, NoteBlockInstrument.BIT,
+                     NoteBlockInstrument.CHIME, NoteBlockInstrument.BASS),    // Electric Piano 1
+        5  to listOf(NoteBlockInstrument.PLING, NoteBlockInstrument.BIT,
+                     NoteBlockInstrument.CHIME, NoteBlockInstrument.BASS),    // Electric Piano 2
+        6  to listOf(NoteBlockInstrument.BANJO, NoteBlockInstrument.XYLOPHONE,
+                     NoteBlockInstrument.DIDGERIDOO, NoteBlockInstrument.GUITAR), // Harpsichord
+        7  to listOf(NoteBlockInstrument.HARP, NoteBlockInstrument.BELL,
+                     NoteBlockInstrument.GUITAR, NoteBlockInstrument.BASS),   // Clavinet
+
+        // ── Chromatic Percussion ───────────────────────────────────────────────
+        8  to listOf(NoteBlockInstrument.HARP, NoteBlockInstrument.BELL,
+                     NoteBlockInstrument.GUITAR, NoteBlockInstrument.BASS),   // Celesta
+        9  to listOf(NoteBlockInstrument.HARP, NoteBlockInstrument.BELL,
+                     NoteBlockInstrument.GUITAR, NoteBlockInstrument.BASS),   // Glockenspiel
+        10 to listOf(NoteBlockInstrument.HARP, NoteBlockInstrument.BELL,
+                     NoteBlockInstrument.GUITAR, NoteBlockInstrument.BASS),   // Music Box
+        11 to listOf(NoteBlockInstrument.IRON_XYLOPHONE, NoteBlockInstrument.XYLOPHONE,
+                     NoteBlockInstrument.FLUTE, NoteBlockInstrument.BASS),    // Vibraphone
+        12 to listOf(NoteBlockInstrument.IRON_XYLOPHONE, NoteBlockInstrument.XYLOPHONE,
+                     NoteBlockInstrument.FLUTE, NoteBlockInstrument.BASS),    // Marimba
+        13 to listOf(NoteBlockInstrument.IRON_XYLOPHONE, NoteBlockInstrument.XYLOPHONE,
+                     NoteBlockInstrument.FLUTE, NoteBlockInstrument.BASS),    // Xylophone
+        14 to listOf(NoteBlockInstrument.BELL),                               // Tubular Bells
+        15 to listOf(NoteBlockInstrument.BELL),                               // Dulcimer
+
+        // ── Organ ──────────────────────────────────────────────────────────────
+        16 to listOf(NoteBlockInstrument.PLING, NoteBlockInstrument.FLUTE,
+                     NoteBlockInstrument.DIDGERIDOO, NoteBlockInstrument.CHIME), // Drawbar Organ
+        17 to listOf(NoteBlockInstrument.PLING, NoteBlockInstrument.FLUTE,
+                     NoteBlockInstrument.DIDGERIDOO, NoteBlockInstrument.CHIME), // Percussive Organ
+        18 to listOf(NoteBlockInstrument.PLING, NoteBlockInstrument.FLUTE,
+                     NoteBlockInstrument.DIDGERIDOO, NoteBlockInstrument.CHIME), // Rock Organ
+        19 to listOf(NoteBlockInstrument.PLING, NoteBlockInstrument.FLUTE,
+                     NoteBlockInstrument.DIDGERIDOO, NoteBlockInstrument.CHIME), // Church Organ
+        20 to listOf(NoteBlockInstrument.PLING, NoteBlockInstrument.FLUTE,
+                     NoteBlockInstrument.CHIME, NoteBlockInstrument.BASS),    // Reed Organ
+        21 to listOf(NoteBlockInstrument.BANJO, NoteBlockInstrument.XYLOPHONE,
+                     NoteBlockInstrument.DIDGERIDOO, NoteBlockInstrument.GUITAR), // Accordion
+        22 to listOf(NoteBlockInstrument.BANJO, NoteBlockInstrument.XYLOPHONE,
+                     NoteBlockInstrument.DIDGERIDOO, NoteBlockInstrument.GUITAR), // Harmonica
+        23 to listOf(NoteBlockInstrument.BANJO, NoteBlockInstrument.XYLOPHONE,
+                     NoteBlockInstrument.DIDGERIDOO, NoteBlockInstrument.GUITAR), // Tango Accordion
+
+        // ── Guitar ─────────────────────────────────────────────────────────────
+        24 to listOf(NoteBlockInstrument.HARP, NoteBlockInstrument.BELL,
+                     NoteBlockInstrument.GUITAR, NoteBlockInstrument.BASS),   // Nylon Guitar
+        25 to listOf(NoteBlockInstrument.HARP, NoteBlockInstrument.BELL,
+                     NoteBlockInstrument.GUITAR, NoteBlockInstrument.BASS),   // Steel Guitar
+        26 to listOf(NoteBlockInstrument.HARP, NoteBlockInstrument.BELL,
+                     NoteBlockInstrument.GUITAR, NoteBlockInstrument.BASS),   // Jazz Guitar
+        27 to listOf(NoteBlockInstrument.HARP, NoteBlockInstrument.BELL,
+                     NoteBlockInstrument.GUITAR, NoteBlockInstrument.BASS),   // Clean Guitar
+        28 to listOf(NoteBlockInstrument.HARP, NoteBlockInstrument.BELL,
+                     NoteBlockInstrument.GUITAR, NoteBlockInstrument.BASS),   // Muted Guitar
+        29 to listOf(NoteBlockInstrument.GUITAR),                             // Overdriven Guitar
+        30 to listOf(NoteBlockInstrument.GUITAR),                             // Distortion Guitar
+        31 to listOf(NoteBlockInstrument.GUITAR),                             // Guitar Harmonics
+
+        // ── Bass ───────────────────────────────────────────────────────────────
+        32 to listOf(NoteBlockInstrument.BASS),                               // Acoustic Bass
+        33 to listOf(NoteBlockInstrument.BASS),                               // Finger Bass
+        34 to listOf(NoteBlockInstrument.BASS),                               // Pick Bass
+        35 to listOf(NoteBlockInstrument.BASS),                               // Fretless Bass
+        36 to listOf(NoteBlockInstrument.BASS),                               // Slap Bass 1
+        37 to listOf(NoteBlockInstrument.BASS),                               // Slap Bass 2
+        38 to listOf(NoteBlockInstrument.BASS),                               // Synth Bass 1
+        39 to listOf(NoteBlockInstrument.BASS),                               // Synth Bass 2
+
+        // ── Strings ────────────────────────────────────────────────────────────
+        40 to listOf(NoteBlockInstrument.FLUTE),                              // Violin
+        41 to listOf(NoteBlockInstrument.FLUTE),                              // Viola
+        42 to listOf(NoteBlockInstrument.FLUTE),                              // Cello
+        43 to listOf(NoteBlockInstrument.FLUTE),                              // Contrabass
+        44 to listOf(NoteBlockInstrument.FLUTE),                              // Tremolo Strings
+        45 to listOf(NoteBlockInstrument.FLUTE),                              // Pizzicato Strings
+        46 to listOf(NoteBlockInstrument.HARP),                               // Orchestral Harp
+        47 to listOf(NoteBlockInstrument.SNARE),                              // Timpani
+
+        // ── Ensemble ───────────────────────────────────────────────────────────
+        48 to listOf(NoteBlockInstrument.FLUTE),                              // String Ensemble 1
+        49 to listOf(NoteBlockInstrument.FLUTE),                              // String Ensemble 2
+        50 to listOf(NoteBlockInstrument.FLUTE),                              // Synth Strings 1
+        51 to listOf(NoteBlockInstrument.FLUTE),                              // Synth Strings 2
+        52 to listOf(NoteBlockInstrument.FLUTE),                              // Choir Aahs
+        53 to listOf(NoteBlockInstrument.FLUTE),                              // Voice Oohs
+        54 to listOf(NoteBlockInstrument.FLUTE),                              // Synth Voice
+        55 to listOf(NoteBlockInstrument.FLUTE),                              // Orchestra Hit
+
+        // ── Brass ──────────────────────────────────────────────────────────────
+        56 to listOf(NoteBlockInstrument.TRUMPET),                            // Trumpet
+        57 to listOf(NoteBlockInstrument.TRUMPET_WEATHERED),                  // Trombone
+        58 to listOf(NoteBlockInstrument.TRUMPET_WEATHERED),                  // Tuba
+        59 to listOf(NoteBlockInstrument.TRUMPET_WEATHERED),                  // Muted Trumpet
+        60 to listOf(NoteBlockInstrument.TRUMPET_WEATHERED),                  // French Horn
+        61 to listOf(NoteBlockInstrument.TRUMPET),                            // Brass Section
+        62 to listOf(NoteBlockInstrument.TRUMPET),                            // Synth Brass 1
+        63 to listOf(NoteBlockInstrument.TRUMPET_EXPOSED),                    // Synth Brass 2
+
+        // ── Reed ───────────────────────────────────────────────────────────────
+        64 to listOf(NoteBlockInstrument.TRUMPET),                            // Soprano Sax
+        65 to listOf(NoteBlockInstrument.TRUMPET),                            // Alto Sax
+        66 to listOf(NoteBlockInstrument.TRUMPET),                            // Tenor Sax
+        67 to listOf(NoteBlockInstrument.TRUMPET),                            // Baritone Sax
+        68 to listOf(NoteBlockInstrument.DIDGERIDOO),                         // Oboe
+        69 to listOf(NoteBlockInstrument.DIDGERIDOO),                         // English Horn
+        70 to listOf(NoteBlockInstrument.DIDGERIDOO),                         // Bassoon
+        71 to listOf(NoteBlockInstrument.DIDGERIDOO),                         // Clarinet
+
+        // ── Pipe ───────────────────────────────────────────────────────────────
+        72 to listOf(NoteBlockInstrument.FLUTE),                              // Piccolo
+        73 to listOf(NoteBlockInstrument.FLUTE),                              // Flute
+        74 to listOf(NoteBlockInstrument.FLUTE),                              // Recorder
+        75 to listOf(NoteBlockInstrument.FLUTE),                              // Pan Flute
+        76 to listOf(NoteBlockInstrument.FLUTE),                              // Blown Bottle
+        77 to listOf(NoteBlockInstrument.FLUTE),                              // Shakuhachi
+        78 to listOf(NoteBlockInstrument.FLUTE),                              // Whistle
+        79 to listOf(NoteBlockInstrument.FLUTE),                              // Ocarina
+
+        // ── Synth Lead ─────────────────────────────────────────────────────────
+        80 to listOf(NoteBlockInstrument.BIT),                               // Square Wave
+        81 to listOf(NoteBlockInstrument.BIT),                               // Sawtooth Wave
+        82 to listOf(NoteBlockInstrument.FLUTE),                             // Calliope
+        83 to listOf(NoteBlockInstrument.FLUTE),                             // Chiff
+        84 to listOf(NoteBlockInstrument.BIT),                               // Charang
+        85 to listOf(NoteBlockInstrument.FLUTE),                             // Voice
+        86 to listOf(NoteBlockInstrument.BIT),                               // Fifths
+        87 to listOf(NoteBlockInstrument.BIT),                               // Bass + Lead
+
+        // ── Synth Pad ──────────────────────────────────────────────────────────
+        88 to listOf(NoteBlockInstrument.FLUTE),                             // New Age Pad
+        89 to listOf(NoteBlockInstrument.FLUTE),                             // Warm Pad
+        90 to listOf(NoteBlockInstrument.BIT),                               // Polysynth Pad
+        91 to listOf(NoteBlockInstrument.FLUTE),                             // Choir Pad
+        92 to listOf(NoteBlockInstrument.FLUTE),                             // Bowed Pad
+        93 to listOf(NoteBlockInstrument.FLUTE),                             // Metallic Pad
+        94 to listOf(NoteBlockInstrument.FLUTE),                             // Halo Pad
+        95 to listOf(NoteBlockInstrument.FLUTE),                             // Sweep Pad
+
+        // ── Synth FX ───────────────────────────────────────────────────────────
+        96  to listOf(NoteBlockInstrument.DIDGERIDOO),                       // Rain FX
+        97  to listOf(NoteBlockInstrument.HARP),                             // Soundtrack FX
+        98  to listOf(NoteBlockInstrument.BELL),                             // Crystal FX (orb sample)
+        99  to listOf(NoteBlockInstrument.GUITAR),                           // Atmosphere FX
+        100 to listOf(NoteBlockInstrument.HARP),                             // Brightness FX
+        101 to listOf(NoteBlockInstrument.HARP),                             // Goblins FX
+        102 to listOf(NoteBlockInstrument.HARP),                             // Echoes FX
+        103 to listOf(NoteBlockInstrument.HARP),                             // Sci-fi FX
+
+        // ── Ethnic ─────────────────────────────────────────────────────────────
+        104 to listOf(NoteBlockInstrument.BANJO),                            // Sitar
+        105 to listOf(NoteBlockInstrument.BANJO),                            // Banjo
+        106 to listOf(NoteBlockInstrument.BANJO),                            // Shamisen
+        107 to listOf(NoteBlockInstrument.BANJO),                            // Koto
+        108 to listOf(NoteBlockInstrument.IRON_XYLOPHONE),                   // Kalimba
+        109 to listOf(NoteBlockInstrument.FLUTE),                            // Bagpipe
+        110 to listOf(NoteBlockInstrument.FLUTE),                            // Fiddle
+        111 to listOf(NoteBlockInstrument.FLUTE),                            // Shanai
+
+        // ── Percussive ─────────────────────────────────────────────────────────
+        112 to listOf(NoteBlockInstrument.BELL),                             // Tinkle Bell
+        113 to listOf(NoteBlockInstrument.HARP),                             // Agogo
+        114 to listOf(NoteBlockInstrument.IRON_XYLOPHONE),                   // Steel Drums
+        115 to listOf(NoteBlockInstrument.BASEDRUM),                         // Woodblock (wood sample)
+        116 to listOf(NoteBlockInstrument.SNARE),                            // Taiko Drum
+        117 to listOf(NoteBlockInstrument.SNARE),                            // Melodic Tom
+        118 to listOf(NoteBlockInstrument.SNARE),                            // Synth Drum
+        119 to listOf(NoteBlockInstrument.SNARE),                            // Reverse Cymbal
+
+        // ── Sound Effects ──────────────────────────────────────────────────────
+        120 to listOf(NoteBlockInstrument.HARP),                             // Guitar Fret Noise
+        121 to listOf(NoteBlockInstrument.HARP),                             // Breath Noise
+        122 to listOf(NoteBlockInstrument.HARP),                             // Seashore
+        123 to listOf(NoteBlockInstrument.HARP),                             // Bird Tweet
+        124 to listOf(NoteBlockInstrument.BELL),                             // Telephone Ring (orb)
+        125 to listOf(NoteBlockInstrument.HARP),                             // Helicopter
+        126 to listOf(NoteBlockInstrument.HARP),                             // Applause
+        127 to listOf(NoteBlockInstrument.HARP)                              // Gunshot
+    )
+}
+</file>
+
+<file path="src/client/kotlin/kyrielie/blockbard/client/midi/OrganReadinessChecker.kt">
+package kyrielie.blockbard.midi
+
+import kyrielie.blockbard.organ.NoteBlockRegistry
+import net.minecraft.world.level.block.state.properties.NoteBlockInstrument
+import org.slf4j.LoggerFactory
+
+/**
+ * Result of comparing a MIDI file's instrument/note requirements against the
+ * currently scanned organ.
+ */
+data class OrganReadinessReport(
+    /** Notes that are fully covered: the required instrument and MIDI note exist in the organ. */
+    val coveredNotes: Set<MidiNoteRequirement>,
+    /** Notes missing because the correct instrument is absent entirely. */
+    val missingInstruments: Set<NoteBlockInstrument>,
+    /** Notes whose instrument exists but is not tuned to cover that specific MIDI note. */
+    val missingNotes: Set<MidiNoteRequirement>,
+    /** Total distinct (instrument, midiNote) pairs the MIDI file requires. */
+    val totalRequired: Int
+) {
+    val isFullyCovered: Boolean get() = missingInstruments.isEmpty() && missingNotes.isEmpty()
+    val coveragePercent: Int
+        get() = if (totalRequired == 0) 100
+                else (coveredNotes.size * 100) / totalRequired
+
+    fun summary(): String = buildString {
+        if (isFullyCovered) {
+            appendLine("Organ fully covers this MIDI file ($totalRequired notes).")
+        } else {
+            appendLine("Coverage: $coveragePercent% (${ coveredNotes.size}/$totalRequired notes).")
+            if (missingInstruments.isNotEmpty()) {
+                appendLine("Missing instruments: ${missingInstruments.joinToString { it.name }}")
+            }
+            if (missingNotes.isNotEmpty()) {
+                appendLine("${missingNotes.size} note(s) out of range for available instruments.")
+            }
+        }
+    }
+}
+
+data class MidiNoteRequirement(
+    val instrument: NoteBlockInstrument,
+    val midiNote: Int
+)
+
+/**
+ * Checks whether the currently scanned organ (via [NoteBlockRegistry]) can play
+ * everything a MIDI file requires.
+ *
+ * The check operates on the resolved (instrument, midiNote) pairs that
+ * [MidiChannelResolver] produces — not raw GM programs — so it correctly handles
+ * the per-channel instrument assignments.
+ */
+object OrganReadinessChecker {
+
+    private val logger = LoggerFactory.getLogger("BlockBard/OrganReadiness")
+
+    /**
+     * Runs the readiness check.
+     *
+     * @param requirements Set of (instrument, midiNote) pairs the MIDI file needs.
+     *                     Obtain this from [MidiChannelResolver.resolveRequirements].
+     * @return An [OrganReadinessReport] describing coverage gaps.
+     */
+    fun check(requirements: Set<MidiNoteRequirement>): OrganReadinessReport {
+        val playableMidiNotes: Map<NoteBlockInstrument, Set<Int>> =
+            NoteBlockRegistry.allPlayable()
+                .groupBy { it.instrument }
+                .mapValues { (_, entries) -> entries.map { it.midiNote }.toSet() }
+
+        val availableInstruments = playableMidiNotes.keys
+
+        val covered      = mutableSetOf<MidiNoteRequirement>()
+        val missingInstr = mutableSetOf<NoteBlockInstrument>()
+        val missingNotes = mutableSetOf<MidiNoteRequirement>()
+
+        for (req in requirements) {
+            when {
+                req.instrument !in availableInstruments -> {
+                    missingInstr.add(req.instrument)
+                }
+                req.midiNote !in (playableMidiNotes[req.instrument] ?: emptySet()) -> {
+                    missingNotes.add(req)
+                }
+                else -> covered.add(req)
+            }
+        }
+
+        val report = OrganReadinessReport(covered, missingInstr, missingNotes, requirements.size)
+        logger.info("OrganReadiness: ${report.summary().trimEnd()}")
+        return report
+    }
+}
+</file>
 
 <file path=".github/workflows/build.yml">
 name: Build BlockBard
@@ -259,453 +1034,6 @@ class BlockBardModMenuIntegration : ModMenuApi {
 }
 </file>
 
-<file path="src/client/kotlin/kyrielie/blockbard/client/gui/MainScreen.kt">
-package kyrielie.blockbard.client.gui
-
-import kyrielie.blockbard.client.config.ConfigManager
-import kyrielie.blockbard.client.playback.MidiFilePlayer
-import kyrielie.blockbard.client.playback.NbsFileLoader
-import kyrielie.blockbard.client.playback.NbsPlayer
-import kyrielie.blockbard.organ.*
-import kyrielie.blockbard.client.organ.OrganScanner
-import kyrielie.blockbard.client.player.CenterResult
-import kyrielie.blockbard.client.player.PlayerController
-import kyrielie.blockbard.util.midiNoteToName
-import net.fabricmc.loader.api.FabricLoader
-import net.minecraft.client.gui.GuiGraphicsExtractor          // was: GuiGraphics
-import net.minecraft.client.gui.components.Button
-import net.minecraft.client.gui.screens.Screen
-import net.minecraft.client.input.MouseButtonEvent             // new: event object for mouseClicked
-import net.minecraft.network.chat.Component
-import java.io.File
-
-class MainScreen(private val parent: Screen? = null) : Screen(Component.literal("BlockBard")) {
-
-    private val midisDir: File by lazy {
-        FabricLoader.getInstance().configDir.resolve("blockbard/midis").toFile().also { dir ->
-            if (!dir.exists()) {
-                dir.mkdirs()
-                dir.resolve("README.txt").writeText(
-                    "Drop .mid or .nbs files here and click 'Refresh' in BlockBard."
-                )
-            }
-        }
-    }
-
-    private var midiFiles: List<File> = emptyList()
-    private var selectedFile: File? = null
-    private var selectedIndex: Int = -1
-    private var scrollOffset: Int = 0
-    private val maxVisible = 8
-
-    // Playback state
-    private var tuner: NoteBlockTuner? = null
-    private var tuningTargets: List<TuneTarget> = emptyList()
-    private var tuneProgress: Pair<Int, Int> = Pair(0, 0)
-    private var assignment: OrganAssignment? = null
-    private var organScanMessage: String = "Press Scan to detect noteblocks"
-    private var coverageMessage: String = ""
-    private var lastShiftMessage: String = ""
-    private var scanTicker = 0
-
-    // Tuning tick queue
-    private var pendingTunerBlock: net.minecraft.core.BlockPos? = null
-
-    override fun init() {
-        super.init()
-        refreshFiles()
-        OrganScanner.scan()
-        updateOrganInfo()
-
-        // ── File list controls ──
-        addRenderableWidget(
-            Button.builder(Component.literal("↑")) { scrollOffset = (scrollOffset - 1).coerceAtLeast(0) }
-                .pos(10, 60).size(20, 16).build()
-        )
-        addRenderableWidget(
-            Button.builder(Component.literal("↓")) { scrollOffset = (scrollOffset + 1).coerceAtMost((midiFiles.size - maxVisible).coerceAtLeast(0)) }
-                .pos(10, 80).size(20, 16).build()
-        )
-        addRenderableWidget(
-            Button.builder(Component.literal("Refresh")) { refreshFiles() }
-                .pos(10, 100).size(60, 16).build()
-        )
-
-        // ── Organ controls ──
-        addRenderableWidget(
-            Button.builder(Component.literal("Scan")) {
-                OrganScanner.scan()
-                updateOrganInfo()
-            }.pos(10, 200).size(50, 16).build()
-        )
-
-        addRenderableWidget(
-            Button.builder(Component.literal("Center")) {
-                val result = PlayerController.centerOnOrgan()
-                organScanMessage = when (result) {
-                    is CenterResult.Centered -> "Centered. ${result.reachableCount}/${result.totalFound} reachable."
-                    CenterResult.NoBlocks -> "No playable noteblocks found."
-                    CenterResult.NoPlayer -> "No player found."
-                }
-            }.pos(65, 200).size(60, 16).build()
-        )
-
-        addRenderableWidget(
-            Button.builder(Component.literal("Tune")) {
-                startTuning()
-            }.pos(130, 200).size(50, 16).build()
-        )
-
-        // ── Playback controls ──
-        addRenderableWidget(
-            Button.builder(Component.literal("▶ Play")) {
-                if (MidiFilePlayer.isPaused) MidiFilePlayer.resume()
-                else startPlayback()
-            }.pos(10, 222).size(55, 16).build()
-        )
-
-        addRenderableWidget(
-            Button.builder(Component.literal("⏸ Pause")) {
-                if (MidiFilePlayer.isPaused) MidiFilePlayer.resume()
-                else MidiFilePlayer.pause()
-            }.pos(70, 222).size(60, 16).build()
-        )
-
-        addRenderableWidget(
-            Button.builder(Component.literal("⏹ Stop")) {
-                MidiFilePlayer.stop()
-                NbsPlayer.stop()
-            }.pos(135, 222).size(50, 16).build()
-        )
-
-        addRenderableWidget(
-            Button.builder(Component.literal("⇀ Shuffle")) {
-                shuffle()
-            }.pos(190, 222).size(60, 16).build()
-        )
-
-        // Tempo buttons
-        addRenderableWidget(
-            Button.builder(Component.literal("Tempo -")) {
-                MidiFilePlayer.tempoMultiplier = (MidiFilePlayer.tempoMultiplier - 0.1f).coerceAtLeast(0.5f)
-            }.pos(10, 242).size(55, 16).build()
-        )
-        addRenderableWidget(
-            Button.builder(Component.literal("Tempo +")) {
-                MidiFilePlayer.tempoMultiplier = (MidiFilePlayer.tempoMultiplier + 0.1f).coerceAtMost(2.0f)
-            }.pos(70, 242).size(55, 16).build()
-        )
-
-        addRenderableWidget(
-            Button.builder(Component.literal("Close")) {
-                onClose()
-            }.pos(width - 70, height - 24).size(60, 16).build()
-        )
-    }
-
-    private fun refreshFiles() {
-        midiFiles = (midisDir.listFiles { f ->
-            f.extension.lowercase() in listOf("mid", "midi", "nbs")
-        } ?: emptyArray()).toList().sortedBy { it.name }
-        scrollOffset = 0
-    }
-
-    private fun updateOrganInfo() {
-        val playable = NoteBlockRegistry.allPlayable()
-        val silenced = NoteBlockRegistry.all().count { it.status == NoteBlockStatus.SILENCED }
-        val mobHeads = NoteBlockRegistry.allMobHeadEntries().size
-        organScanMessage = "Playable: ${playable.size}  Silenced: $silenced  Mob heads: $mobHeads"
-    }
-
-    private fun startTuning() {
-        val midi = MidiFilePlayer.loadedMidi ?: return
-        val map = PlayerController.organMap ?: run {
-            organScanMessage = "Run Center first!"
-            return
-        }
-        val reachable = NoteBlockRegistry.allPlayable().filter { map.isReachable(it.pos) }
-        val result = MidiToOrganMapper.buildAssignment(midi.noteUsageCounts, reachable)
-        assignment = result
-        val targets = MidiToOrganMapper.computeTuneTargets(result, reachable)
-        tuningTargets = targets
-        tuner = NoteBlockTuner(targets) { done, total ->
-            tuneProgress = Pair(done, total)
-        }
-        organScanMessage = "Tuning..."
-        updateCoverageMessage(result)
-    }
-
-    private fun updateCoverageMessage(result: OrganAssignment) {
-        val total = (result.assignment.size + result.unplayable.size)
-        val covered = result.assignment.size
-        val unplayable = result.unplayable.map { midiNoteToName(it) }
-        coverageMessage = "$covered/$total notes covered" +
-                if (unplayable.isNotEmpty()) ". Missing: ${unplayable.take(4).joinToString()}" else ""
-    }
-
-    private fun startPlayback() {
-        val file = selectedFile ?: return
-        if (file.extension.lowercase() == "nbs") {
-            val nbs = NbsFileLoader.load(file)
-            NbsPlayer.play(nbs, MidiFilePlayer.tempoMultiplier)
-        } else {
-            if (MidiFilePlayer.loadedMidi?.file != file) {
-                MidiFilePlayer.load(file)
-            }
-            MidiFilePlayer.play()
-        }
-    }
-
-    private fun shuffle() {
-        val available = midiFiles.filter { it != selectedFile }
-        if (available.isEmpty()) return
-        val next = available.random()
-        selectFile(next)
-    }
-
-    private fun selectFile(file: File) {
-        selectedFile = file
-        selectedIndex = midiFiles.indexOf(file)
-        MidiFilePlayer.stop()
-        if (file.extension.lowercase() in listOf("mid", "midi")) {
-            MidiFilePlayer.load(file)
-        }
-        ConfigManager.config.lastPlayedTrack = file.name
-        organScanMessage = "Loaded: ${file.name}. Run Scan → Center → Tune → Play."
-        coverageMessage = ""
-    }
-
-    override fun tick() {
-        super.tick()
-        scanTicker++
-        if (scanTicker >= 20 * ConfigManager.config.autoRescanIntervalSeconds) {
-            scanTicker = 0
-            OrganScanner.scan()
-            updateOrganInfo()
-        }
-
-        // Process one tuner click per tick
-        val t = tuner
-        if (t != null && !t.isDone) {
-            val pos = t.nextClick()
-            if (pos != null) PlayerController.interactWith(pos)
-            if (t.isDone) {
-                tuner = null
-                organScanMessage = "Tuning complete! Press Play."
-            }
-        }
-    }
-
-    // render() → extractRenderState()  (GuiGraphics → GuiGraphicsExtractor)
-    // renderBackground() → extractBackground()
-    override fun extractRenderState(graphics: GuiGraphicsExtractor, mouseX: Int, mouseY: Int, partialTick: Float) {
-        // Do NOT call extractBackground() here — the engine already calls it before invoking
-        // extractRenderState() via extractRenderStateWithTooltipAndSubtitles().
-        // Calling it again triggers "Can only blur once per frame".
-        super.extractRenderState(graphics, mouseX, mouseY, partialTick)
-
-        val font = minecraft.font
-
-        // text() replaces drawString()
-        graphics.text(font, "♪ BlockBard", 10, 10, 0xFFFFAA)
-        graphics.text(font, "MIDI / NBS Files:", 10, 26, 0xCCCCCC)
-
-        // File list
-        val visibleFiles = midiFiles.drop(scrollOffset).take(maxVisible)
-        visibleFiles.forEachIndexed { i, file ->
-            val y = 36 + i * 14
-            val realIdx = scrollOffset + i
-            val color = if (realIdx == selectedIndex) 0x55FF55 else 0xDDDDDD
-            val prefix = if (realIdx == selectedIndex) "▶ " else "  "
-            val label = prefix + file.name.take(30)
-            graphics.text(font, label, 34, y, color)
-        }
-
-        if (midiFiles.isEmpty()) {
-            graphics.text(font, "(no files — drop .mid/.nbs in config/blockbard/midis/)", 10, 36, 0xAAAAAA)
-        }
-
-        // Organ status
-        val organY = 175
-        graphics.text(font, "─── Organ ───", 10, organY, 0x88AAFF)
-        graphics.text(font, organScanMessage, 10, organY + 12, 0xFFFFFF)
-
-        // Instrument counts
-        val counts = NoteBlockRegistry.countPerInstrument()
-        var cy = organY + 24
-        counts.entries.take(5).forEach { (inst, count) ->
-            graphics.text(font, "${inst.name}: $count", 10, cy, 0xDDDDDD)
-            cy += 10
-        }
-
-        if (coverageMessage.isNotEmpty()) {
-            graphics.text(font, coverageMessage, 10, cy + 2, 0xFFCC44)
-            cy += 12
-        }
-
-        if (tuner != null) {
-            val (done, total) = tuneProgress
-            graphics.text(font, "Tuning $done/$total blocks...", 10, cy + 2, 0x44FF88)
-        }
-
-        // Playback status
-        val pbY = height - 42
-        val status = when {
-            MidiFilePlayer.isActive() && !MidiFilePlayer.isPaused -> "▶ PLAYING ${selectedFile?.name ?: ""}"
-            MidiFilePlayer.isPaused -> "⏸ PAUSED"
-            else -> "⏹ IDLE"
-        }
-        graphics.text(font, status, 10, pbY, 0xAAFFAA)
-        graphics.text(font, "Tempo: ${"%.1f".format(MidiFilePlayer.tempoMultiplier)}x", 200, pbY, 0xCCCCCC)
-    }
-
-    // mouseClicked now takes (MouseButtonEvent, Boolean) instead of (Double, Double, Int)
-    override fun mouseClicked(event: MouseButtonEvent, doubleClick: Boolean): Boolean {
-        val mouseX = event.x()
-        val mouseY = event.y()
-        // Check file list clicks — only on primary (left) button
-        if (event.button() == 0) {
-            val visibleFiles = midiFiles.drop(scrollOffset).take(maxVisible)
-            visibleFiles.forEachIndexed { i, file ->
-                val y = 36 + i * 14
-                if (mouseX >= 34 && mouseX <= width - 10 && mouseY >= y && mouseY < y + 14) {
-                    selectFile(file)
-                    return true
-                }
-            }
-        }
-        return super.mouseClicked(event, doubleClick)
-    }
-
-    override fun onClose() {
-        ConfigManager.save()
-        // setScreen is now on mc.gui, not mc directly
-        minecraft.gui.setScreen(parent)
-    }
-
-    override fun isPauseScreen(): Boolean = false
-}
-</file>
-
-<file path="src/client/kotlin/kyrielie/blockbard/client/gui/PlaybackHud.kt">
-package kyrielie.blockbard.client.gui
-
-import kyrielie.blockbard.client.playback.MidiFilePlayer
-import kyrielie.blockbard.organ.NoteBlockRegistry
-// HudRenderCallback is gone. Use the new HudElement / HudElementRegistry API.
-import net.fabricmc.fabric.api.client.rendering.v1.hud.HudElement
-import net.fabricmc.fabric.api.client.rendering.v1.hud.HudElementRegistry
-import net.fabricmc.fabric.api.client.rendering.v1.hud.VanillaHudElements
-import net.minecraft.client.DeltaTracker
-// GuiGraphics is now GuiGraphicsExtractor
-import net.minecraft.client.gui.GuiGraphicsExtractor
-import net.minecraft.client.Minecraft
-import net.minecraft.resources.Identifier
-
-object PlaybackHud {
-
-    var isVisible: Boolean = true
-    var lastShiftMessage: String = ""
-
-    // Identifier.of() was removed — use fromNamespaceAndPath(namespace, path)
-    private val HUD_ID = Identifier.fromNamespaceAndPath("blockbard", "playback_hud")
-
-    fun register() {
-        // Attach after BOSS_BAR so we render after the main HUD but before chat/subtitles.
-        HudElementRegistry.attachElementAfter(
-            VanillaHudElements.BOSS_BAR,
-            HUD_ID,
-            HudElement { graphics, _ -> render(graphics) }
-        )
-    }
-
-    private fun render(graphics: GuiGraphicsExtractor) {
-        if (!isVisible) return
-        val mc = Minecraft.getInstance()
-        // Screen access: mc.gui.screen()
-        if (mc.gui.screen() != null) return  // Don't show HUD when GUI is open
-        val font = mc.font
-
-        val playable = NoteBlockRegistry.allPlayable().size
-        val status = when {
-            MidiFilePlayer.isActive() && !MidiFilePlayer.isPaused -> {
-                val currentMs = MidiFilePlayer.getCurrentTick()
-                val totalMs = MidiFilePlayer.getTotalTicks()
-                "▶ PLAYING  tick $currentMs/$totalMs"
-            }
-            MidiFilePlayer.isPaused -> "⏸ PAUSED"
-            else -> "♪ BlockBard  [B to open]"
-        }
-
-        val tempo = "${"%.1f".format(MidiFilePlayer.tempoMultiplier)}x"
-        val coverage = "Organ: $playable blocks"
-
-        val x = 4
-        var y = graphics.guiHeight() - 48
-
-        // fill() signature unchanged
-        graphics.fill(x - 2, y - 2, x + 180, y + 40, 0x88000000.toInt())
-        // drawString() → text()  (GuiGraphicsExtractor uses text(font, string, x, y, color))
-        graphics.text(font, status, x, y, 0xAAFFAA); y += 10
-        graphics.text(font, "Tempo: $tempo  |  $coverage", x, y, 0xCCCCCC); y += 10
-        if (lastShiftMessage.isNotEmpty()) {
-            graphics.text(font, lastShiftMessage, x, y, 0xFFCC44)
-        }
-    }
-}
-</file>
-
-<file path="src/client/kotlin/kyrielie/blockbard/client/input/KeyboardInputHandler.kt">
-package kyrielie.blockbard.client.input
-
-import kyrielie.blockbard.client.config.ConfigManager
-import kyrielie.blockbard.organ.ArpeggioScheduler
-import kyrielie.blockbard.organ.NoteRequest
-import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents
-// KeyBindingHelper → KeyMappingHelper (fabric-key-mapping-api-v1)
-import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper
-import net.minecraft.client.KeyMapping
-import net.minecraft.client.Minecraft
-import org.lwjgl.glfw.GLFW
-
-object KeyboardInputHandler {
-
-    private val keyBindings: MutableList<KeyMapping> = mutableListOf()
-
-    fun register() {
-        for (i in 1..9) {
-            // KeyMapping constructor now takes KeyMapping.Category instead of a raw String
-            val key = KeyMappingHelper.registerKeyMapping(
-                KeyMapping(
-                    "key.blockbard.note$i",
-                    GLFW.GLFW_KEY_0 + i,
-                    KeyMapping.Category.MISC
-                )
-            )
-            keyBindings.add(key)
-        }
-
-        ClientTickEvents.END_CLIENT_TICK.register { _ ->
-            onTick()
-        }
-    }
-
-    private fun onTick() {
-        val mc = Minecraft.getInstance()
-        // Screen access: mc.gui.screen()
-        if (mc.gui.screen() != null) return  // Don't trigger during GUI
-
-        val mappings = ConfigManager.config.keyMappings
-        keyBindings.forEachIndexed { i, kb ->
-            while (kb.consumeClick()) {
-                val midiNote = mappings.getOrElse(i) { 54 + i }
-                ArpeggioScheduler.enqueue(NoteRequest(midiNote))
-            }
-        }
-    }
-}
-</file>
-
 <file path="src/client/kotlin/kyrielie/blockbard/client/input/MidiInputHandler.kt">
 package kyrielie.blockbard.client.input
 
@@ -778,77 +1106,6 @@ object MidiInputHandler {
 
     val isConnected: Boolean get() = transmitter != null
     val connectedDeviceName: String? get() = openedDeviceName
-}
-</file>
-
-<file path="src/client/kotlin/kyrielie/blockbard/client/organ/OrganScanner.kt">
-package kyrielie.blockbard.client.organ
-
-import kyrielie.blockbard.organ.MOB_HEAD_BLOCKS
-import kyrielie.blockbard.organ.NoteBlockEntry
-import kyrielie.blockbard.organ.NoteBlockRegistry
-import kyrielie.blockbard.organ.NoteBlockStatus
-import kyrielie.blockbard.util.midiBase
-import kyrielie.blockbard.util.noteIndexToMidi
-import net.minecraft.client.Minecraft
-import net.minecraft.world.level.block.Blocks
-import net.minecraft.world.level.block.NoteBlock
-import net.minecraft.world.level.block.state.properties.NoteBlockInstrument
-
-object OrganScanner {
-
-    /** Scan radius in blocks (1–10). Configurable via config screen. */
-    var scanRadius: Int = 5
-
-    /**
-     * Scans for noteblocks in a cube of [scanRadius] around the player and updates [NoteBlockRegistry].
-     * Must be called from the client thread (e.g. ClientTickEvents or button click).
-     */
-    fun scan() {
-        val mc = Minecraft.getInstance()
-        val player = mc.player ?: return
-        val world = mc.level ?: return
-
-        val playerPos = player.blockPosition()
-        val eyePos = player.eyePosition
-        val r = scanRadius
-        val found = mutableListOf<NoteBlockEntry>()
-
-        for (x in -r..r) for (y in -r..r) for (z in -r..r) {
-            val pos = playerPos.offset(x, y, z)
-            val state = world.getBlockState(pos)
-            if (state.block != Blocks.NOTE_BLOCK) continue
-
-            val instrument: NoteBlockInstrument = state.getValue(NoteBlock.INSTRUMENT)
-            val noteIndex: Int = state.getValue(NoteBlock.NOTE)
-            val midiNote = noteIndexToMidi(instrument, noteIndex)
-
-            val blockCenter = net.minecraft.world.phys.Vec3(pos.x + 0.5, pos.y + 0.5, pos.z + 0.5)
-            val distance = eyePos.distanceTo(blockCenter)
-
-            // Determine status from block above
-            val aboveBlock = world.getBlockState(pos.above()).block
-            val (status, mobHead) = when {
-                aboveBlock in MOB_HEAD_BLOCKS -> Pair(NoteBlockStatus.MOB_HEAD, aboveBlock)
-                !world.getBlockState(pos.above()).isAir -> Pair(NoteBlockStatus.SILENCED, null)
-                else -> Pair(NoteBlockStatus.PLAYABLE, null)
-            }
-
-            found.add(
-                NoteBlockEntry(
-                    pos = pos,
-                    instrument = instrument,
-                    noteIndex = noteIndex,
-                    midiNote = midiNote,
-                    distanceFromPlayer = distance,
-                    status = status,
-                    mobHeadType = mobHead
-                )
-            )
-        }
-
-        NoteBlockRegistry.update(found)
-    }
 }
 </file>
 
@@ -1214,201 +1471,6 @@ object NbsPlayer {
 }
 </file>
 
-<file path="src/client/kotlin/kyrielie/blockbard/client/player/PlayerController.kt">
-package kyrielie.blockbard.client.player
-
-import kyrielie.blockbard.organ.NoteBlockEntry
-import kyrielie.blockbard.organ.NoteBlockRegistry
-import kyrielie.blockbard.organ.OrganMap
-import kyrielie.blockbard.organ.ReachInfo
-import kyrielie.blockbard.util.vecToYawPitch
-import net.minecraft.client.Minecraft
-import net.minecraft.core.BlockPos
-import net.minecraft.core.Direction
-import net.minecraft.world.InteractionHand
-import net.minecraft.world.phys.BlockHitResult
-import net.minecraft.world.phys.Vec3
-
-/** Survival reach distance from eye position (blocks). */
-const val REACH_DISTANCE = 4.5
-
-sealed class CenterResult {
-    object NoPlayer : CenterResult()
-    object NoBlocks : CenterResult()
-    data class Centered(
-        val standPos: BlockPos,
-        val reachableCount: Int,
-        val totalFound: Int
-    ) : CenterResult()
-}
-
-object PlayerController {
-
-    var organMap: OrganMap? = null
-        private set
-
-    fun centerOnOrgan(): CenterResult {
-        val mc = Minecraft.getInstance()
-        val player = mc.player ?: return CenterResult.NoPlayer
-        val world = mc.level ?: return CenterResult.NoPlayer
-
-        val playableBlocks = NoteBlockRegistry.allPlayable()
-        if (playableBlocks.isEmpty()) return CenterResult.NoBlocks
-
-        val avgX = playableBlocks.map { it.pos.x + 0.5 }.average()
-        val avgZ = playableBlocks.map { it.pos.z + 0.5 }.average()
-        val playerPos = player.blockPosition()
-        val cX = avgX.toInt()
-        val cZ = avgZ.toInt()
-        val searchRadius = 6
-
-        val candidates = mutableListOf<BlockPos>()
-        for (x in -searchRadius..searchRadius) {
-            for (z in -searchRadius..searchRadius) {
-                val testPos = BlockPos(cX + x, playerPos.y, cZ + z)
-                val feetState = world.getBlockState(testPos)
-                val headState = world.getBlockState(testPos.above())
-                val floorState = world.getBlockState(testPos.below())
-                if (!feetState.isAir || !headState.isAir) continue
-                if (!floorState.isSolid) continue
-                candidates.add(testPos)
-            }
-        }
-        if (candidates.isEmpty()) candidates.add(playerPos)
-
-        val best = candidates.maxByOrNull { standPos ->
-            val eyePos = Vec3(standPos.x + 0.5, standPos.y + 1.62, standPos.z + 0.5)
-            playableBlocks.count { entry ->
-                val target = Vec3(entry.pos.x + 0.5, entry.pos.y + 1.0, entry.pos.z + 0.5)
-                eyePos.distanceTo(target) <= REACH_DISTANCE
-            }
-        } ?: playerPos
-
-        val eyePos = Vec3(best.x + 0.5, best.y + 1.62, best.z + 0.5)
-        val reachMap = playableBlocks.associate { entry ->
-            val target = Vec3(entry.pos.x + 0.5, entry.pos.y + 1.0, entry.pos.z + 0.5)
-            val delta = target.subtract(eyePos)
-            val distance = delta.length()
-            val isReachable = distance <= REACH_DISTANCE
-            val (yaw, pitch) = if (isReachable) vecToYawPitch(delta) else Pair(0f, 0f)
-            entry.pos to ReachInfo(isReachable, yaw, pitch, distance)
-        }
-
-        organMap = OrganMap(best, reachMap)
-
-        if (best != playerPos) {
-            // moveTo() was removed. Use setPos(Vec3) to reposition, preserving current rotation.
-            // setPos takes a Vec3; yRot/xRot are set separately via their setters.
-            player.setPos(Vec3(best.x + 0.5, best.y.toDouble(), best.z + 0.5))
-            // Keep existing rotation — read via getters, re-apply via setters
-            player.setYRot(player.getYRot())
-            player.setXRot(player.getXRot())
-        }
-
-        val reachable = reachMap.values.count { it.isReachable }
-        return CenterResult.Centered(best, reachable, playableBlocks.size)
-    }
-
-    fun interactWith(pos: BlockPos): Boolean {
-        val mc = Minecraft.getInstance()
-        val player = mc.player ?: return false
-        val reach = organMap?.getReachInfo(pos)
-        if (reach != null && !reach.isReachable) return false
-
-        val eyePos = player.eyePosition
-        val target = Vec3(pos.x + 0.5, pos.y + 1.0, pos.z + 0.5)
-        val delta = target.subtract(eyePos)
-        if (delta.length() > REACH_DISTANCE) return false
-
-        val (yaw, pitch) = reach?.let { Pair(it.yaw, it.pitch) } ?: vecToYawPitch(delta)
-        // Use setters rather than direct field assignment — they propagate rotation correctly
-        player.setYRot(yaw)
-        player.setXRot(pitch)
-
-        val hitResult = BlockHitResult(target, Direction.UP, pos, false)
-        mc.gameMode?.useItemOn(player, InteractionHand.MAIN_HAND, hitResult)
-        return true
-    }
-
-    fun interactWith(entry: NoteBlockEntry): Boolean = interactWith(entry.pos)
-
-    fun clearOrganMap() { organMap = null }
-}
-</file>
-
-<file path="src/client/kotlin/kyrielie/blockbard/client/BlockBardClient.kt">
-package kyrielie.blockbard.client
-
-import kyrielie.blockbard.client.config.ConfigManager
-import kyrielie.blockbard.client.gui.MainScreen
-import kyrielie.blockbard.client.gui.PlaybackHud
-import kyrielie.blockbard.client.input.KeyboardInputHandler
-import kyrielie.blockbard.client.input.MidiInputHandler
-import kyrielie.blockbard.client.player.PlayerController
-import kyrielie.blockbard.organ.ArpeggioScheduler
-import kyrielie.blockbard.organ.InstrumentShifter
-import kyrielie.blockbard.client.organ.OrganScanner
-import net.fabricmc.api.ClientModInitializer
-import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents
-// KeyBindingHelper → KeyMappingHelper (fabric-key-mapping-api-v1)
-import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper
-import net.minecraft.client.KeyMapping
-import org.lwjgl.glfw.GLFW
-
-object BlockBardClient : ClientModInitializer {
-
-    const val MOD_ID = "blockbard"
-
-    private lateinit var openGuiKey: KeyMapping
-    private lateinit var toggleHudKey: KeyMapping
-
-    override fun onInitializeClient() {
-        ConfigManager.load()
-        val cfg = ConfigManager.config
-
-        // Apply config to subsystems
-        OrganScanner.scanRadius = cfg.scanRadius
-        InstrumentShifter.mode = cfg.shiftModeEnum()
-        InstrumentShifter.maxOctaveShift = cfg.maxOctaveShift
-        ArpeggioScheduler.staleTimeoutMs = cfg.arpeggioStaleTimeoutMs
-
-        // Wire the interact delegate so ArpeggioScheduler can call PlayerController without
-        // the main sourceset depending on the client sourceset.
-        ArpeggioScheduler.interactDelegate = { pos -> PlayerController.interactWith(pos) }
-
-        // Register hotkeys
-        // KeyMapping now takes KeyMapping.Category instead of a raw String
-        openGuiKey = KeyMappingHelper.registerKeyMapping(
-            KeyMapping("key.blockbard.open_gui", GLFW.GLFW_KEY_B, KeyMapping.Category.MISC)
-        )
-        toggleHudKey = KeyMappingHelper.registerKeyMapping(
-            KeyMapping("key.blockbard.toggle_hud", GLFW.GLFW_KEY_H, KeyMapping.Category.MISC)
-        )
-
-        // Register live-play keys 1–9
-        KeyboardInputHandler.register()
-
-        // Register HUD
-        PlaybackHud.register()
-
-        // Main tick event
-        // Screen access: mc.gui.screen() / mc.gui.setScreen(...)
-        ClientTickEvents.END_CLIENT_TICK.register { mc ->
-            while (openGuiKey.consumeClick()) {
-                if (mc.gui.screen() == null) mc.gui.setScreen(MainScreen())
-            }
-            while (toggleHudKey.consumeClick()) {
-                PlaybackHud.isVisible = !PlaybackHud.isVisible
-            }
-            ArpeggioScheduler.onTick()
-        }
-
-        // Auto-connect saved MIDI device
-        MidiInputHandler.autoConnect()
-    }
-}
-</file>
-
 <file path="src/client/resources/assets/blockbard/lang/en_us.json">
 {
   "key.blockbard.open_gui": "Open BlockBard",
@@ -1423,219 +1485,6 @@ object BlockBardClient : ClientModInitializer {
   "key.blockbard.note8": "Play Note 8",
   "key.blockbard.note9": "Play Note 9",
   "category.blockbard": "BlockBard"
-}
-</file>
-
-<file path="src/main/kotlin/kyrielie/blockbard/organ/ArpeggioScheduler.kt">
-package kyrielie.blockbard.organ
-
-import net.minecraft.core.BlockPos
-
-data class NoteRequest(
-    val midiNote: Int,
-    val enqueuedAtMs: Long = System.currentTimeMillis(),
-    /** Pre-resolved block position (null = resolve from assignment map at dispatch time). */
-    val resolvedPos: BlockPos? = null
-)
-
-/**
- * Tick-based queue that serialises simultaneous note requests into sequential block interactions.
- * One note is dispatched per tick via [onTick]. The actual block interaction is delegated to
- * [interactDelegate], which is wired by BlockBardClient on the client side to PlayerController.
- */
-object ArpeggioScheduler {
-
-    /** Set by MidiToOrganMapper to map midiNote → the assigned BlockPos. */
-    var assignment: Map<Int, BlockPos> = emptyMap()
-
-    /** Requests older than this are dropped to avoid note build-up during lag. */
-    var staleTimeoutMs: Long = 200L
-
-    /**
-     * Wired by the client entrypoint to the actual block interaction function.
-     * Receives the BlockPos to right-click; returns true if dispatched.
-     */
-    var interactDelegate: ((BlockPos) -> Boolean)? = null
-
-    private val queue: ArrayDeque<NoteRequest> = ArrayDeque()
-
-    /** Called every ClientTickEvent. Dispatches one queued note per tick. */
-    fun onTick() {
-        if (queue.isEmpty()) return
-        val request = queue.removeFirst()
-        val age = System.currentTimeMillis() - request.enqueuedAtMs
-        if (age > staleTimeoutMs) {
-            onTick()  // skip stale, try next
-            return
-        }
-        val pos = request.resolvedPos
-            ?: assignment[request.midiNote]
-            ?: NoteBlockRegistry.findBestForMidi(request.midiNote)?.pos
-            ?: return
-        interactDelegate?.invoke(pos)
-    }
-
-    fun enqueue(request: NoteRequest) { queue.addLast(request) }
-
-    fun clear() = queue.clear()
-
-    fun isEmpty(): Boolean = queue.isEmpty()
-
-    val queueSize: Int get() = queue.size
-}
-</file>
-
-<file path="src/main/kotlin/kyrielie/blockbard/organ/InstrumentShifter.kt">
-package kyrielie.blockbard.organ
-
-enum class ShiftMode {
-    EXACT_ONLY,       // Skip the note if no exact match
-    INSTRUMENT_SHIFT, // Use a different instrument that natively covers this note
-    OCTAVE_SHIFT,     // Transpose by ±1 or ±2 octaves until a match is found
-    BEST_EFFORT       // Try INSTRUMENT_SHIFT first, then OCTAVE_SHIFT as fallback
-}
-
-data class ShiftResult(
-    val entry: NoteBlockEntry,
-    val semitoneShift: Int  // 0 if exact, ±12/±24 if octave shifted
-)
-
-object InstrumentShifter {
-
-    var mode: ShiftMode = ShiftMode.BEST_EFFORT
-    var maxOctaveShift: Int = 1  // max octaves to transpose (1 or 2)
-
-    /**
-     * Finds the best available noteblock entry for a given MIDI note,
-     * considering the configured ShiftMode.
-     *
-     * [candidates] is a list of all PLAYABLE entries to search in
-     * (allows the caller to exclude already-assigned blocks).
-     */
-    fun findBest(midiNote: Int, candidates: List<NoteBlockEntry>): ShiftResult? {
-        return when (mode) {
-            ShiftMode.EXACT_ONLY -> findExact(midiNote, candidates)?.let { ShiftResult(it, 0) }
-            ShiftMode.INSTRUMENT_SHIFT -> findInstrumentShift(midiNote, candidates)
-            ShiftMode.OCTAVE_SHIFT -> findOctaveShift(midiNote, candidates)
-            ShiftMode.BEST_EFFORT -> findInstrumentShift(midiNote, candidates)
-                ?: findOctaveShift(midiNote, candidates)
-        }
-    }
-
-    /** Exact MIDI note match across any instrument. */
-    fun findExact(midiNote: Int, candidates: List<NoteBlockEntry>): NoteBlockEntry? =
-        candidates
-            .filter { it.midiNote == midiNote }
-            .minByOrNull { it.distanceFromPlayer }
-
-    /** Instrument shift: find any block whose instrument range natively covers this note. */
-    private fun findInstrumentShift(midiNote: Int, candidates: List<NoteBlockEntry>): ShiftResult? =
-        candidates
-            .filter { it.midiNote == midiNote }
-            .minByOrNull { it.distanceFromPlayer }
-            ?.let { ShiftResult(it, 0) }
-
-    /** Octave shift: try ±12 then ±24 semitones until a match is found. */
-    private fun findOctaveShift(midiNote: Int, candidates: List<NoteBlockEntry>): ShiftResult? {
-        val shifts = buildList {
-            add(0)
-            if (maxOctaveShift >= 1) { add(-12); add(12) }
-            if (maxOctaveShift >= 2) { add(-24); add(24) }
-        }
-        for (shift in shifts) {
-            val shifted = midiNote + shift
-            val entry = candidates
-                .filter { it.midiNote == shifted }
-                .minByOrNull { it.distanceFromPlayer }
-            if (entry != null) return ShiftResult(entry, shift)
-        }
-        return null
-    }
-}
-</file>
-
-<file path="src/main/kotlin/kyrielie/blockbard/organ/MidiToOrganMapper.kt">
-package kyrielie.blockbard.organ
-
-import kyrielie.blockbard.util.midiBase
-import kyrielie.blockbard.util.coversNatively
-import net.minecraft.core.BlockPos
-
-data class OrganAssignment(
-    /** Maps each distinct MIDI note used in the song to a noteblock position. */
-    val assignment: Map<Int, BlockPos>,
-    /** MIDI notes that could not be assigned to any block. */
-    val unplayable: List<Int>,
-    /** Shifts applied: midiNote → semitone shift used. */
-    val shifts: Map<Int, Int>
-)
-
-object MidiToOrganMapper {
-
-    /**
-     * Assigns MIDI notes to physical noteblocks.
-     * [midiNoteUsageCounts] maps midiNote → how often it appears in the song (used to prioritize frequent notes).
-     * [reachableBlocks] is the list of PLAYABLE blocks in the current OrganMap.
-     */
-    fun buildAssignment(
-        midiNoteUsageCounts: Map<Int, Int>,
-        reachableBlocks: List<NoteBlockEntry>
-    ): OrganAssignment {
-        val assignment = mutableMapOf<Int, BlockPos>()
-        val unplayable = mutableListOf<Int>()
-        val shifts = mutableMapOf<Int, Int>()
-        val usedPositions = mutableSetOf<BlockPos>()
-
-        // Process most-used notes first so they get best available blocks
-        val sortedNotes = midiNoteUsageCounts.entries.sortedByDescending { it.value }.map { it.key }
-
-        for (midiNote in sortedNotes) {
-            val available = reachableBlocks.filter { it.pos !in usedPositions }
-
-            // 1. Prefer a block whose instrument natively covers this note (no tuning offset required)
-            val nativeCandidate = available
-                .filter { it.instrument.coversNatively(midiNote) }
-                .minByOrNull { it.distanceFromPlayer }
-
-            if (nativeCandidate != null) {
-                assignment[midiNote] = nativeCandidate.pos
-                usedPositions.add(nativeCandidate.pos)
-                shifts[midiNote] = 0
-                continue
-            }
-
-            // 2. Fall back to InstrumentShifter
-            val shiftResult = InstrumentShifter.findBest(midiNote, available)
-            if (shiftResult != null) {
-                assignment[midiNote] = shiftResult.entry.pos
-                usedPositions.add(shiftResult.entry.pos)
-                shifts[midiNote] = shiftResult.semitoneShift
-                continue
-            }
-
-            unplayable.add(midiNote)
-        }
-
-        return OrganAssignment(assignment, unplayable, shifts)
-    }
-
-    /**
-     * Computes the target note index for each assigned block.
-     * Returns Map<BlockPos, targetNoteIndex> to feed into NoteBlockTuner.
-     */
-    fun computeTuneTargets(
-        assignment: OrganAssignment,
-        reachableBlocks: List<NoteBlockEntry>
-    ): List<TuneTarget> {
-        val blockByPos = reachableBlocks.associateBy { it.pos }
-        return assignment.assignment.mapNotNull { (midiNote, pos) ->
-            val entry = blockByPos[pos] ?: return@mapNotNull null
-            val shift = assignment.shifts[midiNote] ?: 0
-            val effectiveMidi = midiNote + shift
-            val targetNoteIndex = (effectiveMidi - entry.instrument.midiBase).coerceIn(0, 24)
-            TuneTarget(pos, entry.noteIndex, targetNoteIndex, entry.instrument)
-        }
-    }
 }
 </file>
 
@@ -1688,17 +1537,31 @@ package kyrielie.blockbard.organ
 import net.minecraft.core.BlockPos
 import net.minecraft.world.level.block.state.properties.NoteBlockInstrument
 import kyrielie.blockbard.util.midiBase
+import org.slf4j.LoggerFactory
+
+/** Represents a detected instrument overflow: more than 24 noteblocks share one instrument. */
+data class InstrumentOverflow(
+    val instrument: NoteBlockInstrument,
+    val count: Int,
+    val maxUsable: Int = 25  // noteIndex 0–24
+) {
+    val excess: Int get() = count - maxUsable
+    override fun toString() = "${instrument.name}: $count blocks (max $maxUsable, $excess excess)"
+}
 
 /**
  * Central in-memory registry mapping BlockPos → NoteBlockEntry.
  * Updated by OrganScanner on each scan; queried by the mapper and scheduler.
  */
 object NoteBlockRegistry {
+
+    private val logger = LoggerFactory.getLogger("BlockBard/NoteBlockRegistry")
     private val entries: MutableMap<BlockPos, NoteBlockEntry> = LinkedHashMap()
 
     fun update(newEntries: List<NoteBlockEntry>) {
         entries.clear()
         newEntries.forEach { entries[it.pos] = it }
+        checkInstrumentOverflow()
     }
 
     fun clear() = entries.clear()
@@ -1725,6 +1588,16 @@ object NoteBlockRegistry {
     fun countPerInstrument(): Map<NoteBlockInstrument, Int> =
         allPlayable().groupBy { it.instrument }.mapValues { it.value.size }
 
+    /**
+     * Returns any instruments that have more than 25 noteblocks (indices 0–24).
+     * More than 25 blocks per instrument means some will be duplicates and can never
+     * all be assigned unique notes. This is a configuration error in the noteblock organ.
+     */
+    fun detectInstrumentOverflows(): List<InstrumentOverflow> =
+        countPerInstrument()
+            .filter { (_, count) -> count > 25 }
+            .map { (inst, count) -> InstrumentOverflow(inst, count) }
+
     /** Update a specific entry's noteIndex after tuning. */
     fun updateTunedNote(pos: BlockPos, newNoteIndex: Int) {
         val existing = entries[pos] ?: return
@@ -1735,79 +1608,14 @@ object NoteBlockRegistry {
     }
 
     fun size(): Int = entries.size
-}
-</file>
 
-<file path="src/main/kotlin/kyrielie/blockbard/organ/NoteBlockTuner.kt">
-package kyrielie.blockbard.organ
-
-import kyrielie.blockbard.util.clicksNeeded
-import net.minecraft.core.BlockPos
-import net.minecraft.world.level.block.state.properties.NoteBlockInstrument
-
-data class TuneTarget(
-    val pos: BlockPos,
-    val currentNote: Int,   // 0–24, read from BlockState at scan time
-    val targetNote: Int,    // required by MidiToOrganMapper assignment
-    val instrument: NoteBlockInstrument
-) {
-    val clicksRequired: Int get() = clicksNeeded(currentNote, targetNote)
-    val alreadyTuned: Boolean get() = currentNote == targetNote
-}
-
-/**
- * Manages the auto-tuning state machine.
- * Consumes TuneTargets one at a time; the client event loop calls nextClick() each tick
- * to get the next (pos, clickCount) action and reports progress via [onProgress].
- */
-class NoteBlockTuner(
-    private val targets: List<TuneTarget>,
-    val onProgress: (completed: Int, total: Int) -> Unit = { _, _ -> }
-) {
-    private var targetIndex = 0
-    private var clicksRemaining = 0
-    private var completed = 0
-    val total: Int = targets.sumOf { it.clicksRequired }
-    var isDone: Boolean = false
-        private set
-
-    init {
-        advance()
-    }
-
-    private fun advance() {
-        while (targetIndex < targets.size) {
-            val t = targets[targetIndex]
-            if (t.alreadyTuned) {
-                targetIndex++
-                completed++
-                onProgress(completed, targets.size)
-                continue
-            }
-            clicksRemaining = t.clicksRequired
-            break
+    private fun checkInstrumentOverflow() {
+        val overflows = detectInstrumentOverflows()
+        if (overflows.isEmpty()) return
+        overflows.forEach { o ->
+            logger.warn("NoteBlockRegistry: INSTRUMENT OVERFLOW — ${o.instrument.name} has ${o.count} blocks but max unique notes is ${o.maxUsable} (${o.excess} excess blocks will be unreachable)")
         }
-        if (targetIndex >= targets.size) isDone = true
     }
-
-    /** Returns the BlockPos to click this tick, or null if done. */
-    fun nextClick(): BlockPos? {
-        if (isDone) return null
-        val target = targets.getOrNull(targetIndex) ?: run { isDone = true; return null }
-        clicksRemaining--
-        if (clicksRemaining <= 0) {
-            // Update registry so subsequent scans reflect the new note
-            NoteBlockRegistry.updateTunedNote(target.pos, target.targetNote)
-            targetIndex++
-            completed++
-            onProgress(completed, targets.size)
-            advance()
-        }
-        return target.pos
-    }
-
-    val completedBlocks: Int get() = completed
-    val totalBlocks: Int get() = targets.size
 }
 </file>
 
@@ -1875,39 +1683,65 @@ package kyrielie.blockbard.util
 
 import net.minecraft.world.level.block.state.properties.NoteBlockInstrument
 
-/** Maps each instrument to its MIDI base note (the MIDI note produced at noteIndex=0). */
+/**
+ * Maps each NoteBlockInstrument to its MIDI base note (the MIDI note produced at noteIndex=0).
+ *
+ * Ranges per wiki (all instruments span exactly 2 octaves = 25 semitones, index 0–24):
+ *
+ *   midiBase 30  → F#1–F#3   (BASS, DIDGERIDOO)
+ *   midiBase 42  → F#2–F#4   (GUITAR, TRUMPET, TRUMPET_EXPOSED, TRUMPET_OXIDIZED, TRUMPET_WEATHERED)
+ *   midiBase 54  → F#3–F#5   (HARP, BASEDRUM, SNARE, HAT, BANJO, BIT, IRON_XYLOPHONE, PLING)
+ *   midiBase 66  → F#4–F#6   (FLUTE, COW_BELL)
+ *   midiBase 78  → F#5–F#7   (BELL, CHIME, XYLOPHONE)
+ *
+ * Trumpet enum names confirmed against the decompiled NoteBlockInstrument.java for this
+ * MC build: TRUMPET, TRUMPET_EXPOSED, TRUMPET_OXIDIZED, TRUMPET_WEATHERED (all Type.BASE_BLOCK,
+ * same as HARP/BASS/etc. — fully tunable like any other noteblock instrument). All four are
+ * grouped with GUITAR in the brass/copper family range.
+ *
+ * COW_BELL fix: was incorrectly mapped to 54 (F#3); wiki specifies F#4–F#6 → 66.
+ */
 val NoteBlockInstrument.midiBase: Int
     get() = when (this) {
-        // F#1 — −2 octaves
+
+        // ── F#1 base (midiBase 30) ────────────────────────────────────────────
         NoteBlockInstrument.BASS,
         NoteBlockInstrument.DIDGERIDOO -> 30
 
-        // F#2 — −1 octave
-        // Guitar, Weathered/Oxidized Trumpet share the 42 base.
-        // NOTE: Verify TRUMPET_WEATHERED / TRUMPET_OXIDIZED enum names against
-        //       `./gradlew genSources` for Minecraft 26.2.
-        NoteBlockInstrument.GUITAR -> 42
+        // ── F#2 base (midiBase 42) ────────────────────────────────────────────
+        // Trumpet variants confirmed via decompiled source: TRUMPET, TRUMPET_EXPOSED,
+        // TRUMPET_OXIDIZED, TRUMPET_WEATHERED. Grouped with GUITAR (brass/copper family).
+        NoteBlockInstrument.GUITAR,
+        NoteBlockInstrument.TRUMPET,
+        NoteBlockInstrument.TRUMPET_EXPOSED,
+        NoteBlockInstrument.TRUMPET_OXIDIZED,
+        NoteBlockInstrument.TRUMPET_WEATHERED -> 42
 
-        // F#3 — standard (0 offset)
+        // ── F#3 base (midiBase 54) ────────────────────────────────────────────
         NoteBlockInstrument.BASEDRUM,
         NoteBlockInstrument.SNARE,
         NoteBlockInstrument.HAT,
         NoteBlockInstrument.BANJO,
-        NoteBlockInstrument.COW_BELL,
         NoteBlockInstrument.BIT,
         NoteBlockInstrument.IRON_XYLOPHONE,
         NoteBlockInstrument.PLING,
         NoteBlockInstrument.HARP -> 54
 
-        // F#4 — +1 octave
-        NoteBlockInstrument.FLUTE -> 66
+        // ── F#4 base (midiBase 66) ────────────────────────────────────────────
+        // COW_BELL: wiki says F#4–F#6; was previously (incorrectly) mapped to 54.
+        NoteBlockInstrument.FLUTE,
+        NoteBlockInstrument.COW_BELL -> 66
 
-        // F#5 — +2 octaves
+        // ── F#5 base (midiBase 78) ────────────────────────────────────────────
         NoteBlockInstrument.BELL,
         NoteBlockInstrument.CHIME,
         NoteBlockInstrument.XYLOPHONE -> 78
 
-        // Default: standard range for any new instruments (trumpets etc. verified at genSources time)
+        // Mob-head instruments (ZOMBIE, SKELETON, CREEPER, DRAGON, WITHER_SKELETON,
+        // PIGLIN) and CUSTOM_HEAD are not pitch-tunable noteblock instruments — they
+        // ignore noteIndex entirely, so a midiBase is meaningless for them. Default
+        // to 54 only as an inert fallback; callers should be checking isTunable()
+        // before relying on midiBase for these.
         else -> 54
     }
 
@@ -4014,6 +3848,635 @@ pluginManagement {
 rootProject.name = 'blockbard'
 </file>
 
+<file path="src/client/kotlin/kyrielie/blockbard/client/organ/OrganScanner.kt">
+package kyrielie.blockbard.client.organ
+
+import kyrielie.blockbard.organ.MOB_HEAD_BLOCKS
+import kyrielie.blockbard.organ.NoteBlockEntry
+import kyrielie.blockbard.organ.NoteBlockRegistry
+import kyrielie.blockbard.organ.NoteBlockStatus
+import kyrielie.blockbard.util.midiBase
+import kyrielie.blockbard.util.noteIndexToMidi
+import kyrielie.blockbard.util.midiNoteToName
+import net.minecraft.client.Minecraft
+import net.minecraft.network.chat.Component
+import net.minecraft.world.level.block.Blocks
+import net.minecraft.world.level.block.NoteBlock
+import net.minecraft.world.level.block.state.properties.NoteBlockInstrument
+import org.slf4j.LoggerFactory
+
+object OrganScanner {
+
+    private val logger = LoggerFactory.getLogger("BlockBard/OrganScanner")
+
+    /** Scan radius in blocks (1–10). Configurable via config screen. */
+    var scanRadius: Int = 5
+
+    /**
+     * Scans for noteblocks in a cube of [scanRadius] around the player and updates [NoteBlockRegistry].
+     * Must be called from the client thread (e.g. ClientTickEvents or button click).
+     */
+    fun scan() {
+        val mc = Minecraft.getInstance()
+        val player = mc.player ?: run {
+            logger.warn("scan: no player available")
+            return
+        }
+        val world = mc.level ?: run {
+            logger.warn("scan: no world available")
+            return
+        }
+
+        val playerPos = player.blockPosition()
+        val eyePos = player.eyePosition
+        val r = scanRadius
+        val found = mutableListOf<NoteBlockEntry>()
+
+        logger.info("scan: scanning radius=$r around $playerPos")
+
+        for (x in -r..r) for (y in -r..r) for (z in -r..r) {
+            val pos = playerPos.offset(x, y, z)
+            val state = world.getBlockState(pos)
+            if (state.block != Blocks.NOTE_BLOCK) continue
+
+            val instrument: NoteBlockInstrument = state.getValue(NoteBlock.INSTRUMENT)
+            val noteIndex: Int = state.getValue(NoteBlock.NOTE)
+            val midiNote = noteIndexToMidi(instrument, noteIndex)
+
+            val blockCenter = net.minecraft.world.phys.Vec3(pos.x + 0.5, pos.y + 0.5, pos.z + 0.5)
+            val distance = eyePos.distanceTo(blockCenter)
+
+            val aboveBlock = world.getBlockState(pos.above()).block
+            val (status, mobHead) = when {
+                aboveBlock in MOB_HEAD_BLOCKS -> Pair(NoteBlockStatus.MOB_HEAD, aboveBlock)
+                !world.getBlockState(pos.above()).isAir -> Pair(NoteBlockStatus.SILENCED, null)
+                else -> Pair(NoteBlockStatus.PLAYABLE, null)
+            }
+
+            logger.info("scan: found NoteBlock at $pos — instrument=${instrument.name} noteIndex=$noteIndex midi=$midiNote (${midiNoteToName(midiNote)}) status=$status dist=${"%.1f".format(distance)}")
+
+            found.add(
+                NoteBlockEntry(
+                    pos = pos,
+                    instrument = instrument,
+                    noteIndex = noteIndex,
+                    midiNote = midiNote,
+                    distanceFromPlayer = distance,
+                    status = status,
+                    mobHeadType = mobHead
+                )
+            )
+        }
+
+        NoteBlockRegistry.update(found)
+
+        // Check for instrument overflow
+        val overflows = NoteBlockRegistry.detectInstrumentOverflows()
+        if (overflows.isNotEmpty()) {
+            overflows.forEach { o ->
+                val msg = "⚠ ${o.instrument.name} has ${o.count} blocks (max 25) — ${o.excess} excess will be untunable"
+                logger.warn("scan: instrument overflow — $msg")
+                player.sendSystemMessage(Component.literal("§b[BlockBard] §e$msg"))
+            }
+        }
+
+        val playable = found.count { it.status == NoteBlockStatus.PLAYABLE }
+        val silenced = found.count { it.status == NoteBlockStatus.SILENCED }
+        val mobHeads = found.count { it.status == NoteBlockStatus.MOB_HEAD }
+
+        val summary = "Scan complete: ${found.size} total — $playable playable, $silenced silenced, $mobHeads mob-head"
+        logger.info("scan: $summary")
+
+        // Echo to chat for in-game visibility
+        player.sendSystemMessage(Component.literal("§b[BlockBard] §f$summary"))
+
+        if (playable > 0) {
+            val playableEntries = found.filter { it.status == NoteBlockStatus.PLAYABLE }
+
+            val noteRange = playableEntries.sortedBy { it.midiNote }
+            val low = midiNoteToName(noteRange.first().midiNote)
+            val high = midiNoteToName(noteRange.last().midiNote)
+            logger.info("scan: playable MIDI range $low–$high")
+            player.sendSystemMessage(Component.literal("§b[BlockBard] §7Playable range: $low – $high"))
+
+            // Per-instrument breakdown: which notes (and how many blocks) are actually
+            // available for each instrument. This is what tuning/playback logic needs —
+            // the global range above can look fine while a specific instrument is missing
+            // notes or has duplicate noteIndex collisions.
+            logger.info("scan: per-instrument note coverage —")
+            playableEntries
+                .groupBy { it.instrument }
+                .toSortedMap(compareBy { it.name })
+                .forEach { (instrument, entries) ->
+                    val sortedByIndex = entries.sortedBy { it.noteIndex }
+                    val indices = sortedByIndex.map { it.noteIndex }
+                    val duplicateIndices = indices.groupBy { it }.filter { it.value.size > 1 }.keys.sorted()
+                    val instrLow = midiNoteToName(sortedByIndex.first().midiNote)
+                    val instrHigh = midiNoteToName(sortedByIndex.last().midiNote)
+
+                    val dupNote = if (duplicateIndices.isNotEmpty()) " ⚠ duplicate noteIndex(es): $duplicateIndices" else ""
+                    logger.info("  ${instrument.name}: ${entries.size} block(s), noteIndex [${indices.joinToString()}], range $instrLow–$instrHigh$dupNote")
+                }
+        }
+    }
+}
+</file>
+
+<file path="src/main/kotlin/kyrielie/blockbard/organ/ArpeggioScheduler.kt">
+package kyrielie.blockbard.organ
+
+import net.minecraft.core.BlockPos
+import org.slf4j.LoggerFactory
+
+data class NoteRequest(
+    val midiNote: Int,
+    val enqueuedAtMs: Long = System.currentTimeMillis(),
+    /**
+     * Pre-resolved block position. When set, bypasses the assignment map entirely.
+     * Used by the scale test and any direct-play path that already knows which block to hit.
+     */
+    val resolvedPos: BlockPos? = null
+)
+
+/**
+ * Tick-based queue that serialises simultaneous note requests into sequential
+ * block interactions. One note is dispatched per tick via [onTick].
+ *
+ * [interactDelegate] is wired by BlockBardClient to PlayerController.interactWith().
+ */
+object ArpeggioScheduler {
+
+    private val logger = LoggerFactory.getLogger("BlockBard/ArpeggioScheduler")
+
+    /** Populated by MidiToOrganMapper: midiNote → assigned BlockPos. */
+    var assignment: Map<Int, BlockPos> = emptyMap()
+
+    /** Requests older than this are dropped to prevent note build-up after lag. */
+    var staleTimeoutMs: Long = 200L
+
+    /** Wired to PlayerController.interactWith() by the client entrypoint. */
+    var interactDelegate: ((BlockPos) -> Boolean)? = null
+
+    private val queue: ArrayDeque<NoteRequest> = ArrayDeque()
+
+    /** Called every client tick. Dispatches one queued note. */
+    fun onTick() {
+        // Iterative stale-skip — never recursive
+        while (queue.isNotEmpty()) {
+            val request = queue.first()
+            val age = System.currentTimeMillis() - request.enqueuedAtMs
+
+            if (age > staleTimeoutMs) {
+                queue.removeFirst()
+                logger.debug("dropping stale MIDI ${request.midiNote} (age ${age}ms > ${staleTimeoutMs}ms)")
+                continue
+            }
+
+            // Fresh note — find the block
+            queue.removeFirst()
+            val pos = request.resolvedPos
+                ?: assignment[request.midiNote]
+                ?: NoteBlockRegistry.findBestForMidi(request.midiNote)?.pos
+
+            if (pos == null) {
+                logger.warn("no block found for MIDI ${request.midiNote} — skipping (assignment has ${assignment.size} entries)")
+                return
+            }
+
+            logger.debug("dispatching MIDI ${request.midiNote} → $pos")
+            val dispatched = interactDelegate?.invoke(pos) ?: false
+            if (!dispatched) {
+                logger.warn("interactDelegate returned false for $pos (MIDI ${request.midiNote})")
+            }
+            return
+        }
+    }
+
+    fun enqueue(request: NoteRequest) {
+        logger.debug("enqueue MIDI ${request.midiNote} resolvedPos=${request.resolvedPos} queueSize=${queue.size + 1}")
+        queue.addLast(request)
+    }
+
+    fun clear() {
+        logger.info("queue cleared (had ${queue.size} items)")
+        queue.clear()
+    }
+
+    fun isEmpty(): Boolean = queue.isEmpty()
+    val queueSize: Int get() = queue.size
+}
+</file>
+
+<file path="src/main/kotlin/kyrielie/blockbard/organ/InstrumentShifter.kt">
+package kyrielie.blockbard.organ
+
+import kyrielie.blockbard.util.coversNatively
+
+enum class ShiftMode {
+    EXACT_ONLY,       // Skip the note if no exact match
+    INSTRUMENT_SHIFT, // Use a different instrument that natively covers this note
+    OCTAVE_SHIFT,     // Transpose by ±1 or ±2 octaves until a match is found
+    BEST_EFFORT       // Try INSTRUMENT_SHIFT first, then OCTAVE_SHIFT as fallback
+}
+
+data class ShiftResult(
+    val entry: NoteBlockEntry,
+    val semitoneShift: Int  // 0 if exact, ±12/±24 if octave shifted
+)
+
+object InstrumentShifter {
+
+    var mode: ShiftMode = ShiftMode.BEST_EFFORT
+    var maxOctaveShift: Int = 1  // max octaves to transpose (1 or 2)
+
+    /**
+     * Finds the best available noteblock entry for a given MIDI note,
+     * considering the configured ShiftMode.
+     *
+     * [candidates] is a list of all PLAYABLE entries to search in
+     * (allows the caller to exclude already-assigned blocks).
+     */
+    fun findBest(midiNote: Int, candidates: List<NoteBlockEntry>): ShiftResult? {
+        return when (mode) {
+            ShiftMode.EXACT_ONLY -> findExact(midiNote, candidates)?.let { ShiftResult(it, 0) }
+            ShiftMode.INSTRUMENT_SHIFT -> findInstrumentShift(midiNote, candidates)
+            ShiftMode.OCTAVE_SHIFT -> findOctaveShift(midiNote, candidates)
+            ShiftMode.BEST_EFFORT -> findInstrumentShift(midiNote, candidates)
+                ?: findOctaveShift(midiNote, candidates)
+        }
+    }
+
+    /** Exact MIDI note match across any instrument. */
+    fun findExact(midiNote: Int, candidates: List<NoteBlockEntry>): NoteBlockEntry? =
+        candidates
+            .filter { it.midiNote == midiNote }
+            .minByOrNull { it.distanceFromPlayer }
+
+    /**
+     * Instrument shift: find any block whose instrument natively covers this MIDI note,
+     * regardless of what the block's current tuning is (it will be re-tuned).
+     * This is distinct from findExact — it checks the instrument's *range*, not the current note.
+     */
+    private fun findInstrumentShift(midiNote: Int, candidates: List<NoteBlockEntry>): ShiftResult? =
+        candidates
+            .filter { it.instrument.coversNatively(midiNote) }
+            .minByOrNull { it.distanceFromPlayer }
+            ?.let { ShiftResult(it, 0) }
+
+    /** Octave shift: try ±12 then ±24 semitones until a match is found. */
+    private fun findOctaveShift(midiNote: Int, candidates: List<NoteBlockEntry>): ShiftResult? {
+        val shifts = buildList {
+            add(0)
+            if (maxOctaveShift >= 1) { add(-12); add(12) }
+            if (maxOctaveShift >= 2) { add(-24); add(24) }
+        }
+        for (shift in shifts) {
+            val shifted = midiNote + shift
+            val entry = candidates
+                .filter { it.midiNote == shifted }
+                .minByOrNull { it.distanceFromPlayer }
+            if (entry != null) return ShiftResult(entry, shift)
+        }
+        return null
+    }
+}
+</file>
+
+<file path="src/main/kotlin/kyrielie/blockbard/organ/MidiToOrganMapper.kt">
+package kyrielie.blockbard.organ
+
+import kyrielie.blockbard.util.coversNatively
+import kyrielie.blockbard.util.midiBase
+import kyrielie.blockbard.util.midiNoteToName
+import net.minecraft.core.BlockPos
+import org.slf4j.LoggerFactory
+
+data class OrganAssignment(
+    /** Maps each distinct MIDI note used in the song to a noteblock position. */
+    val assignment: Map<Int, BlockPos>,
+    /** MIDI notes that could not be assigned to any block. */
+    val unplayable: List<Int>,
+    /** Shifts applied: midiNote → semitone shift used. */
+    val shifts: Map<Int, Int>
+)
+
+object MidiToOrganMapper {
+
+    private val logger = LoggerFactory.getLogger("BlockBard/MidiToOrganMapper")
+
+    fun buildAssignment(
+        midiNoteUsageCounts: Map<Int, Int>,
+        reachableBlocks: List<NoteBlockEntry>
+    ): OrganAssignment {
+        val assignment = mutableMapOf<Int, BlockPos>()
+        val unplayable = mutableListOf<Int>()
+        val shifts = mutableMapOf<Int, Int>()
+        val usedPositions = mutableSetOf<BlockPos>()
+
+        val sortedNotes = midiNoteUsageCounts.entries.sortedByDescending { it.value }.map { it.key }
+        logger.info("buildAssignment: ${sortedNotes.size} distinct notes, ${reachableBlocks.size} reachable blocks")
+
+        for (midiNote in sortedNotes) {
+            val available = reachableBlocks.filter { it.pos !in usedPositions }
+
+            val nativeCandidate = available
+                .filter { it.instrument.coversNatively(midiNote) }
+                .minByOrNull { it.distanceFromPlayer }
+
+            if (nativeCandidate != null) {
+                assignment[midiNote] = nativeCandidate.pos
+                usedPositions.add(nativeCandidate.pos)
+                shifts[midiNote] = 0
+                logger.debug("  ${midiNoteToName(midiNote)} → ${nativeCandidate.pos} (${nativeCandidate.instrument.name}, native)")
+                continue
+            }
+
+            val shiftResult = InstrumentShifter.findBest(midiNote, available)
+            if (shiftResult != null) {
+                assignment[midiNote] = shiftResult.entry.pos
+                usedPositions.add(shiftResult.entry.pos)
+                shifts[midiNote] = shiftResult.semitoneShift
+                logger.debug("  ${midiNoteToName(midiNote)} → ${shiftResult.entry.pos} (${shiftResult.entry.instrument.name}, shift=${shiftResult.semitoneShift})")
+                continue
+            }
+
+            unplayable.add(midiNote)
+            logger.warn("  ${midiNoteToName(midiNote)} UNPLAYABLE — no suitable block found")
+        }
+
+        logger.info("buildAssignment: ${assignment.size} assigned, ${unplayable.size} unplayable")
+        return OrganAssignment(assignment, unplayable, shifts)
+    }
+
+    /**
+     * Computes the target note index for each assigned block.
+     * Returns null for any assignment where the effective MIDI note falls outside
+     * the instrument's range (0–24) — these are silently dropped with a warning.
+     */
+    fun computeTuneTargets(
+        assignment: OrganAssignment,
+        reachableBlocks: List<NoteBlockEntry>
+    ): List<TuneTarget> {
+        val blockByPos = reachableBlocks.associateBy { it.pos }
+        val targets = mutableListOf<TuneTarget>()
+
+        for ((midiNote, pos) in assignment.assignment) {
+            val entry = blockByPos[pos] ?: run {
+                logger.warn("computeTuneTargets: no entry for pos $pos (midiNote=${midiNoteToName(midiNote)}) — skipping")
+                continue
+            }
+            val shift = assignment.shifts[midiNote] ?: 0
+            val effectiveMidi = midiNote + shift
+            val rawIndex = effectiveMidi - entry.instrument.midiBase
+
+            // Validate range — do NOT silently clamp
+            if (rawIndex !in 0..24) {
+                logger.warn("computeTuneTargets: MIDI ${midiNoteToName(effectiveMidi)} (raw=$effectiveMidi) is out of range for ${entry.instrument.name} (midiBase=${entry.instrument.midiBase}) — dropping")
+                continue
+            }
+
+            val target = TuneTarget(pos, entry.noteIndex, rawIndex, entry.instrument)
+            logger.debug("  TuneTarget ${entry.pos} ${entry.instrument.name} ${entry.noteIndex}→${rawIndex} (${midiNoteToName(effectiveMidi)}) — ${target.estimatedClicks} clicks")
+            targets.add(target)
+        }
+
+        val totalClicks = targets.sumOf { it.estimatedClicks }
+        logger.info("computeTuneTargets: ${targets.size} targets, $totalClicks total clicks")
+        return targets
+    }
+}
+</file>
+
+<file path="src/main/kotlin/kyrielie/blockbard/organ/NoteBlockTuner.kt">
+package kyrielie.blockbard.organ
+
+import kyrielie.blockbard.util.clicksNeeded
+import kyrielie.blockbard.util.midiNoteToName
+import kyrielie.blockbard.util.noteIndexToMidi
+import net.minecraft.core.BlockPos
+import net.minecraft.world.level.block.state.properties.NoteBlockInstrument
+import org.slf4j.LoggerFactory
+
+data class TuneTarget(
+    val pos: BlockPos,
+    val snapshotNote: Int,  // noteIndex at scan time — used only for initial click estimate
+    val targetNote: Int,    // 0–24, required noteIndex after tuning
+    val instrument: NoteBlockInstrument
+) {
+    /** Estimated clicks from snapshot. Actual clicks are driven by live world reads. */
+    val estimatedClicks: Int get() = clicksNeeded(snapshotNote, targetNote)
+    val appearsAlreadyTuned: Boolean get() = snapshotNote == targetNote
+}
+
+enum class TunerState { IDLE, TUNING, VERIFYING, DONE, FAILED }
+
+/**
+ * Stateful noteblock tuner modelled on DiscJockey's approach:
+ *
+ * - Re-reads the actual world blockstate every tick for every target.
+ *   The snapshot note in TuneTarget is only used for the initial click estimate;
+ *   the live world read is always authoritative for deciding whether to click.
+ * - Skips blocks that are already at their target note (live world read).
+ * - Maintains [notePredictions] for optimistic in-flight tracking (TTL = ping*2 + 150ms).
+ * - Token-bucket rate limiter: 8 tokens / 310ms (matches Paper's server-side limit).
+ * - Verification phase: waits ping*2 + 100ms then re-reads all blocks before declaring done.
+ * - On mismatch during verification, clears predictions and retries only the failed blocks.
+ */
+class NoteBlockTuner(
+    private val targets: List<TuneTarget>,
+    private val worldNoteReader: (BlockPos) -> Int?,
+    private val interactBlock: (BlockPos) -> Boolean,
+    private val pingMs: () -> Int = { 0 },
+    val onProgress: (done: Int, total: Int, msg: String) -> Unit = { _, _, _ -> }
+) {
+    private val logger = LoggerFactory.getLogger("BlockBard/NoteBlockTuner")
+
+    var state: TunerState = TunerState.IDLE
+        private set
+
+    // Optimistic predictions: pos → (predicted note index, expires at ms)
+    private val notePredictions = mutableMapOf<BlockPos, Pair<Int, Long>>()
+
+    // Token bucket (Paper limit: 8 interacts per 310ms)
+    private var availableInteracts: Float = 8f
+    private var lastInteractMs: Long = -1L
+
+    // Verification countdown
+    private var verifyStartedAt: Long = -1L
+
+    val total: Int = targets.size
+    private var confirmedCount: Int = 0
+
+    // How many targets were already at their target note when tuning started
+    private var alreadyTunedAtStart: Int = 0
+
+    fun start() {
+        if (targets.isEmpty()) {
+            logger.info("NoteBlockTuner: no targets — already done")
+            state = TunerState.DONE
+            onProgress(0, 0, "Nothing to tune.")
+            return
+        }
+
+        // Count blocks already at target using LIVE world reads, not snapshot
+        alreadyTunedAtStart = targets.count { t ->
+            worldNoteReader(t.pos) == t.targetNote
+        }
+
+        state = TunerState.TUNING
+        availableInteracts = 8f
+        lastInteractMs = -1L
+        notePredictions.clear()
+        verifyStartedAt = -1L
+        confirmedCount = 0
+
+        val needClicks = total - alreadyTunedAtStart
+        logger.info("NoteBlockTuner: starting — $total targets, $alreadyTunedAtStart already correct, $needClicks need clicks")
+        targets.forEach { t ->
+            val liveNote = worldNoteReader(t.pos) ?: t.snapshotNote
+            val clicks = clicksNeeded(liveNote, t.targetNote)
+            val targetMidi = noteIndexToMidi(t.instrument, t.targetNote)
+            if (clicks > 0) {
+                logger.debug("  NEEDS TUNE: ${t.pos} ${t.instrument.name} liveNote=$liveNote → target=${t.targetNote} (${midiNoteToName(targetMidi)}) = $clicks clicks")
+            } else {
+                logger.debug("  SKIP (already correct): ${t.pos} ${t.instrument.name} note=$liveNote")
+            }
+        }
+    }
+
+    fun onTick() {
+        if (state == TunerState.IDLE) { start(); return }
+        if (state == TunerState.DONE || state == TunerState.FAILED) return
+
+        val now = System.currentTimeMillis()
+
+        // Expire stale predictions
+        notePredictions.entries.removeAll { (_, v) -> v.second < now }
+
+        // Refill token bucket
+        if (lastInteractMs >= 0L) {
+            val elapsed = now - lastInteractMs
+            availableInteracts += elapsed / (310f / 8f)
+            availableInteracts = availableInteracts.coerceIn(0f, 8f)
+        } else {
+            availableInteracts = 8f
+        }
+
+        when (state) {
+            TunerState.TUNING    -> tickTuning(now)
+            TunerState.VERIFYING -> tickVerifying(now)
+            else -> {}
+        }
+    }
+
+    private fun tickTuning(now: Long) {
+        val untuned = mutableListOf<Pair<BlockPos, Int>>() // pos → effective current note
+        confirmedCount = 0
+
+        for (target in targets) {
+            // Always read live world state
+            val worldNote = worldNoteReader(target.pos)
+            if (worldNote == null) {
+                logger.warn("NoteBlockTuner: ${target.pos} is no longer a noteblock!")
+                state = TunerState.FAILED
+                onProgress(confirmedCount, total, "FAILED: ${target.pos} is no longer a noteblock")
+                return
+            }
+
+            // Use in-flight prediction if fresher than world (prediction not yet expired)
+            val effectiveNote = notePredictions[target.pos]?.first ?: worldNote
+
+            when {
+                // Both world and effective agree it's correct → confirmed
+                effectiveNote == target.targetNote && worldNote == target.targetNote -> confirmedCount++
+                // Prediction says it's on the way, world hasn't caught up → wait (don't click again)
+                effectiveNote == target.targetNote && worldNote != target.targetNote -> { /* wait */ }
+                // Not at target → needs a click
+                else -> untuned.add(target.pos to effectiveNote)
+            }
+        }
+
+        val progress = "$confirmedCount/$total confirmed, ${untuned.size} pending"
+        logger.debug("NoteBlockTuner TUNING: $progress")
+        onProgress(confirmedCount, total, progress)
+
+        if (untuned.isEmpty() && confirmedCount == total) {
+            val pingWait = pingMs() * 2 + 100L
+            verifyStartedAt = now
+            state = TunerState.VERIFYING
+            logger.info("NoteBlockTuner: all confirmed — verifying (waiting ${pingWait}ms for server round-trip)")
+            onProgress(confirmedCount, total, "Verifying...")
+            return
+        }
+
+        // Dispatch clicks within rate limit
+        for ((pos, effectiveNote) in untuned) {
+            if (availableInteracts < 1f) {
+                logger.debug("NoteBlockTuner: rate limited — ${untuned.size} blocks deferred")
+                break
+            }
+            val dispatched = interactBlock(pos)
+            if (!dispatched) {
+                logger.warn("NoteBlockTuner: interactBlock false for $pos — aborting")
+                state = TunerState.FAILED
+                onProgress(confirmedCount, total, "FAILED: could not interact with $pos")
+                return
+            }
+            val predicted = (effectiveNote + 1) % 25
+            val expires = now + pingMs() * 2 + 150L
+            notePredictions[pos] = Pair(predicted, expires)
+            logger.debug("NoteBlockTuner: clicked $pos note $effectiveNote → predicted $predicted")
+            availableInteracts -= 1f
+            lastInteractMs = now
+        }
+    }
+
+    private fun tickVerifying(now: Long) {
+        val pingWait = pingMs() * 2 + 100L
+        if (now - verifyStartedAt < pingWait) return
+
+        var allGood = true
+        val mismatches = mutableListOf<String>()
+        confirmedCount = 0
+
+        for (target in targets) {
+            val worldNote = worldNoteReader(target.pos)
+            if (worldNote == null) {
+                allGood = false
+                mismatches.add("${target.pos} missing")
+                logger.warn("NoteBlockTuner: ${target.pos} disappeared during verification")
+                continue
+            }
+            if (worldNote == target.targetNote) {
+                confirmedCount++
+                NoteBlockRegistry.updateTunedNote(target.pos, worldNote)
+            } else {
+                allGood = false
+                mismatches.add("${target.pos}: got $worldNote expected ${target.targetNote}")
+                logger.warn("NoteBlockTuner: mismatch ${target.pos}: got $worldNote expected ${target.targetNote}")
+            }
+        }
+
+        if (allGood) {
+            state = TunerState.DONE
+            val skipped = alreadyTunedAtStart
+            logger.info("NoteBlockTuner: DONE — $total verified ($skipped were already correct)")
+            onProgress(confirmedCount, total, "Complete! ($skipped already correct, ${total - skipped} tuned)")
+        } else {
+            logger.warn("NoteBlockTuner: ${mismatches.size} mismatches — retrying")
+            notePredictions.clear()
+            state = TunerState.TUNING
+            onProgress(confirmedCount, total, "Retrying ${mismatches.size} mismatched blocks...")
+        }
+    }
+
+    val isDone: Boolean get() = state == TunerState.DONE
+    val isFailed: Boolean get() = state == TunerState.FAILED
+    val isActive: Boolean get() = state == TunerState.TUNING || state == TunerState.VERIFYING
+    val confirmedBlocks: Int get() = confirmedCount
+}
+</file>
+
 <file path="README.md">
 # BlockBard
 
@@ -4165,6 +4628,1114 @@ When the user requests "migration", "rewrite", or "refactor" of old mod code:
 
 ## Environment Check
 Run `scripts/mod-env-check.sh` to auto-detect current project configuration.
+</file>
+
+<file path="src/client/kotlin/kyrielie/blockbard/client/gui/MainScreen.kt">
+package kyrielie.blockbard.client.gui
+
+import kyrielie.blockbard.client.config.ConfigManager
+import kyrielie.blockbard.client.playback.MidiFilePlayer
+import kyrielie.blockbard.client.playback.NbsFileLoader
+import kyrielie.blockbard.client.playback.NbsPlayer
+import kyrielie.blockbard.organ.*
+import kyrielie.blockbard.client.organ.OrganScanner
+import kyrielie.blockbard.client.player.CenterResult
+import kyrielie.blockbard.client.player.PlayerController
+import kyrielie.blockbard.util.midiNoteToName
+import net.fabricmc.loader.api.FabricLoader
+import net.minecraft.client.gui.GuiGraphicsExtractor
+import net.minecraft.client.gui.components.Button
+import net.minecraft.client.gui.screens.Screen
+import net.minecraft.client.input.MouseButtonEvent
+import net.minecraft.network.chat.Component
+import net.minecraft.world.level.GameType
+import org.slf4j.LoggerFactory
+import java.io.File
+
+class MainScreen(private val parent: Screen? = null) : Screen(Component.literal("BlockBard")) {
+
+    private val logger = LoggerFactory.getLogger("BlockBard/MainScreen")
+
+    private val midisDir: File by lazy {
+        FabricLoader.getInstance().configDir.resolve("blockbard/midis").toFile().also { dir ->
+            if (!dir.exists()) {
+                dir.mkdirs()
+                dir.resolve("README.txt").writeText(
+                    "Drop .mid or .nbs files here and click 'Refresh' in BlockBard."
+                )
+            }
+        }
+    }
+
+    private var midiFiles: List<File> = emptyList()
+    private var selectedFile: File? = null
+    private var selectedIndex: Int = -1
+    private var scrollOffset: Int = 0
+    private val maxVisible = 8
+
+    // Tuning state
+    private var tuner: NoteBlockTuner? = null
+    private var assignment: OrganAssignment? = null
+    private var tuneStatusMsg: String = ""
+
+    // General status
+    private var organScanMessage: String = "Press Scan to detect noteblocks"
+    private var coverageMessage: String = ""
+    private var scanTicker = 0
+
+    // Scale playback state
+    private var scaleNotes: List<NoteBlockEntry> = emptyList()
+    private var scaleIndex: Int = -1
+    private var scaleTicker: Int = 0
+    private val scaleTickInterval = 4 // ticks between notes (~200ms at 20tps)
+
+    override fun init() {
+        super.init()
+        logger.info("MainScreen: init()")
+        refreshFiles()
+        OrganScanner.scan()
+        updateOrganInfo()
+
+        // ── File list controls ──
+        addRenderableWidget(Button.builder(Component.literal("↑")) {
+            scrollOffset = (scrollOffset - 1).coerceAtLeast(0)
+            logger.debug("scroll up → offset=$scrollOffset")
+        }.pos(10, 60).size(20, 16).build())
+
+        addRenderableWidget(Button.builder(Component.literal("↓")) {
+            scrollOffset = (scrollOffset + 1).coerceAtMost((midiFiles.size - maxVisible).coerceAtLeast(0))
+            logger.debug("scroll down → offset=$scrollOffset")
+        }.pos(10, 80).size(20, 16).build())
+
+        addRenderableWidget(Button.builder(Component.literal("Refresh")) {
+            logger.info("Refresh clicked")
+            refreshFiles()
+            chat("Refreshed — ${midiFiles.size} files found")
+        }.pos(10, 100).size(60, 16).build())
+
+        // ── Organ controls ──
+        addRenderableWidget(Button.builder(Component.literal("Scan")) {
+            logger.info("Scan clicked")
+            OrganScanner.scan()
+            updateOrganInfo()
+        }.pos(10, 200).size(50, 16).build())
+
+        addRenderableWidget(Button.builder(Component.literal("Center")) {
+            logger.info("Center clicked")
+            chat("Centering on organ...")
+            val result = PlayerController.centerOnOrgan()
+            organScanMessage = when (result) {
+                is CenterResult.Centered -> "Centered. ${result.reachableCount}/${result.totalFound} reachable."
+                CenterResult.NoBlocks   -> "No playable noteblocks found."
+                CenterResult.NoPlayer   -> "No player found."
+            }
+            chat(organScanMessage)
+            logger.info("Center result: $organScanMessage")
+        }.pos(65, 200).size(60, 16).build())
+
+        addRenderableWidget(Button.builder(Component.literal("Tune")) {
+            logger.info("Tune clicked")
+            startTuning()
+        }.pos(130, 200).size(50, 16).build())
+
+        addRenderableWidget(Button.builder(Component.literal("▶ Scale")) {
+            logger.info("Play Scale clicked")
+            playScale()
+        }.pos(185, 200).size(60, 16).build())
+
+        // ── Playback controls ──
+        addRenderableWidget(Button.builder(Component.literal("▶ Play")) {
+            logger.info("Play clicked — isPaused=${MidiFilePlayer.isPaused}, file=${selectedFile?.name}")
+            if (MidiFilePlayer.isPaused) {
+                MidiFilePlayer.resume()
+                chat("Resumed")
+            } else {
+                startPlayback()
+            }
+        }.pos(10, 222).size(55, 16).build())
+
+        addRenderableWidget(Button.builder(Component.literal("⏸ Pause")) {
+            logger.info("Pause clicked")
+            if (MidiFilePlayer.isPaused) {
+                MidiFilePlayer.resume(); chat("Resumed")
+            } else {
+                MidiFilePlayer.pause(); chat("Paused")
+            }
+        }.pos(70, 222).size(60, 16).build())
+
+        addRenderableWidget(Button.builder(Component.literal("⏹ Stop")) {
+            logger.info("Stop clicked")
+            MidiFilePlayer.stop()
+            NbsPlayer.stop()
+            stopScale()
+            abortTuning()
+            chat("Stopped")
+        }.pos(135, 222).size(50, 16).build())
+
+        addRenderableWidget(Button.builder(Component.literal("⇀ Shuffle")) {
+            logger.info("Shuffle clicked")
+            shuffle()
+        }.pos(190, 222).size(60, 16).build())
+
+        addRenderableWidget(Button.builder(Component.literal("Tempo -")) {
+            MidiFilePlayer.tempoMultiplier = (MidiFilePlayer.tempoMultiplier - 0.1f).coerceAtLeast(0.5f)
+            logger.info("Tempo − → ${MidiFilePlayer.tempoMultiplier}")
+            chat("Tempo: ${"%.1f".format(MidiFilePlayer.tempoMultiplier)}x")
+        }.pos(10, 242).size(55, 16).build())
+
+        addRenderableWidget(Button.builder(Component.literal("Tempo +")) {
+            MidiFilePlayer.tempoMultiplier = (MidiFilePlayer.tempoMultiplier + 0.1f).coerceAtMost(2.0f)
+            logger.info("Tempo + → ${MidiFilePlayer.tempoMultiplier}")
+            chat("Tempo: ${"%.1f".format(MidiFilePlayer.tempoMultiplier)}x")
+        }.pos(70, 242).size(55, 16).build())
+
+        addRenderableWidget(Button.builder(Component.literal("Close")) {
+            logger.info("Close clicked")
+            onClose()
+        }.pos(width - 70, height - 24).size(60, 16).build())
+    }
+
+    // ── Helpers ──
+
+    private fun chat(msg: String) {
+        minecraft.player?.sendSystemMessage(Component.literal("§b[BlockBard] §f$msg"))
+    }
+
+    private fun chatWarn(msg: String) {
+        minecraft.player?.sendSystemMessage(Component.literal("§b[BlockBard] §c$msg"))
+    }
+
+    private fun refreshFiles() {
+        midiFiles = (midisDir.listFiles { f ->
+            f.extension.lowercase() in listOf("mid", "midi", "nbs")
+        } ?: emptyArray()).toList().sortedBy { it.name }
+        scrollOffset = 0
+        logger.info("refreshFiles: found ${midiFiles.size} files in ${midisDir.absolutePath}")
+    }
+
+    private fun updateOrganInfo() {
+        val playable = NoteBlockRegistry.allPlayable()
+        val silenced = NoteBlockRegistry.all().count { it.status == NoteBlockStatus.SILENCED }
+        val mobHeads = NoteBlockRegistry.allMobHeadEntries().size
+        organScanMessage = "Playable: ${playable.size}  Silenced: $silenced  Mob heads: $mobHeads"
+        logger.info("updateOrganInfo: $organScanMessage")
+    }
+
+    // ── Tuning ──
+
+    private fun startTuning() {
+        val mc = minecraft
+        val player = mc.player ?: run { chatWarn("No player"); return }
+
+        // Gamemode guard
+        val gameMode = mc.gameMode?.playerMode
+        if (gameMode == GameType.CREATIVE || gameMode == GameType.SPECTATOR) {
+            chatWarn("Cannot tune in ${gameMode.getName()} mode")
+            logger.warn("startTuning: blocked — $gameMode mode")
+            return
+        }
+
+        // Empty hand check — critical: useWithoutItem only fires when hands are empty
+        val mainHand = player.mainHandItem
+        val offHand  = player.offhandItem
+        if (!mainHand.isEmpty) {
+            chatWarn("Empty your main hand before tuning — held items block noteblock interaction")
+            logger.warn("startTuning: blocked — player holding ${mainHand.item} in main hand")
+            return
+        }
+        if (!offHand.isEmpty) {
+            chatWarn("Empty your offhand before tuning")
+            logger.warn("startTuning: blocked — player holding ${offHand.item} in offhand")
+            return
+        }
+
+        val map = PlayerController.organMap ?: run {
+            chatWarn("Run Center first!")
+            logger.warn("startTuning: no organ map")
+            return
+        }
+
+        val reachable = NoteBlockRegistry.allPlayable().filter { map.isReachable(it.pos) }
+        if (reachable.isEmpty()) {
+            chatWarn("No reachable noteblocks — run Scan then Center first")
+            logger.warn("startTuning: no reachable blocks")
+            return
+        }
+
+        val targets: List<TuneTarget>
+
+        val midi = MidiFilePlayer.loadedMidi
+        if (midi != null) {
+            // MIDI loaded — map notes from the song to blocks
+            logger.info("startTuning: MIDI mode — ${reachable.size} reachable blocks, ${midi.distinctNotes.size} distinct notes")
+            val result = MidiToOrganMapper.buildAssignment(midi.noteUsageCounts, reachable)
+            assignment = result
+            if (result.unplayable.isNotEmpty()) {
+                val names = result.unplayable.map { midiNoteToName(it) }
+                chatWarn("Warning: ${names.size} notes unplayable: ${names.take(6).joinToString()}")
+            }
+            updateCoverageMessage(result)
+            targets = MidiToOrganMapper.computeTuneTargets(result, reachable)
+        } else {
+            // No MIDI — tune blocks to a chromatic scale starting at F#3 (MIDI 54, noteIndex 0 on HARP)
+            // This is the natural test target: one block per semitone, ascending, *per instrument*.
+            // Note indices are scoped to each instrument independently (DiscJockey-style:
+            // noteblocksForInstrument is grouped per NoteBlockInstrument) — otherwise blocks
+            // past the 25th in a flat ordering would all collide on noteIndex 24.
+            logger.info("startTuning: no-MIDI mode — tuning ${reachable.size} blocks to chromatic scale from F#3")
+            chat("No MIDI loaded — tuning blocks to chromatic scale (F#3 upward)")
+            val sorted = reachable.sortedBy { it.distanceFromPlayer }
+            targets = sorted
+                .groupBy { it.instrument }
+                .flatMap { (_, blocksForInstrument) ->
+                    blocksForInstrument.mapIndexed { i, entry ->
+                        val targetNoteIndex = i.coerceIn(0, 24)
+                        TuneTarget(entry.pos, entry.noteIndex, targetNoteIndex, entry.instrument)
+                    }
+                }
+            assignment = null
+            val perInstrumentCounts = sorted.groupBy { it.instrument }.mapValues { it.value.size }
+            coverageMessage = "Test scale: ${sorted.size} blocks across ${perInstrumentCounts.size} instrument(s) → noteIndex 0–24 per instrument"
+        }
+
+        if (targets.isEmpty()) {
+            chat("Nothing to tune — all blocks already at target notes!")
+            logger.info("startTuning: no targets needed")
+            return
+        }
+
+        val totalClicks = targets.sumOf { it.estimatedClicks }
+        chat("Tuning ${targets.size} blocks (~$totalClicks clicks)...")
+        logger.info("startTuning: ${targets.size} targets, $totalClicks total clicks")
+
+        tuner = NoteBlockTuner(
+            targets         = targets,
+            worldNoteReader = { pos ->
+                mc.level?.getBlockState(pos)?.let { state ->
+                    if (state.block == net.minecraft.world.level.block.Blocks.NOTE_BLOCK)
+                        state.getValue(net.minecraft.world.level.block.NoteBlock.NOTE)
+                    else null
+                }
+            },
+            interactBlock   = { pos -> PlayerController.interactWith(pos) },
+            pingMs          = { PlayerController.currentPingMs() },
+            onProgress      = { done, total, msg ->
+                tuneStatusMsg = "$done/$total — $msg"
+                logger.debug("tuner progress: $tuneStatusMsg")
+            }
+        )
+        tuner!!.start()
+    }
+
+    private fun abortTuning() {
+        if (tuner?.isActive == true) {
+            logger.info("abortTuning: tuner cancelled")
+            chat("Tuning cancelled")
+        }
+        tuner = null
+        tuneStatusMsg = ""
+    }
+
+    private fun updateCoverageMessage(result: OrganAssignment) {
+        val covered   = result.assignment.size
+        val total     = covered + result.unplayable.size
+        val unplayable = result.unplayable.map { midiNoteToName(it) }
+        coverageMessage = "$covered/$total notes covered" +
+                if (unplayable.isNotEmpty()) ". Missing: ${unplayable.take(4).joinToString()}" else ""
+        logger.info("coverage: $coverageMessage")
+    }
+
+    // ── Scale playback ──
+
+    private fun playScale() {
+        val mc = minecraft
+        val player = mc.player ?: run { logger.warn("playScale: no player"); return }
+
+        val gameMode = mc.gameMode?.playerMode
+        if (gameMode == GameType.CREATIVE) {
+            chatWarn("Cannot play scale in Creative — noteblocks would break!")
+            logger.warn("playScale: blocked — Creative mode")
+            return
+        }
+
+        val playable = NoteBlockRegistry.allPlayable()
+        if (playable.isEmpty()) {
+            chatWarn("No playable noteblocks found — run Scan first")
+            logger.warn("playScale: no playable blocks")
+            return
+        }
+
+        // Sort by actual MIDI note — this naturally orders GUITAR (base 42) before HARP (base 54)
+        // and BASS (base 30) before both. No instrument assumptions needed.
+        scaleNotes = playable.sortedBy { it.midiNote }
+        scaleIndex = 0
+        scaleTicker = 0
+
+        val noteNames = scaleNotes.map { "${it.instrument.name.take(4)}:${kyrielie.blockbard.util.midiNoteToName(it.midiNote)}" }
+        logger.info("playScale: ${scaleNotes.size} notes in pitch order: $noteNames")
+        chat("Playing scale (${scaleNotes.size} notes, ${scaleNotes.first().instrument.name} → ${scaleNotes.last().instrument.name})")
+    }
+
+    private fun stopScale() {
+        if (scaleIndex >= 0) {
+            logger.info("stopScale: cancelled at note $scaleIndex/${scaleNotes.size}")
+        }
+        scaleNotes = emptyList()
+        scaleIndex = -1
+        scaleTicker = 0
+    }
+
+    private fun tickScale() {
+        if (scaleIndex < 0) return
+        if (scaleIndex >= scaleNotes.size) {
+            logger.info("tickScale: scale complete")
+            chat("Scale complete!")
+            stopScale()
+            return
+        }
+
+        scaleTicker++
+        if (scaleTicker < scaleTickInterval) return
+        scaleTicker = 0
+
+        val entry = scaleNotes[scaleIndex]
+        val noteName = midiNoteToName(entry.midiNote)
+        logger.info("tickScale: [$scaleIndex/${scaleNotes.size - 1}] ${entry.instrument.name} noteIndex=${entry.noteIndex} midi=${entry.midiNote} ($noteName) @ ${entry.pos}")
+        minecraft.player?.sendSystemMessage(
+            Component.literal("§b[BlockBard] §f[$scaleIndex] ${entry.instrument.name} §a$noteName §7@ ${entry.pos.toShortString()}")
+        )
+        ArpeggioScheduler.enqueue(NoteRequest(entry.midiNote, resolvedPos = entry.pos))
+        scaleIndex++
+    }
+
+    // ── Playback ──
+
+    private fun startPlayback() {
+        val file = selectedFile ?: run { chatWarn("No file selected"); return }
+        logger.info("startPlayback: ${file.name}")
+        chat("Playing: ${file.name}")
+        if (file.extension.lowercase() == "nbs") {
+            val nbs = NbsFileLoader.load(file)
+            logger.info("startPlayback: NBS '${nbs.title}' ${nbs.notes.size} notes at ${nbs.tempo} tps")
+            NbsPlayer.play(nbs, MidiFilePlayer.tempoMultiplier)
+        } else {
+            if (MidiFilePlayer.loadedMidi?.file != file) {
+                val midi = MidiFilePlayer.load(file)
+                logger.info("startPlayback: MIDI ${midi.events.size} events, ${midi.distinctNotes.size} distinct notes")
+            }
+            MidiFilePlayer.play()
+        }
+    }
+
+    private fun shuffle() {
+        val available = midiFiles.filter { it != selectedFile }
+        if (available.isEmpty()) { logger.info("shuffle: nothing to shuffle to"); return }
+        selectFile(available.random())
+    }
+
+    private fun selectFile(file: File) {
+        selectedFile = file
+        selectedIndex = midiFiles.indexOf(file)
+        MidiFilePlayer.stop()
+        if (file.extension.lowercase() in listOf("mid", "midi")) {
+            val midi = MidiFilePlayer.load(file)
+            logger.info("selectFile: ${file.name} — ${midi.events.size} events, tempo=${midi.baseTempoUsPerBeat}µs/beat")
+            chat("Loaded: ${file.name} (${midi.distinctNotes.size} distinct notes)")
+        }
+        ConfigManager.config.lastPlayedTrack = file.name
+        organScanMessage = "Loaded: ${file.name}. Run Scan → Center → Tune → Play."
+        coverageMessage = ""
+    }
+
+    // ── Tick ──
+
+    override fun tick() {
+        super.tick()
+
+        // Auto-rescan
+        scanTicker++
+        if (scanTicker >= 20 * ConfigManager.config.autoRescanIntervalSeconds) {
+            scanTicker = 0
+            OrganScanner.scan()
+            updateOrganInfo()
+        }
+
+        // Tuner tick
+        val t = tuner
+        if (t != null) {
+            t.onTick()
+
+            if (t.isDone) {
+                tuner = null
+                organScanMessage = "Tuning complete! Press ▶ Play."
+                chat("Tuning complete! All blocks verified.")
+                logger.info("tick: tuning complete")
+                // Rescan so registry reflects real world state
+                OrganScanner.scan()
+                updateOrganInfo()
+            } else if (t.isFailed) {
+                tuner = null
+                chatWarn("Tuning failed — check logs for details")
+                logger.warn("tick: tuning failed")
+            }
+        }
+
+        // Scale tick
+        tickScale()
+    }
+
+    // ── Render ──
+
+    override fun extractRenderState(graphics: GuiGraphicsExtractor, mouseX: Int, mouseY: Int, partialTick: Float) {
+        super.extractRenderState(graphics, mouseX, mouseY, partialTick)
+        val font = minecraft.font
+
+        graphics.text(font, "♪ BlockBard", 10, 10, 0xFFFFAA)
+        graphics.text(font, "MIDI / NBS Files:", 10, 26, 0xCCCCCC)
+
+        // File list
+        val visibleFiles = midiFiles.drop(scrollOffset).take(maxVisible)
+        visibleFiles.forEachIndexed { i, file ->
+            val y = 36 + i * 14
+            val realIdx = scrollOffset + i
+            val color = if (realIdx == selectedIndex) 0x55FF55 else 0xDDDDDD
+            val prefix = if (realIdx == selectedIndex) "▶ " else "  "
+            graphics.text(font, prefix + file.name.take(30), 34, y, color)
+        }
+        if (midiFiles.isEmpty()) {
+            graphics.text(font, "(no files — drop .mid/.nbs into config/blockbard/midis/)", 10, 36, 0xAAAAAA)
+        }
+
+        // Organ status section
+        val organY = 175
+        graphics.text(font, "─── Organ ───", 10, organY, 0x88AAFF)
+        graphics.text(font, organScanMessage, 10, organY + 12, 0xFFFFFF)
+
+        val counts = NoteBlockRegistry.countPerInstrument()
+        var cy = organY + 24
+        counts.entries.take(5).forEach { (inst, count) ->
+            graphics.text(font, "${inst.name}: $count", 10, cy, 0xDDDDDD)
+            cy += 10
+        }
+
+        if (coverageMessage.isNotEmpty()) {
+            graphics.text(font, coverageMessage, 10, cy + 2, 0xFFCC44)
+            cy += 12
+        }
+
+        // Tuner status
+        val t = tuner
+        if (t != null) {
+            val stateLabel = when (t.state) {
+                TunerState.TUNING    -> "§eTuning..."
+                TunerState.VERIFYING -> "§aVerifying..."
+                else                 -> ""
+            }
+            graphics.text(font, "$stateLabel ${t.confirmedBlocks}/${t.total}", 10, cy + 2, 0x44FF88)
+            cy += 12
+            if (tuneStatusMsg.isNotEmpty()) {
+                graphics.text(font, tuneStatusMsg.take(45), 10, cy, 0xCCFFCC)
+                cy += 10
+            }
+        }
+
+        // Scale progress
+        if (scaleIndex >= 0 && scaleIndex < scaleNotes.size) {
+            val entry = scaleNotes[scaleIndex]
+            graphics.text(font, "♪ Scale: ${midiNoteToName(entry.midiNote)} ($scaleIndex/${scaleNotes.size})", 10, cy + 2, 0xAAFF44)
+        }
+
+        // Playback status bar
+        val pbY = height - 42
+        val status = when {
+            MidiFilePlayer.isActive() && !MidiFilePlayer.isPaused ->
+                "▶ PLAYING  ${selectedFile?.name ?: ""}"
+            MidiFilePlayer.isPaused -> "⏸ PAUSED"
+            else                    -> "⏹ IDLE"
+        }
+        graphics.text(font, status, 10, pbY, 0xAAFFAA)
+        graphics.text(font, "Tempo: ${"%.1f".format(MidiFilePlayer.tempoMultiplier)}x", 200, pbY, 0xCCCCCC)
+
+        // Ping display (useful when tuning on a server)
+        val ping = PlayerController.currentPingMs()
+        if (ping > 0) graphics.text(font, "Ping: ${ping}ms", 200, pbY + 10, 0xAAAAAA)
+    }
+
+    override fun mouseClicked(event: MouseButtonEvent, doubleClick: Boolean): Boolean {
+        val mouseX = event.x()
+        val mouseY = event.y()
+        if (event.button() == 0) {
+            val visibleFiles = midiFiles.drop(scrollOffset).take(maxVisible)
+            visibleFiles.forEachIndexed { i, file ->
+                val y = 36 + i * 14
+                if (mouseX >= 34 && mouseX <= width - 10 && mouseY >= y && mouseY < y + 14) {
+                    logger.info("file clicked: ${file.name}")
+                    selectFile(file)
+                    return true
+                }
+            }
+        }
+        return super.mouseClicked(event, doubleClick)
+    }
+
+    override fun onClose() {
+        logger.info("MainScreen: closing")
+        ConfigManager.save()
+        minecraft.gui.setScreen(parent)
+    }
+
+    // Suppress the background blur — keeps the game visually unobstructed while the GUI is open
+    override fun extractBlurredBackground(graphics: GuiGraphicsExtractor) {
+        // Intentionally empty — do not call super, which would call graphics.blurBeforeThisStratum()
+    }
+
+    override fun isPauseScreen(): Boolean = false
+}
+</file>
+
+<file path="src/client/kotlin/kyrielie/blockbard/client/gui/PlaybackHud.kt">
+package kyrielie.blockbard.client.gui
+
+import kyrielie.blockbard.client.playback.MidiFilePlayer
+import kyrielie.blockbard.organ.NoteBlockRegistry
+// HudRenderCallback is gone in 26.x. Use the new HudElement / HudElementRegistry API.
+import net.fabricmc.fabric.api.client.rendering.v1.hud.HudElement
+import net.fabricmc.fabric.api.client.rendering.v1.hud.HudElementRegistry
+import net.fabricmc.fabric.api.client.rendering.v1.hud.VanillaHudElements
+import net.minecraft.client.DeltaTracker
+// GuiGraphics is now GuiGraphicsExtractor in 26.x
+import net.minecraft.client.gui.GuiGraphicsExtractor
+import net.minecraft.client.Minecraft
+import net.minecraft.resources.Identifier
+import org.slf4j.LoggerFactory
+
+object PlaybackHud {
+
+    private val logger = LoggerFactory.getLogger("BlockBard/PlaybackHud")
+
+    var isVisible: Boolean = true
+    var lastShiftMessage: String = ""
+
+    // Identifier.of() was removed — use fromNamespaceAndPath(namespace, path)
+    private val HUD_ID = Identifier.fromNamespaceAndPath("blockbard", "playback_hud")
+
+    fun register() {
+        // Attach after BOSS_BAR so we render after the main HUD but before chat/subtitles.
+        HudElementRegistry.attachElementAfter(
+            VanillaHudElements.BOSS_BAR,
+            HUD_ID,
+            HudElement { graphics, _ -> render(graphics) }
+        )
+        logger.info("PlaybackHud: registered")
+    }
+
+    private fun render(graphics: GuiGraphicsExtractor) {
+        if (!isVisible) return
+        val mc = Minecraft.getInstance()
+        // Screen access in 26.x: mc.gui.screen(), not mc.screen
+        if (mc.gui.screen() != null) return
+        val font = mc.font
+
+        val playable = NoteBlockRegistry.allPlayable().size
+        val status = when {
+            MidiFilePlayer.isActive() && !MidiFilePlayer.isPaused -> {
+                val currentTick = MidiFilePlayer.getCurrentTick()
+                val totalTicks = MidiFilePlayer.getTotalTicks()
+                "▶ PLAYING  tick $currentTick/$totalTicks"
+            }
+            MidiFilePlayer.isPaused -> "⏸ PAUSED"
+            else -> "♪ BlockBard  [B to open]"
+        }
+
+        val tempo = "${"%.1f".format(MidiFilePlayer.tempoMultiplier)}x"
+        val coverage = "Organ: $playable blocks"
+
+        val x = 4
+        // guiHeight() in 26.x (was mc.window.guiScaledHeight)
+        var y = graphics.guiHeight() - 48
+
+        // fill() signature unchanged
+        graphics.fill(x - 2, y - 2, x + 180, y + 40, 0x88000000.toInt())
+        // drawString() → text() in GuiGraphicsExtractor
+        graphics.text(font, status, x, y, 0xAAFFAA); y += 10
+        graphics.text(font, "Tempo: $tempo  |  $coverage", x, y, 0xCCCCCC); y += 10
+        if (lastShiftMessage.isNotEmpty()) {
+            graphics.text(font, lastShiftMessage, x, y, 0xFFCC44)
+        }
+    }
+}
+</file>
+
+<file path="src/client/kotlin/kyrielie/blockbard/client/input/KeyboardInputHandler.kt">
+package kyrielie.blockbard.client.input
+
+import kyrielie.blockbard.client.config.ConfigManager
+import kyrielie.blockbard.client.gui.MainScreen
+import kyrielie.blockbard.organ.ArpeggioScheduler
+import kyrielie.blockbard.organ.NoteRequest
+import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents
+import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper
+import net.minecraft.client.KeyMapping
+import net.minecraft.client.Minecraft
+import org.lwjgl.glfw.GLFW
+import org.slf4j.LoggerFactory
+
+/**
+ * Handles 1–9 key presses for direct noteblock playback.
+ *
+ * Key mapping (default, configurable via ConfigManager.config.keyMappings):
+ *   Key 1 → MIDI 54 (F#3, noteIndex 0 on HARP)
+ *   Key 2 → MIDI 55 (G3,  noteIndex 1)
+ *   Key 3 → MIDI 56 (G#3, noteIndex 2)
+ *   Key 4 → MIDI 57 (A3,  noteIndex 3)
+ *   Key 5 → MIDI 58 (A#3, noteIndex 4)
+ *   Key 6 → MIDI 59 (B3,  noteIndex 5)
+ *   Key 7 → MIDI 60 (C4,  noteIndex 6)
+ *   Key 8 → MIDI 61 (C#4, noteIndex 7)
+ *   Key 9 → MIDI 62 (D4,  noteIndex 8)
+ *
+ * IMPORTANT: Keys only fire while the BlockBard GUI (MainScreen) is open.
+ * They are suppressed entirely when no screen is open or a different screen
+ * is showing — this prevents interference with vanilla number-key hotbar.
+ */
+object KeyboardInputHandler {
+
+    private val logger = LoggerFactory.getLogger("BlockBard/Keyboard")
+    private val keyBindings: MutableList<KeyMapping> = mutableListOf()
+
+    fun register() {
+        for (i in 1..9) {
+            val key = KeyMappingHelper.registerKeyMapping(
+                KeyMapping(
+                    "key.blockbard.note$i",
+                    GLFW.GLFW_KEY_0 + i,
+                    KeyMapping.Category.MISC
+                )
+            )
+            keyBindings.add(key)
+        }
+        logger.info("KeyboardInputHandler: registered 9 note keys (1–9), active only when BlockBard GUI is open")
+
+        ClientTickEvents.END_CLIENT_TICK.register { _ -> onTick() }
+    }
+
+    private fun onTick() {
+        val mc = Minecraft.getInstance()
+
+        // Only fire when BlockBard's own screen is open
+        val screen = mc.gui.screen()
+        if (screen !is MainScreen) {
+            // Drain any queued clicks silently so they don't fire later when the screen opens
+            keyBindings.forEach { kb -> while (kb.consumeClick()) { /* discard */ } }
+            return
+        }
+
+        val mappings = ConfigManager.config.keyMappings
+        keyBindings.forEachIndexed { i, kb ->
+            while (kb.consumeClick()) {
+                val midiNote = mappings.getOrElse(i) { 54 + i }
+                logger.info("KeyboardInputHandler: key ${i + 1} → MIDI $midiNote")
+                mc.player?.sendSystemMessage(
+                    net.minecraft.network.chat.Component.literal("§b[BlockBard] §fKey ${i + 1} → MIDI $midiNote")
+                )
+                ArpeggioScheduler.enqueue(NoteRequest(midiNote))
+            }
+        }
+    }
+}
+</file>
+
+<file path="src/client/kotlin/kyrielie/blockbard/client/player/PlayerController.kt">
+package kyrielie.blockbard.client.player
+
+import kyrielie.blockbard.organ.NoteBlockEntry
+import kyrielie.blockbard.organ.NoteBlockRegistry
+import kyrielie.blockbard.organ.OrganMap
+import kyrielie.blockbard.organ.ReachInfo
+import kyrielie.blockbard.util.vecToYawPitch
+import net.minecraft.client.Minecraft
+import net.minecraft.core.BlockPos
+import net.minecraft.core.Direction
+import net.minecraft.world.InteractionHand
+import net.minecraft.world.level.GameType
+import net.minecraft.world.phys.BlockHitResult
+import net.minecraft.world.phys.Vec3
+import org.slf4j.LoggerFactory
+
+/** Survival reach distance from eye position (blocks). */
+const val REACH_DISTANCE = 4.5
+
+sealed class CenterResult {
+    object NoPlayer : CenterResult()
+    object NoBlocks : CenterResult()
+    data class Centered(
+        val standPos: BlockPos,
+        val reachableCount: Int,
+        val totalFound: Int
+    ) : CenterResult()
+}
+
+object PlayerController {
+
+    private val logger = LoggerFactory.getLogger("BlockBard/PlayerController")
+
+    var organMap: OrganMap? = null
+        private set
+
+    /** Returns current server round-trip ping in ms, or 0 if unavailable. */
+    fun currentPingMs(): Int {
+        val mc = Minecraft.getInstance()
+        val player = mc.player ?: return 0
+        return mc.connection?.getPlayerInfo(player.gameProfile.id)?.latency ?: 0
+    }
+
+    /**
+     * Logged once at scan/center/tune start so logs are self-describing about which
+     * environment (singleplayer vs. a real server) produced them — needed to correlate
+     * the client/server desync hypothesis against local-test vs public-server logs.
+     *
+     * Verified against Minecraft.java / ClientCommonPacketListenerImpl.java in the
+     * decompiled source: Minecraft.isLocalServer() and
+     * connection.serverBrand() are both real, current APIs.
+     */
+    fun logEnvironmentBanner(context: String) {
+        val mc = Minecraft.getInstance()
+        val brand = mc.player?.connection?.serverBrand()
+        logger.info(
+            "[$context] environment banner: singleplayer=${mc.isLocalServer} serverBrand=$brand " +
+                "ping=${currentPingMs()} dimension=${mc.level?.dimension()?.identifier()}"
+        )
+    }
+
+    // RESOLVED — checked against LocalPlayer.java in the decompiled source:
+    // player.setPos() itself does NOT send any packet — it only mutates the client-side
+    // entity. But LocalPlayer.tick() unconditionally calls sendPosition() every tick
+    // (when isControlledCamera(), i.e. not spectating another entity, which is always
+    // true for normal BlockBard usage), and sendPosition() compares the current position
+    // against the last-sent one and fires a ServerboundMovePlayerPacket (Pos/PosRot)
+    // whenever the delta exceeds a tiny threshold (2e-4 blocks squared). A setPos() call
+    // from centerOnOrgan() therefore gets picked up and sent to the server automatically
+    // on the very next client tick — no explicit packet send is needed here, and Baritone
+    // (which also never calls setPos+send manually, only listens for the resulting
+    // ServerboundMovePlayerPacket) confirms this is the normal way mods drive movement.
+    //
+    // The one way this CAN still go wrong: if interactWith() is ever called in the same
+    // tick as centerOnOrgan() (before LocalPlayer.tick() has run again), the server would
+    // see the click before it sees the new position. In the current design this can't
+    // happen — centerOnOrgan() runs synchronously from a GUI button click, and all
+    // interacts are dispatched later via ArpeggioScheduler.onTick() in END_CLIENT_TICK,
+    // which is always at least one full tick later. So the original client/server position
+    // desync hypothesis for items 2 and 4 is NOT confirmed by the source — no code fix is
+    // needed here. If items 2/4 still reproduce on a public server after this logging pass,
+    // the cause is something else (server-side anti-cheat reach checks, server-side click
+    // rate limiting, an actual case of the same-tick ordering above, etc.) and the new
+    // interactWith()/tickScale() logging from this round should make that visible.
+    fun centerOnOrgan(): CenterResult {
+        val mc = Minecraft.getInstance()
+        val player = mc.player ?: run {
+            logger.warn("centerOnOrgan: no player")
+            return CenterResult.NoPlayer
+        }
+        val world = mc.level ?: run {
+            logger.warn("centerOnOrgan: no world")
+            return CenterResult.NoPlayer
+        }
+
+        logEnvironmentBanner("centerOnOrgan")
+
+        logger.info("centerOnOrgan: entry pos=${player.position()} yRot=${player.yRot} xRot=${player.xRot} ping=${currentPingMs()}")
+
+        val playableBlocks = NoteBlockRegistry.allPlayable()
+        logger.info("centerOnOrgan: ${playableBlocks.size} playable blocks found")
+        if (playableBlocks.isEmpty()) return CenterResult.NoBlocks
+
+        val playerPos = player.blockPosition()
+
+        // Helper: count reachable blocks from a given stand position.
+        // Uses player.getEyeHeight() (live, pose-aware) rather than a hardcoded 1.62 —
+        // interactWith() uses player.eyePosition, which is also pose-aware. Using a
+        // fixed constant here would silently disagree with interactWith if the player
+        // is crouching (or otherwise not in the STANDING pose) at Center time, which is
+        // a real candidate for the "wrong aim" bug in item 1: the precomputed reach/yaw/
+        // pitch would be built from the wrong eye height and stay wrong until re-centered.
+        fun countReachable(standPos: BlockPos): Int {
+            val eyePos = Vec3(standPos.x + 0.5, standPos.y + player.getEyeHeight().toDouble(), standPos.z + 0.5)
+            return playableBlocks.count { entry ->
+                val target = Vec3(entry.pos.x + 0.5, entry.pos.y + 1.0, entry.pos.z + 0.5)
+                eyePos.distanceTo(target) <= REACH_DISTANCE
+            }
+        }
+
+        // Always start by evaluating the player's current block
+        val currentBlockReachable = countReachable(playerPos)
+        logger.info("centerOnOrgan: current block $playerPos covers $currentBlockReachable/${playableBlocks.size} blocks")
+
+        // If the player's current block already covers everything, just snap to block center — no teleport
+        if (currentBlockReachable == playableBlocks.size) {
+            logger.info("centerOnOrgan: current block is optimal — snapping to block center only")
+            val centeredX = playerPos.x + 0.5
+            val centeredZ = playerPos.z + 0.5
+            val currentX = player.x
+            val currentZ = player.z
+            logger.info("centerOnOrgan: [optimal branch] before setPos pos=${player.position()}")
+            // Only move if not already within the block (within 0.4 of center)
+            if (Math.abs(currentX - centeredX) > 0.05 || Math.abs(currentZ - centeredZ) > 0.05) {
+                player.setPos(Vec3(centeredX, player.y, centeredZ))
+                logger.info("centerOnOrgan: snapped to center of current block $playerPos")
+            } else {
+                logger.info("centerOnOrgan: already centered in block — no movement")
+            }
+            // Re-read rather than assume the setPos value took — something else (collision,
+            // server correction, another mod) may override it same-tick.
+            logger.info("centerOnOrgan: [optimal branch] after setPos pos=${player.position()} (re-read, not assumed)")
+            buildOrganMap(playableBlocks, playerPos, player.getEyeHeight())
+            return CenterResult.Centered(playerPos, currentBlockReachable, playableBlocks.size)
+        }
+
+        // Current block isn't optimal — search nearby for a better stand position
+        val avgX = playableBlocks.map { it.pos.x + 0.5 }.average()
+        val avgZ = playableBlocks.map { it.pos.z + 0.5 }.average()
+        val cX = avgX.toInt()
+        val cZ = avgZ.toInt()
+        val searchRadius = 6
+
+        val candidates = mutableListOf<BlockPos>()
+        for (x in -searchRadius..searchRadius) {
+            for (z in -searchRadius..searchRadius) {
+                val testPos = BlockPos(cX + x, playerPos.y, cZ + z)
+                val feetState = world.getBlockState(testPos)
+                val headState = world.getBlockState(testPos.above())
+                val floorState = world.getBlockState(testPos.below())
+                if (!feetState.isAir || !headState.isAir) continue
+                if (!floorState.canOcclude()) continue
+                candidates.add(testPos)
+            }
+        }
+
+        // Add current block as a candidate so it's always considered
+        if (playerPos !in candidates) candidates.add(playerPos)
+        logger.info("centerOnOrgan: ${candidates.size} stand position candidates")
+
+        val best = candidates.maxByOrNull { countReachable(it) } ?: playerPos
+        val bestReachable = countReachable(best)
+
+        buildOrganMap(playableBlocks, best, player.getEyeHeight())
+
+        logger.info("centerOnOrgan: [search branch] before setPos pos=${player.position()} chosenStand=$best")
+        if (best == playerPos) {
+            // Best position is the current block — just snap to center
+            val centeredX = playerPos.x + 0.5
+            val centeredZ = playerPos.z + 0.5
+            player.setPos(Vec3(centeredX, player.y, centeredZ))
+            logger.info("centerOnOrgan: current block is best ($bestReachable reachable) — snapped to center")
+        } else {
+            // Need to move to a different block
+            player.setPos(Vec3(best.x + 0.5, best.y.toDouble(), best.z + 0.5))
+            logger.info("centerOnOrgan: moved to $best ($bestReachable/${playableBlocks.size} reachable)")
+        }
+        // Re-read rather than assume — if this differs from what was just set, something
+        // else (collision, server correction, another mod) is overriding the position.
+        logger.info("centerOnOrgan: [search branch] after setPos pos=${player.position()} (re-read, not assumed)")
+
+        return CenterResult.Centered(best, bestReachable, playableBlocks.size)
+    }
+
+    private fun buildOrganMap(playableBlocks: List<kyrielie.blockbard.organ.NoteBlockEntry>, standPos: BlockPos, eyeHeight: Float) {
+        val eyePos = Vec3(standPos.x + 0.5, standPos.y + eyeHeight.toDouble(), standPos.z + 0.5)
+        val reachMap = playableBlocks.associate { entry ->
+            val target = Vec3(entry.pos.x + 0.5, entry.pos.y + 1.0, entry.pos.z + 0.5)
+            val delta = target.subtract(eyePos)
+            val distance = delta.length()
+            val isReachable = distance <= REACH_DISTANCE
+            val (yaw, pitch) = if (isReachable) vecToYawPitch(delta) else Pair(0f, 0f)
+            entry.pos to ReachInfo(isReachable, yaw, pitch, distance)
+        }
+        organMap = OrganMap(standPos, reachMap)
+        logger.info("buildOrganMap: ${reachMap.values.count { it.isReachable }}/${playableBlocks.size} reachable from $standPos (eyeHeight=$eyeHeight)")
+    }
+
+    /**
+     * Sends a right-click interact to a noteblock.
+     * Uses Direction.UP always — noteblocks advance their note via useWithoutItem,
+     * which doesn't care about hit face direction.
+     *
+     * IMPORTANT: The player must have empty hands for useWithoutItem to be reached.
+     * If the player holds any item, performUseItemOn() may short-circuit before
+     * calling useWithoutItem, and the note will NOT advance.
+     */
+    // Tracks consecutive unreachable failures per block, so a structural aim/reach
+    // problem (same block failing repeatedly) is distinguishable from a one-off
+    // lag spike. Cleared on success.
+    private val consecutiveUnreachable = mutableMapOf<BlockPos, Int>()
+
+    fun interactWith(pos: BlockPos): Boolean {
+        val mc = Minecraft.getInstance()
+        val player = mc.player ?: run {
+            logger.warn("interactWith $pos: no player")
+            return false
+        }
+
+        // ── Creative / Spectator guard ──
+        val gameMode = mc.gameMode?.playerMode
+        if (gameMode == GameType.CREATIVE || gameMode == GameType.SPECTATOR) {
+            val msg = "§e[BlockBard] §cCannot interact in ${gameMode.getName()} mode"
+            player.sendSystemMessage(net.minecraft.network.chat.Component.literal(msg))
+            logger.warn("interactWith $pos: blocked — player is in $gameMode mode")
+            return false
+        }
+
+        val reach = organMap?.getReachInfo(pos)
+        if (reach != null && !reach.isReachable) {
+            // The OrganMap distance was computed at Center time from the stand position.
+            // Recompute live so a stale map (player moved after Center, map never rebuilt)
+            // is distinguishable from a genuinely-too-far block.
+            val liveEyePos = player.eyePosition
+            val liveTarget = Vec3(pos.x + 0.5, pos.y + 1.0, pos.z + 0.5)
+            val liveDistance = liveTarget.subtract(liveEyePos).length()
+            val staleDeltaThreshold = 0.5
+            val staleSuspected = Math.abs(liveDistance - reach.distance) > staleDeltaThreshold
+            val count = (consecutiveUnreachable[pos] ?: 0) + 1
+            consecutiveUnreachable[pos] = count
+            logger.warn(
+                "interactWith $pos: not reachable mapDistance=${"%.2f".format(reach.distance)} " +
+                    "liveDistance=${"%.2f".format(liveDistance)} staleMapSuspected=$staleSuspected " +
+                    "consecutiveFails=$count clientPos=${player.position()} ping=${currentPingMs()}"
+            )
+            return false
+        }
+        consecutiveUnreachable.remove(pos)
+
+        val eyePos = player.eyePosition
+        val target = Vec3(pos.x + 0.5, pos.y + 1.0, pos.z + 0.5)
+        val delta = target.subtract(eyePos)
+        val distance = delta.length()
+        if (distance > REACH_DISTANCE) {
+            logger.warn("interactWith $pos: too far (${"%.2f".format(distance)} > $REACH_DISTANCE) clientPos=${player.position()} ping=${currentPingMs()}")
+            return false
+        }
+
+        val (yaw, pitch) = reach?.let { Pair(it.yaw, it.pitch) } ?: vecToYawPitch(delta)
+        player.setYRot(yaw)
+        player.setXRot(pitch)
+
+        // Re-read after the setters — entity rotation can occasionally be overridden
+        // same-tick by other systems, so confirm the values actually took rather than
+        // assuming setYRot/setXRot are the last word.
+        val liveYRotAfterSet = player.yRot
+        val liveXRotAfterSet = player.xRot
+        if (liveYRotAfterSet != yaw || liveXRotAfterSet != pitch) {
+            logger.warn(
+                "interactWith $pos: rotation did not take — set yaw=$yaw pitch=$pitch, " +
+                    "read back yRot=$liveYRotAfterSet xRot=$liveXRotAfterSet"
+            )
+        }
+
+        // Delta between live-computed (yaw, pitch) and the values precomputed by
+        // buildOrganMap at Center time, when available. A persistent mismatch points
+        // to buildOrganMap and interactWith disagreeing on eye height or eye position.
+        if (reach != null) {
+            val (liveYaw, livePitch) = vecToYawPitch(delta)
+            val yawDelta = Math.abs(liveYaw - reach.yaw)
+            val pitchDelta = Math.abs(livePitch - reach.pitch)
+            if (yawDelta > 1.0f || pitchDelta > 1.0f) {
+                logger.warn(
+                    "interactWith $pos: aim mismatch — live(yaw=${"%.1f".format(liveYaw)}, pitch=${"%.1f".format(livePitch)}) " +
+                        "vs precomputed(yaw=${"%.1f".format(reach.yaw)}, pitch=${"%.1f".format(reach.pitch)}) " +
+                        "eyePos=$eyePos"
+                )
+            }
+        }
+
+        // Direction.UP is correct for noteblocks — useWithoutItem ignores hit face
+        val hitResult = BlockHitResult(target, Direction.UP, pos, false)
+        logger.info(
+            "interactWith $pos: useItemOn clientPos=${player.position()} eyePos=$eyePos " +
+                "clientDist=${"%.2f".format(distance)} mapDist=${reach?.distance?.let { "%.2f".format(it) } ?: "n/a"} " +
+                "yaw=${"%.1f".format(yaw)} pitch=${"%.1f".format(pitch)} ping=${currentPingMs()}"
+        )
+        mc.gameMode?.useItemOn(player, InteractionHand.MAIN_HAND, hitResult)
+        return true
+    }
+
+    fun interactWith(entry: NoteBlockEntry): Boolean = interactWith(entry.pos)
+
+    fun clearOrganMap() {
+        logger.info("clearOrganMap: organ map cleared")
+        organMap = null
+    }
+}
+</file>
+
+<file path="src/client/kotlin/kyrielie/blockbard/client/BlockBardClient.kt">
+package kyrielie.blockbard.client
+
+import kyrielie.blockbard.client.config.ConfigManager
+import kyrielie.blockbard.client.gui.MainScreen
+import kyrielie.blockbard.client.gui.PlaybackHud
+import kyrielie.blockbard.client.input.KeyboardInputHandler
+import kyrielie.blockbard.client.input.MidiInputHandler
+import kyrielie.blockbard.client.player.PlayerController
+import kyrielie.blockbard.organ.ArpeggioScheduler
+import kyrielie.blockbard.organ.InstrumentShifter
+import kyrielie.blockbard.client.organ.OrganScanner
+import net.fabricmc.api.ClientModInitializer
+import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents
+import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper
+import net.minecraft.client.KeyMapping
+import org.lwjgl.glfw.GLFW
+import org.slf4j.LoggerFactory
+
+object BlockBardClient : ClientModInitializer {
+
+    const val MOD_ID = "blockbard"
+    val logger = LoggerFactory.getLogger("BlockBard")
+
+    private lateinit var openGuiKey: KeyMapping
+    private lateinit var toggleHudKey: KeyMapping
+
+    override fun onInitializeClient() {
+        logger.info("BlockBard initializing...")
+        ConfigManager.load()
+        val cfg = ConfigManager.config
+        logger.info("Config loaded: scanRadius=${cfg.scanRadius}, shiftMode=${cfg.shiftMode}, arpeggioStaleTimeoutMs=${cfg.arpeggioStaleTimeoutMs}")
+
+        OrganScanner.scanRadius = cfg.scanRadius
+        InstrumentShifter.mode = cfg.shiftModeEnum()
+        InstrumentShifter.maxOctaveShift = cfg.maxOctaveShift
+        ArpeggioScheduler.staleTimeoutMs = cfg.arpeggioStaleTimeoutMs
+
+        ArpeggioScheduler.interactDelegate = { pos ->
+            logger.debug("interactDelegate: → $pos")
+            PlayerController.interactWith(pos)
+        }
+
+        openGuiKey = KeyMappingHelper.registerKeyMapping(
+            KeyMapping("key.blockbard.open_gui", GLFW.GLFW_KEY_B, KeyMapping.Category.MISC)
+        )
+        toggleHudKey = KeyMappingHelper.registerKeyMapping(
+            KeyMapping("key.blockbard.toggle_hud", GLFW.GLFW_KEY_H, KeyMapping.Category.MISC)
+        )
+        logger.info("Keybindings registered: B=open GUI, H=toggle HUD")
+
+        KeyboardInputHandler.register()
+        PlaybackHud.register()
+
+        ClientTickEvents.END_CLIENT_TICK.register { mc ->
+            while (openGuiKey.consumeClick()) {
+                logger.info("B pressed — opening MainScreen")
+                if (mc.gui.screen() == null) mc.gui.setScreen(MainScreen())
+            }
+            while (toggleHudKey.consumeClick()) {
+                PlaybackHud.isVisible = !PlaybackHud.isVisible
+                logger.info("H pressed — HUD visible=${PlaybackHud.isVisible}")
+            }
+            ArpeggioScheduler.onTick()
+        }
+
+        MidiInputHandler.autoConnect()
+        logger.info("BlockBard initialized.")
+    }
+}
 </file>
 
 </files>

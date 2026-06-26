@@ -15,6 +15,7 @@ import net.minecraft.client.gui.components.Button
 import net.minecraft.client.gui.screens.Screen
 import net.minecraft.client.input.MouseButtonEvent
 import net.minecraft.network.chat.Component
+import net.minecraft.world.level.GameType
 import org.slf4j.LoggerFactory
 import java.io.File
 
@@ -39,11 +40,12 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
     private var scrollOffset: Int = 0
     private val maxVisible = 8
 
-    // Playback state
+    // Tuning state
     private var tuner: NoteBlockTuner? = null
-    private var tuningTargets: List<TuneTarget> = emptyList()
-    private var tuneProgress: Pair<Int, Int> = Pair(0, 0)
     private var assignment: OrganAssignment? = null
+    private var tuneStatusMsg: String = ""
+
+    // General status
     private var organScanMessage: String = "Press Scan to detect noteblocks"
     private var coverageMessage: String = ""
     private var scanTicker = 0
@@ -52,7 +54,7 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
     private var scaleNotes: List<NoteBlockEntry> = emptyList()
     private var scaleIndex: Int = -1
     private var scaleTicker: Int = 0
-    private val scaleTickInterval = 4  // ticks between each note (~200ms)
+    private val scaleTickInterval = 4 // ticks between notes (~200ms at 20tps)
 
     override fun init() {
         super.init()
@@ -62,133 +64,112 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
         updateOrganInfo()
 
         // ── File list controls ──
-        addRenderableWidget(
-            Button.builder(Component.literal("↑")) {
-                scrollOffset = (scrollOffset - 1).coerceAtLeast(0)
-                logger.debug("MainScreen: scroll up → offset=$scrollOffset")
-            }.pos(10, 60).size(20, 16).build()
-        )
-        addRenderableWidget(
-            Button.builder(Component.literal("↓")) {
-                scrollOffset = (scrollOffset + 1).coerceAtMost((midiFiles.size - maxVisible).coerceAtLeast(0))
-                logger.debug("MainScreen: scroll down → offset=$scrollOffset")
-            }.pos(10, 80).size(20, 16).build()
-        )
-        addRenderableWidget(
-            Button.builder(Component.literal("Refresh")) {
-                logger.info("MainScreen: Refresh clicked")
-                refreshFiles()
-                minecraft.player?.sendSystemMessage(Component.literal("§b[BlockBard] §fRefreshed — ${midiFiles.size} files found"))
-            }.pos(10, 100).size(60, 16).build()
-        )
+        addRenderableWidget(Button.builder(Component.literal("↑")) {
+            scrollOffset = (scrollOffset - 1).coerceAtLeast(0)
+            logger.debug("scroll up → offset=$scrollOffset")
+        }.pos(10, 60).size(20, 16).build())
+
+        addRenderableWidget(Button.builder(Component.literal("↓")) {
+            scrollOffset = (scrollOffset + 1).coerceAtMost((midiFiles.size - maxVisible).coerceAtLeast(0))
+            logger.debug("scroll down → offset=$scrollOffset")
+        }.pos(10, 80).size(20, 16).build())
+
+        addRenderableWidget(Button.builder(Component.literal("Refresh")) {
+            logger.info("Refresh clicked")
+            refreshFiles()
+            chat("Refreshed — ${midiFiles.size} files found")
+        }.pos(10, 100).size(60, 16).build())
 
         // ── Organ controls ──
-        addRenderableWidget(
-            Button.builder(Component.literal("Scan")) {
-                logger.info("MainScreen: Scan clicked")
-                minecraft.player?.sendSystemMessage(Component.literal("§b[BlockBard] §fScanning..."))
-                OrganScanner.scan()
-                updateOrganInfo()
-                // OrganScanner.scan() already prints results to chat
-            }.pos(10, 200).size(50, 16).build()
-        )
+        addRenderableWidget(Button.builder(Component.literal("Scan")) {
+            logger.info("Scan clicked")
+            OrganScanner.scan()
+            updateOrganInfo()
+        }.pos(10, 200).size(50, 16).build())
 
-        addRenderableWidget(
-            Button.builder(Component.literal("Center")) {
-                logger.info("MainScreen: Center clicked")
-                minecraft.player?.sendSystemMessage(Component.literal("§b[BlockBard] §fCentering on organ..."))
-                val result = PlayerController.centerOnOrgan()
-                organScanMessage = when (result) {
-                    is CenterResult.Centered -> "Centered. ${result.reachableCount}/${result.totalFound} reachable."
-                    CenterResult.NoBlocks -> "No playable noteblocks found."
-                    CenterResult.NoPlayer -> "No player found."
-                }
-                val msg = "§b[BlockBard] §f$organScanMessage"
-                minecraft.player?.sendSystemMessage(Component.literal(msg))
-                logger.info("MainScreen: Center result → $organScanMessage")
-            }.pos(65, 200).size(60, 16).build()
-        )
+        addRenderableWidget(Button.builder(Component.literal("Center")) {
+            logger.info("Center clicked")
+            chat("Centering on organ...")
+            val result = PlayerController.centerOnOrgan()
+            organScanMessage = when (result) {
+                is CenterResult.Centered -> "Centered. ${result.reachableCount}/${result.totalFound} reachable."
+                CenterResult.NoBlocks   -> "No playable noteblocks found."
+                CenterResult.NoPlayer   -> "No player found."
+            }
+            chat(organScanMessage)
+            logger.info("Center result: $organScanMessage")
+        }.pos(65, 200).size(60, 16).build())
 
-        addRenderableWidget(
-            Button.builder(Component.literal("Tune")) {
-                logger.info("MainScreen: Tune clicked")
-                minecraft.player?.sendSystemMessage(Component.literal("§b[BlockBard] §fStarting tuning..."))
-                startTuning()
-            }.pos(130, 200).size(50, 16).build()
-        )
+        addRenderableWidget(Button.builder(Component.literal("Tune")) {
+            logger.info("Tune clicked")
+            startTuning()
+        }.pos(130, 200).size(50, 16).build())
 
-        // ── Scale test ──
-        addRenderableWidget(
-            Button.builder(Component.literal("▶ Scale")) {
-                logger.info("MainScreen: Play Scale clicked")
-                playScale()
-            }.pos(185, 200).size(60, 16).build()
-        )
+        addRenderableWidget(Button.builder(Component.literal("▶ Scale")) {
+            logger.info("Play Scale clicked")
+            playScale()
+        }.pos(185, 200).size(60, 16).build())
 
         // ── Playback controls ──
-        addRenderableWidget(
-            Button.builder(Component.literal("▶ Play")) {
-                logger.info("MainScreen: Play clicked — isPaused=${MidiFilePlayer.isPaused}, selectedFile=${selectedFile?.name}")
-                if (MidiFilePlayer.isPaused) {
-                    MidiFilePlayer.resume()
-                    minecraft.player?.sendSystemMessage(Component.literal("§b[BlockBard] §aResumed"))
-                } else {
-                    startPlayback()
-                }
-            }.pos(10, 222).size(55, 16).build()
-        )
+        addRenderableWidget(Button.builder(Component.literal("▶ Play")) {
+            logger.info("Play clicked — isPaused=${MidiFilePlayer.isPaused}, file=${selectedFile?.name}")
+            if (MidiFilePlayer.isPaused) {
+                MidiFilePlayer.resume()
+                chat("Resumed")
+            } else {
+                startPlayback()
+            }
+        }.pos(10, 222).size(55, 16).build())
 
-        addRenderableWidget(
-            Button.builder(Component.literal("⏸ Pause")) {
-                logger.info("MainScreen: Pause clicked — isPaused=${MidiFilePlayer.isPaused}")
-                if (MidiFilePlayer.isPaused) {
-                    MidiFilePlayer.resume()
-                    minecraft.player?.sendSystemMessage(Component.literal("§b[BlockBard] §aResumed"))
-                } else {
-                    MidiFilePlayer.pause()
-                    minecraft.player?.sendSystemMessage(Component.literal("§b[BlockBard] §ePaused"))
-                }
-            }.pos(70, 222).size(60, 16).build()
-        )
+        addRenderableWidget(Button.builder(Component.literal("⏸ Pause")) {
+            logger.info("Pause clicked")
+            if (MidiFilePlayer.isPaused) {
+                MidiFilePlayer.resume(); chat("Resumed")
+            } else {
+                MidiFilePlayer.pause(); chat("Paused")
+            }
+        }.pos(70, 222).size(60, 16).build())
 
-        addRenderableWidget(
-            Button.builder(Component.literal("⏹ Stop")) {
-                logger.info("MainScreen: Stop clicked")
-                MidiFilePlayer.stop()
-                NbsPlayer.stop()
-                stopScale()
-                minecraft.player?.sendSystemMessage(Component.literal("§b[BlockBard] §cStopped"))
-            }.pos(135, 222).size(50, 16).build()
-        )
+        addRenderableWidget(Button.builder(Component.literal("⏹ Stop")) {
+            logger.info("Stop clicked")
+            MidiFilePlayer.stop()
+            NbsPlayer.stop()
+            stopScale()
+            abortTuning()
+            chat("Stopped")
+        }.pos(135, 222).size(50, 16).build())
 
-        addRenderableWidget(
-            Button.builder(Component.literal("⇀ Shuffle")) {
-                logger.info("MainScreen: Shuffle clicked")
-                shuffle()
-            }.pos(190, 222).size(60, 16).build()
-        )
+        addRenderableWidget(Button.builder(Component.literal("⇀ Shuffle")) {
+            logger.info("Shuffle clicked")
+            shuffle()
+        }.pos(190, 222).size(60, 16).build())
 
-        addRenderableWidget(
-            Button.builder(Component.literal("Tempo -")) {
-                MidiFilePlayer.tempoMultiplier = (MidiFilePlayer.tempoMultiplier - 0.1f).coerceAtLeast(0.5f)
-                logger.info("MainScreen: Tempo − → ${MidiFilePlayer.tempoMultiplier}")
-                minecraft.player?.sendSystemMessage(Component.literal("§b[BlockBard] §fTempo: ${"%.1f".format(MidiFilePlayer.tempoMultiplier)}x"))
-            }.pos(10, 242).size(55, 16).build()
-        )
-        addRenderableWidget(
-            Button.builder(Component.literal("Tempo +")) {
-                MidiFilePlayer.tempoMultiplier = (MidiFilePlayer.tempoMultiplier + 0.1f).coerceAtMost(2.0f)
-                logger.info("MainScreen: Tempo + → ${MidiFilePlayer.tempoMultiplier}")
-                minecraft.player?.sendSystemMessage(Component.literal("§b[BlockBard] §fTempo: ${"%.1f".format(MidiFilePlayer.tempoMultiplier)}x"))
-            }.pos(70, 242).size(55, 16).build()
-        )
+        addRenderableWidget(Button.builder(Component.literal("Tempo -")) {
+            MidiFilePlayer.tempoMultiplier = (MidiFilePlayer.tempoMultiplier - 0.1f).coerceAtLeast(0.5f)
+            logger.info("Tempo − → ${MidiFilePlayer.tempoMultiplier}")
+            chat("Tempo: ${"%.1f".format(MidiFilePlayer.tempoMultiplier)}x")
+        }.pos(10, 242).size(55, 16).build())
 
-        addRenderableWidget(
-            Button.builder(Component.literal("Close")) {
-                logger.info("MainScreen: Close clicked")
-                onClose()
-            }.pos(width - 70, height - 24).size(60, 16).build()
-        )
+        addRenderableWidget(Button.builder(Component.literal("Tempo +")) {
+            MidiFilePlayer.tempoMultiplier = (MidiFilePlayer.tempoMultiplier + 0.1f).coerceAtMost(2.0f)
+            logger.info("Tempo + → ${MidiFilePlayer.tempoMultiplier}")
+            chat("Tempo: ${"%.1f".format(MidiFilePlayer.tempoMultiplier)}x")
+        }.pos(70, 242).size(55, 16).build())
+
+        addRenderableWidget(Button.builder(Component.literal("Close")) {
+            logger.info("Close clicked")
+            onClose()
+        }.pos(width - 70, height - 24).size(60, 16).build())
+    }
+
+    // ── Helpers ──
+
+    private fun chat(msg: String) {
+        minecraft.player?.sendSystemMessage(Component.literal("§b[BlockBard] §f$msg"))
+    }
+
+    private fun chatWarn(msg: String) {
+        minecraft.player?.sendSystemMessage(Component.literal("§b[BlockBard] §c$msg"))
     }
 
     private fun refreshFiles() {
@@ -207,43 +188,124 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
         logger.info("updateOrganInfo: $organScanMessage")
     }
 
+    // ── Tuning ──
+
     private fun startTuning() {
-        val midi = MidiFilePlayer.loadedMidi ?: run {
-            organScanMessage = "No MIDI file loaded!"
-            minecraft.player?.sendSystemMessage(Component.literal("§b[BlockBard] §cNo MIDI file loaded — select one first"))
-            logger.warn("startTuning: no MIDI loaded")
+        val mc = minecraft
+        val player = mc.player ?: run { chatWarn("No player"); return }
+
+        // Gamemode guard
+        val gameMode = mc.gameMode?.playerMode
+        if (gameMode == GameType.CREATIVE || gameMode == GameType.SPECTATOR) {
+            chatWarn("Cannot tune in ${gameMode.getName()} mode")
+            logger.warn("startTuning: blocked — $gameMode mode")
             return
         }
+
+        // Empty hand check — critical: useWithoutItem only fires when hands are empty
+        val mainHand = player.mainHandItem
+        val offHand  = player.offhandItem
+        if (!mainHand.isEmpty) {
+            chatWarn("Empty your main hand before tuning — held items block noteblock interaction")
+            logger.warn("startTuning: blocked — player holding ${mainHand.item} in main hand")
+            return
+        }
+        if (!offHand.isEmpty) {
+            chatWarn("Empty your offhand before tuning")
+            logger.warn("startTuning: blocked — player holding ${offHand.item} in offhand")
+            return
+        }
+
         val map = PlayerController.organMap ?: run {
-            organScanMessage = "Run Center first!"
-            minecraft.player?.sendSystemMessage(Component.literal("§b[BlockBard] §cRun Center first"))
-            logger.warn("startTuning: no organ map — Center must be run first")
+            chatWarn("Run Center first!")
+            logger.warn("startTuning: no organ map")
             return
         }
+
         val reachable = NoteBlockRegistry.allPlayable().filter { map.isReachable(it.pos) }
-        logger.info("startTuning: ${reachable.size} reachable playable blocks, ${midi.distinctNotes.size} distinct MIDI notes in file")
-
-        val result = MidiToOrganMapper.buildAssignment(midi.noteUsageCounts, reachable)
-        assignment = result
-        logger.info("startTuning: mapped ${result.assignment.size} notes, ${result.unplayable.size} unplayable: ${result.unplayable.map { midiNoteToName(it) }}")
-
-        val targets = MidiToOrganMapper.computeTuneTargets(result, reachable)
-        tuningTargets = targets
-        val totalClicks = targets.sumOf { it.clicksRequired }
-        logger.info("startTuning: ${targets.size} blocks to tune, $totalClicks total clicks")
-        minecraft.player?.sendSystemMessage(Component.literal("§b[BlockBard] §fTuning ${targets.size} blocks ($totalClicks clicks)..."))
-
-        tuner = NoteBlockTuner(targets) { done, total ->
-            tuneProgress = Pair(done, total)
-            logger.debug("tuning progress: $done/$total blocks")
+        if (reachable.isEmpty()) {
+            chatWarn("No reachable noteblocks — run Scan then Center first")
+            logger.warn("startTuning: no reachable blocks")
+            return
         }
-        organScanMessage = "Tuning..."
-        updateCoverageMessage(result)
+
+        val targets: List<TuneTarget>
+
+        val midi = MidiFilePlayer.loadedMidi
+        if (midi != null) {
+            // MIDI loaded — map notes from the song to blocks
+            logger.info("startTuning: MIDI mode — ${reachable.size} reachable blocks, ${midi.distinctNotes.size} distinct notes")
+            val result = MidiToOrganMapper.buildAssignment(midi.noteUsageCounts, reachable)
+            assignment = result
+            if (result.unplayable.isNotEmpty()) {
+                val names = result.unplayable.map { midiNoteToName(it) }
+                chatWarn("Warning: ${names.size} notes unplayable: ${names.take(6).joinToString()}")
+            }
+            updateCoverageMessage(result)
+            targets = MidiToOrganMapper.computeTuneTargets(result, reachable)
+        } else {
+            // No MIDI — tune blocks to a chromatic scale starting at F#3 (MIDI 54, noteIndex 0 on HARP)
+            // This is the natural test target: one block per semitone, ascending, *per instrument*.
+            // Note indices are scoped to each instrument independently (DiscJockey-style:
+            // noteblocksForInstrument is grouped per NoteBlockInstrument) — otherwise blocks
+            // past the 25th in a flat ordering would all collide on noteIndex 24.
+            logger.info("startTuning: no-MIDI mode — tuning ${reachable.size} blocks to chromatic scale from F#3")
+            chat("No MIDI loaded — tuning blocks to chromatic scale (F#3 upward)")
+            val sorted = reachable.sortedBy { it.distanceFromPlayer }
+            targets = sorted
+                .groupBy { it.instrument }
+                .flatMap { (_, blocksForInstrument) ->
+                    blocksForInstrument.mapIndexed { i, entry ->
+                        val targetNoteIndex = i.coerceIn(0, 24)
+                        TuneTarget(entry.pos, entry.noteIndex, targetNoteIndex, entry.instrument)
+                    }
+                }
+            assignment = null
+            val perInstrumentCounts = sorted.groupBy { it.instrument }.mapValues { it.value.size }
+            coverageMessage = "Test scale: ${sorted.size} blocks across ${perInstrumentCounts.size} instrument(s) → noteIndex 0–24 per instrument"
+        }
+
+        if (targets.isEmpty()) {
+            chat("Nothing to tune — all blocks already at target notes!")
+            logger.info("startTuning: no targets needed")
+            return
+        }
+
+        val totalClicks = targets.sumOf { it.estimatedClicks }
+        chat("Tuning ${targets.size} blocks (~$totalClicks clicks)...")
+        logger.info("startTuning: ${targets.size} targets, $totalClicks total clicks")
+
+        tuner = NoteBlockTuner(
+            targets         = targets,
+            worldNoteReader = { pos ->
+                mc.level?.getBlockState(pos)?.let { state ->
+                    if (state.block == net.minecraft.world.level.block.Blocks.NOTE_BLOCK)
+                        state.getValue(net.minecraft.world.level.block.NoteBlock.NOTE)
+                    else null
+                }
+            },
+            interactBlock   = { pos -> PlayerController.interactWith(pos) },
+            pingMs          = { PlayerController.currentPingMs() },
+            onProgress      = { done, total, msg ->
+                tuneStatusMsg = "$done/$total — $msg"
+                logger.debug("tuner progress: $tuneStatusMsg")
+            }
+        )
+        tuner!!.start()
+    }
+
+    private fun abortTuning() {
+        if (tuner?.isActive == true) {
+            logger.info("abortTuning: tuner cancelled")
+            chat("Tuning cancelled")
+        }
+        tuner = null
+        tuneStatusMsg = ""
     }
 
     private fun updateCoverageMessage(result: OrganAssignment) {
-        val total = (result.assignment.size + result.unplayable.size)
-        val covered = result.assignment.size
+        val covered   = result.assignment.size
+        val total     = covered + result.unplayable.size
         val unplayable = result.unplayable.map { midiNoteToName(it) }
         coverageMessage = "$covered/$total notes covered" +
                 if (unplayable.isNotEmpty()) ". Missing: ${unplayable.take(4).joinToString()}" else ""
@@ -254,41 +316,36 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
 
     private fun playScale() {
         val mc = minecraft
-        val player = mc.player ?: run {
-            logger.warn("playScale: no player")
-            return
-        }
+        val player = mc.player ?: run { logger.warn("playScale: no player"); return }
 
-        // Creative mode guard
         val gameMode = mc.gameMode?.playerMode
-        if (gameMode == net.minecraft.world.level.GameType.CREATIVE) {
-            val msg = "§e[BlockBard] §cCannot play scale in Creative mode — noteblocks would break!"
-            player.sendSystemMessage(Component.literal(msg))
+        if (gameMode == GameType.CREATIVE) {
+            chatWarn("Cannot play scale in Creative — noteblocks would break!")
             logger.warn("playScale: blocked — Creative mode")
             return
         }
 
         val playable = NoteBlockRegistry.allPlayable()
         if (playable.isEmpty()) {
-            player.sendSystemMessage(Component.literal("§b[BlockBard] §cNo playable noteblocks found — run Scan first"))
-            logger.warn("playScale: no playable blocks in registry")
+            chatWarn("No playable noteblocks found — run Scan first")
+            logger.warn("playScale: no playable blocks")
             return
         }
 
-        // Sort by MIDI note for a natural ascending scale
+        // Sort by actual MIDI note — this naturally orders GUITAR (base 42) before HARP (base 54)
+        // and BASS (base 30) before both. No instrument assumptions needed.
         scaleNotes = playable.sortedBy { it.midiNote }
         scaleIndex = 0
         scaleTicker = 0
 
-        val noteNames = scaleNotes.map { midiNoteToName(it.midiNote) }
-        logger.info("playScale: playing ${scaleNotes.size} notes: $noteNames")
-        player.sendSystemMessage(Component.literal("§b[BlockBard] §aPlaying scale: ${noteNames.joinToString(" → ")}"))
+        val noteNames = scaleNotes.map { "${it.instrument.name.take(4)}:${kyrielie.blockbard.util.midiNoteToName(it.midiNote)}" }
+        logger.info("playScale: ${scaleNotes.size} notes in pitch order: $noteNames")
+        chat("Playing scale (${scaleNotes.size} notes, ${scaleNotes.first().instrument.name} → ${scaleNotes.last().instrument.name})")
     }
 
     private fun stopScale() {
         if (scaleIndex >= 0) {
             logger.info("stopScale: cancelled at note $scaleIndex/${scaleNotes.size}")
-            minecraft.player?.sendSystemMessage(Component.literal("§b[BlockBard] §eScale stopped"))
         }
         scaleNotes = emptyList()
         scaleIndex = -1
@@ -296,12 +353,11 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
     }
 
     private fun tickScale() {
-        if (scaleIndex < 0 || scaleIndex >= scaleNotes.size) {
-            if (scaleIndex >= scaleNotes.size) {
-                logger.info("tickScale: scale complete")
-                minecraft.player?.sendSystemMessage(Component.literal("§b[BlockBard] §aScale complete!"))
-                stopScale()
-            }
+        if (scaleIndex < 0) return
+        if (scaleIndex >= scaleNotes.size) {
+            logger.info("tickScale: scale complete")
+            chat("Scale complete!")
+            stopScale()
             return
         }
 
@@ -311,34 +367,28 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
 
         val entry = scaleNotes[scaleIndex]
         val noteName = midiNoteToName(entry.midiNote)
-        logger.info("tickScale: playing note $scaleIndex/${scaleNotes.size - 1} — ${entry.instrument.name} noteIndex=${entry.noteIndex} midi=${entry.midiNote} ($noteName) at ${entry.pos}")
+        logger.info("tickScale: [$scaleIndex/${scaleNotes.size - 1}] ${entry.instrument.name} noteIndex=${entry.noteIndex} midi=${entry.midiNote} ($noteName) @ ${entry.pos}")
         minecraft.player?.sendSystemMessage(
             Component.literal("§b[BlockBard] §f[$scaleIndex] ${entry.instrument.name} §a$noteName §7@ ${entry.pos.toShortString()}")
         )
-
-        // Enqueue with pre-resolved pos so it bypasses the assignment map
-        kyrielie.blockbard.organ.ArpeggioScheduler.enqueue(
-            kyrielie.blockbard.organ.NoteRequest(entry.midiNote, resolvedPos = entry.pos)
-        )
+        ArpeggioScheduler.enqueue(NoteRequest(entry.midiNote, resolvedPos = entry.pos))
         scaleIndex++
     }
 
+    // ── Playback ──
+
     private fun startPlayback() {
-        val file = selectedFile ?: run {
-            minecraft.player?.sendSystemMessage(Component.literal("§b[BlockBard] §cNo file selected"))
-            logger.warn("startPlayback: no file selected")
-            return
-        }
-        logger.info("startPlayback: starting ${file.name}")
-        minecraft.player?.sendSystemMessage(Component.literal("§b[BlockBard] §aPlaying: ${file.name}"))
+        val file = selectedFile ?: run { chatWarn("No file selected"); return }
+        logger.info("startPlayback: ${file.name}")
+        chat("Playing: ${file.name}")
         if (file.extension.lowercase() == "nbs") {
             val nbs = NbsFileLoader.load(file)
-            logger.info("startPlayback: loaded NBS '${nbs.title}' — ${nbs.notes.size} notes at ${nbs.tempo} tps")
+            logger.info("startPlayback: NBS '${nbs.title}' ${nbs.notes.size} notes at ${nbs.tempo} tps")
             NbsPlayer.play(nbs, MidiFilePlayer.tempoMultiplier)
         } else {
             if (MidiFilePlayer.loadedMidi?.file != file) {
                 val midi = MidiFilePlayer.load(file)
-                logger.info("startPlayback: loaded MIDI — ${midi.events.size} events, ${midi.distinctNotes.size} distinct notes")
+                logger.info("startPlayback: MIDI ${midi.events.size} events, ${midi.distinctNotes.size} distinct notes")
             }
             MidiFilePlayer.play()
         }
@@ -346,13 +396,8 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
 
     private fun shuffle() {
         val available = midiFiles.filter { it != selectedFile }
-        if (available.isEmpty()) {
-            logger.info("shuffle: only one file, nothing to shuffle to")
-            return
-        }
-        val next = available.random()
-        logger.info("shuffle: selected ${next.name}")
-        selectFile(next)
+        if (available.isEmpty()) { logger.info("shuffle: nothing to shuffle to"); return }
+        selectFile(available.random())
     }
 
     private fun selectFile(file: File) {
@@ -361,13 +406,15 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
         MidiFilePlayer.stop()
         if (file.extension.lowercase() in listOf("mid", "midi")) {
             val midi = MidiFilePlayer.load(file)
-            logger.info("selectFile: loaded ${file.name} — ${midi.events.size} events, tempo=${midi.baseTempoUsPerBeat}µs/beat")
-            minecraft.player?.sendSystemMessage(Component.literal("§b[BlockBard] §fLoaded: ${file.name} (${midi.distinctNotes.size} distinct notes)"))
+            logger.info("selectFile: ${file.name} — ${midi.events.size} events, tempo=${midi.baseTempoUsPerBeat}µs/beat")
+            chat("Loaded: ${file.name} (${midi.distinctNotes.size} distinct notes)")
         }
         ConfigManager.config.lastPlayedTrack = file.name
         organScanMessage = "Loaded: ${file.name}. Run Scan → Center → Tune → Play."
         coverageMessage = ""
     }
+
+    // ── Tick ──
 
     override fun tick() {
         super.tick()
@@ -380,19 +427,23 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
             updateOrganInfo()
         }
 
-        // Tuning tick — one click per tick
+        // Tuner tick
         val t = tuner
-        if (t != null && !t.isDone) {
-            val pos = t.nextClick()
-            if (pos != null) {
-                logger.debug("tick: tuning click at $pos (${t.completedBlocks}/${t.totalBlocks})")
-                PlayerController.interactWith(pos)
-            }
+        if (t != null) {
+            t.onTick()
+
             if (t.isDone) {
                 tuner = null
-                organScanMessage = "Tuning complete! Press Play."
-                minecraft.player?.sendSystemMessage(Component.literal("§b[BlockBard] §aTuning complete!"))
+                organScanMessage = "Tuning complete! Press ▶ Play."
+                chat("Tuning complete! All blocks verified.")
                 logger.info("tick: tuning complete")
+                // Rescan so registry reflects real world state
+                OrganScanner.scan()
+                updateOrganInfo()
+            } else if (t.isFailed) {
+                tuner = null
+                chatWarn("Tuning failed — check logs for details")
+                logger.warn("tick: tuning failed")
             }
         }
 
@@ -400,8 +451,8 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
         tickScale()
     }
 
-    // In 26.x, Screen uses extractRenderState() instead of render()
-    // Do NOT call extractBackground() here — already called before this by the engine
+    // ── Render ──
+
     override fun extractRenderState(graphics: GuiGraphicsExtractor, mouseX: Int, mouseY: Int, partialTick: Float) {
         super.extractRenderState(graphics, mouseX, mouseY, partialTick)
         val font = minecraft.font
@@ -418,12 +469,11 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
             val prefix = if (realIdx == selectedIndex) "▶ " else "  "
             graphics.text(font, prefix + file.name.take(30), 34, y, color)
         }
-
         if (midiFiles.isEmpty()) {
-            graphics.text(font, "(no files — drop .mid/.nbs in config/blockbard/midis/)", 10, 36, 0xAAAAAA)
+            graphics.text(font, "(no files — drop .mid/.nbs into config/blockbard/midis/)", 10, 36, 0xAAAAAA)
         }
 
-        // Organ status
+        // Organ status section
         val organY = 175
         graphics.text(font, "─── Organ ───", 10, organY, 0x88AAFF)
         graphics.text(font, organScanMessage, 10, organY + 12, 0xFFFFFF)
@@ -440,25 +490,42 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
             cy += 12
         }
 
-        if (tuner != null) {
-            val (done, total) = tuneProgress
-            graphics.text(font, "Tuning $done/$total blocks...", 10, cy + 2, 0x44FF88)
+        // Tuner status
+        val t = tuner
+        if (t != null) {
+            val stateLabel = when (t.state) {
+                TunerState.TUNING    -> "§eTuning..."
+                TunerState.VERIFYING -> "§aVerifying..."
+                else                 -> ""
+            }
+            graphics.text(font, "$stateLabel ${t.confirmedBlocks}/${t.total}", 10, cy + 2, 0x44FF88)
+            cy += 12
+            if (tuneStatusMsg.isNotEmpty()) {
+                graphics.text(font, tuneStatusMsg.take(45), 10, cy, 0xCCFFCC)
+                cy += 10
+            }
         }
 
+        // Scale progress
         if (scaleIndex >= 0 && scaleIndex < scaleNotes.size) {
             val entry = scaleNotes[scaleIndex]
-            graphics.text(font, "♪ Scale: ${midiNoteToName(entry.midiNote)} ($scaleIndex/${scaleNotes.size})", 10, cy + 14, 0xAAFF44)
+            graphics.text(font, "♪ Scale: ${midiNoteToName(entry.midiNote)} ($scaleIndex/${scaleNotes.size})", 10, cy + 2, 0xAAFF44)
         }
 
-        // Playback status
+        // Playback status bar
         val pbY = height - 42
         val status = when {
-            MidiFilePlayer.isActive() && !MidiFilePlayer.isPaused -> "▶ PLAYING ${selectedFile?.name ?: ""}"
+            MidiFilePlayer.isActive() && !MidiFilePlayer.isPaused ->
+                "▶ PLAYING  ${selectedFile?.name ?: ""}"
             MidiFilePlayer.isPaused -> "⏸ PAUSED"
-            else -> "⏹ IDLE"
+            else                    -> "⏹ IDLE"
         }
         graphics.text(font, status, 10, pbY, 0xAAFFAA)
         graphics.text(font, "Tempo: ${"%.1f".format(MidiFilePlayer.tempoMultiplier)}x", 200, pbY, 0xCCCCCC)
+
+        // Ping display (useful when tuning on a server)
+        val ping = PlayerController.currentPingMs()
+        if (ping > 0) graphics.text(font, "Ping: ${ping}ms", 200, pbY + 10, 0xAAAAAA)
     }
 
     override fun mouseClicked(event: MouseButtonEvent, doubleClick: Boolean): Boolean {
@@ -469,7 +536,7 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
             visibleFiles.forEachIndexed { i, file ->
                 val y = 36 + i * 14
                 if (mouseX >= 34 && mouseX <= width - 10 && mouseY >= y && mouseY < y + 14) {
-                    logger.info("MainScreen: file clicked — ${file.name}")
+                    logger.info("file clicked: ${file.name}")
                     selectFile(file)
                     return true
                 }
@@ -482,6 +549,11 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
         logger.info("MainScreen: closing")
         ConfigManager.save()
         minecraft.gui.setScreen(parent)
+    }
+
+    // Suppress the background blur — keeps the game visually unobstructed while the GUI is open
+    override fun extractBlurredBackground(graphics: GuiGraphicsExtractor) {
+        // Intentionally empty — do not call super, which would call graphics.blurBeforeThisStratum()
     }
 
     override fun isPauseScreen(): Boolean = false
