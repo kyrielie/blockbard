@@ -1,7 +1,7 @@
 package kyrielie.blockbard.organ
 
-import kyrielie.blockbard.util.midiBase
 import kyrielie.blockbard.util.coversNatively
+import kyrielie.blockbard.util.midiBase
 import net.minecraft.core.BlockPos
 
 data class OrganAssignment(
