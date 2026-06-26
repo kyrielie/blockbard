@@ -2,17 +2,20 @@ package kyrielie.blockbard.client.gui
 
 import kyrielie.blockbard.client.playback.MidiFilePlayer
 import kyrielie.blockbard.organ.NoteBlockRegistry
-// HudRenderCallback is gone. Use the new HudElement / HudElementRegistry API.
+// HudRenderCallback is gone in 26.x. Use the new HudElement / HudElementRegistry API.
 import net.fabricmc.fabric.api.client.rendering.v1.hud.HudElement
 import net.fabricmc.fabric.api.client.rendering.v1.hud.HudElementRegistry
 import net.fabricmc.fabric.api.client.rendering.v1.hud.VanillaHudElements
 import net.minecraft.client.DeltaTracker
-// GuiGraphics is now GuiGraphicsExtractor
+// GuiGraphics is now GuiGraphicsExtractor in 26.x
 import net.minecraft.client.gui.GuiGraphicsExtractor
 import net.minecraft.client.Minecraft
 import net.minecraft.resources.Identifier
+import org.slf4j.LoggerFactory
 
 object PlaybackHud {
+
+    private val logger = LoggerFactory.getLogger("BlockBard/PlaybackHud")
 
     var isVisible: Boolean = true
     var lastShiftMessage: String = ""
@@ -27,21 +30,22 @@ object PlaybackHud {
             HUD_ID,
             HudElement { graphics, _ -> render(graphics) }
         )
+        logger.info("PlaybackHud: registered")
     }
 
     private fun render(graphics: GuiGraphicsExtractor) {
         if (!isVisible) return
         val mc = Minecraft.getInstance()
-        // Screen access: mc.gui.screen()
-        if (mc.gui.screen() != null) return  // Don't show HUD when GUI is open
+        // Screen access in 26.x: mc.gui.screen(), not mc.screen
+        if (mc.gui.screen() != null) return
         val font = mc.font
 
         val playable = NoteBlockRegistry.allPlayable().size
         val status = when {
             MidiFilePlayer.isActive() && !MidiFilePlayer.isPaused -> {
-                val currentMs = MidiFilePlayer.getCurrentTick()
-                val totalMs = MidiFilePlayer.getTotalTicks()
-                "▶ PLAYING  tick $currentMs/$totalMs"
+                val currentTick = MidiFilePlayer.getCurrentTick()
+                val totalTicks = MidiFilePlayer.getTotalTicks()
+                "▶ PLAYING  tick $currentTick/$totalTicks"
             }
             MidiFilePlayer.isPaused -> "⏸ PAUSED"
             else -> "♪ BlockBard  [B to open]"
@@ -51,11 +55,12 @@ object PlaybackHud {
         val coverage = "Organ: $playable blocks"
 
         val x = 4
+        // guiHeight() in 26.x (was mc.window.guiScaledHeight)
         var y = graphics.guiHeight() - 48
 
         // fill() signature unchanged
         graphics.fill(x - 2, y - 2, x + 180, y + 40, 0x88000000.toInt())
-        // drawString() → text()  (GuiGraphicsExtractor uses text(font, string, x, y, color))
+        // drawString() → text() in GuiGraphicsExtractor
         graphics.text(font, status, x, y, 0xAAFFAA); y += 10
         graphics.text(font, "Tempo: $tempo  |  $coverage", x, y, 0xCCCCCC); y += 10
         if (lastShiftMessage.isNotEmpty()) {
