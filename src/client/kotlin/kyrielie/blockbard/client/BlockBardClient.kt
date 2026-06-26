@@ -11,7 +11,8 @@ import kyrielie.blockbard.organ.InstrumentShifter
 import kyrielie.blockbard.client.organ.OrganScanner
 import net.fabricmc.api.ClientModInitializer
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents
-import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper
+// KeyBindingHelper → KeyMappingHelper (fabric-key-mapping-api-v1)
+import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper
 import net.minecraft.client.KeyMapping
 import org.lwjgl.glfw.GLFW
 
@@ -37,11 +38,12 @@ object BlockBardClient : ClientModInitializer {
         ArpeggioScheduler.interactDelegate = { pos -> PlayerController.interactWith(pos) }
 
         // Register hotkeys
-        openGuiKey = KeyBindingHelper.registerKeyBinding(
-            KeyMapping("key.blockbard.open_gui", GLFW.GLFW_KEY_B, "category.blockbard")
+        // KeyMapping now takes KeyMapping.Category instead of a raw String
+        openGuiKey = KeyMappingHelper.registerKeyMapping(
+            KeyMapping("key.blockbard.open_gui", GLFW.GLFW_KEY_B, KeyMapping.Category.MISC)
         )
-        toggleHudKey = KeyBindingHelper.registerKeyBinding(
-            KeyMapping("key.blockbard.toggle_hud", GLFW.GLFW_KEY_H, "category.blockbard")
+        toggleHudKey = KeyMappingHelper.registerKeyMapping(
+            KeyMapping("key.blockbard.toggle_hud", GLFW.GLFW_KEY_H, KeyMapping.Category.MISC)
         )
 
         // Register live-play keys 1–9
@@ -51,9 +53,10 @@ object BlockBardClient : ClientModInitializer {
         PlaybackHud.register()
 
         // Main tick event
+        // Screen access: mc.gui.screen() / mc.gui.setScreen(...)
         ClientTickEvents.END_CLIENT_TICK.register { mc ->
             while (openGuiKey.consumeClick()) {
-                if (mc.screen == null) mc.setScreen(MainScreen())
+                if (mc.gui.screen() == null) mc.gui.setScreen(MainScreen())
             }
             while (toggleHudKey.consumeClick()) {
                 PlaybackHud.isVisible = !PlaybackHud.isVisible
