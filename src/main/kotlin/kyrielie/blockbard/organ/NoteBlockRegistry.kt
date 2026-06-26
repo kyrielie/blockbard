@@ -3,17 +3,31 @@ package kyrielie.blockbard.organ
 import net.minecraft.core.BlockPos
 import net.minecraft.world.level.block.state.properties.NoteBlockInstrument
 import kyrielie.blockbard.util.midiBase
+import org.slf4j.LoggerFactory
+
+/** Represents a detected instrument overflow: more than 24 noteblocks share one instrument. */
+data class InstrumentOverflow(
+    val instrument: NoteBlockInstrument,
+    val count: Int,
+    val maxUsable: Int = 25  // noteIndex 0–24
+) {
+    val excess: Int get() = count - maxUsable
+    override fun toString() = "${instrument.name}: $count blocks (max $maxUsable, $excess excess)"
+}
 
 /**
  * Central in-memory registry mapping BlockPos → NoteBlockEntry.
  * Updated by OrganScanner on each scan; queried by the mapper and scheduler.
  */
 object NoteBlockRegistry {
+
+    private val logger = LoggerFactory.getLogger("BlockBard/NoteBlockRegistry")
     private val entries: MutableMap<BlockPos, NoteBlockEntry> = LinkedHashMap()
 
     fun update(newEntries: List<NoteBlockEntry>) {
         entries.clear()
         newEntries.forEach { entries[it.pos] = it }
+        checkInstrumentOverflow()
     }
 
     fun clear() = entries.clear()
@@ -40,6 +54,16 @@ object NoteBlockRegistry {
     fun countPerInstrument(): Map<NoteBlockInstrument, Int> =
         allPlayable().groupBy { it.instrument }.mapValues { it.value.size }
 
+    /**
+     * Returns any instruments that have more than 25 noteblocks (indices 0–24).
+     * More than 25 blocks per instrument means some will be duplicates and can never
+     * all be assigned unique notes. This is a configuration error in the noteblock organ.
+     */
+    fun detectInstrumentOverflows(): List<InstrumentOverflow> =
+        countPerInstrument()
+            .filter { (_, count) -> count > 25 }
+            .map { (inst, count) -> InstrumentOverflow(inst, count) }
+
     /** Update a specific entry's noteIndex after tuning. */
     fun updateTunedNote(pos: BlockPos, newNoteIndex: Int) {
         val existing = entries[pos] ?: return
@@ -50,4 +74,12 @@ object NoteBlockRegistry {
     }
 
     fun size(): Int = entries.size
+
+    private fun checkInstrumentOverflow() {
+        val overflows = detectInstrumentOverflows()
+        if (overflows.isEmpty()) return
+        overflows.forEach { o ->
+            logger.warn("NoteBlockRegistry: INSTRUMENT OVERFLOW — ${o.instrument.name} has ${o.count} blocks but max unique notes is ${o.maxUsable} (${o.excess} excess blocks will be unreachable)")
+        }
+    }
 }
