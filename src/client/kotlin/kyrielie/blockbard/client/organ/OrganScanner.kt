@@ -1,3 +1,4 @@
+
 package kyrielie.blockbard.client.organ
 
 import kyrielie.blockbard.organ.MOB_HEAD_BLOCKS
@@ -79,6 +80,16 @@ object OrganScanner {
 
         NoteBlockRegistry.update(found)
 
+        // Check for instrument overflow
+        val overflows = NoteBlockRegistry.detectInstrumentOverflows()
+        if (overflows.isNotEmpty()) {
+            overflows.forEach { o ->
+                val msg = "⚠ ${o.instrument.name} has ${o.count} blocks (max 25) — ${o.excess} excess will be untunable"
+                logger.warn("scan: instrument overflow — $msg")
+                player.sendSystemMessage(Component.literal("§b[BlockBard] §e$msg"))
+            }
+        }
+
         val playable = found.count { it.status == NoteBlockStatus.PLAYABLE }
         val silenced = found.count { it.status == NoteBlockStatus.SILENCED }
         val mobHeads = found.count { it.status == NoteBlockStatus.MOB_HEAD }
@@ -90,12 +101,32 @@ object OrganScanner {
         player.sendSystemMessage(Component.literal("§b[BlockBard] §f$summary"))
 
         if (playable > 0) {
-            val noteRange = found.filter { it.status == NoteBlockStatus.PLAYABLE }
-                .sortedBy { it.midiNote }
+            val playableEntries = found.filter { it.status == NoteBlockStatus.PLAYABLE }
+
+            val noteRange = playableEntries.sortedBy { it.midiNote }
             val low = midiNoteToName(noteRange.first().midiNote)
             val high = midiNoteToName(noteRange.last().midiNote)
             logger.info("scan: playable MIDI range $low–$high")
             player.sendSystemMessage(Component.literal("§b[BlockBard] §7Playable range: $low – $high"))
+
+            // Per-instrument breakdown: which notes (and how many blocks) are actually
+            // available for each instrument. This is what tuning/playback logic needs —
+            // the global range above can look fine while a specific instrument is missing
+            // notes or has duplicate noteIndex collisions.
+            logger.info("scan: per-instrument note coverage —")
+            playableEntries
+                .groupBy { it.instrument }
+                .toSortedMap(compareBy { it.name })
+                .forEach { (instrument, entries) ->
+                    val sortedByIndex = entries.sortedBy { it.noteIndex }
+                    val indices = sortedByIndex.map { it.noteIndex }
+                    val duplicateIndices = indices.groupBy { it }.filter { it.value.size > 1 }.keys.sorted()
+                    val instrLow = midiNoteToName(sortedByIndex.first().midiNote)
+                    val instrHigh = midiNoteToName(sortedByIndex.last().midiNote)
+
+                    val dupNote = if (duplicateIndices.isNotEmpty()) " ⚠ duplicate noteIndex(es): $duplicateIndices" else ""
+                    logger.info("  ${instrument.name}: ${entries.size} block(s), noteIndex [${indices.joinToString()}], range $instrLow–$instrHigh$dupNote")
+                }
         }
     }
 }

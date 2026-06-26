@@ -1,3 +1,4 @@
+
 package kyrielie.blockbard.client
 
 import kyrielie.blockbard.client.config.ConfigManager
@@ -60,6 +61,11 @@ object BlockBardClient : ClientModInitializer {
                 PlaybackHud.isVisible = !PlaybackHud.isVisible
                 logger.info("H pressed — HUD visible=${PlaybackHud.isVisible}")
             }
+            // Phase 2: aim at the next queued block BEFORE dispatching the interact.
+            // This puts the rotation into the movement packet that the engine sends this
+            // tick, so the server sees the updated facing before the use packet arrives
+            // next tick — matching Baritone's PRE player-update rotation pattern.
+            ArpeggioScheduler.peekNextPos()?.let { PlayerController.primeRotation(it) }
             ArpeggioScheduler.onTick()
         }
 
