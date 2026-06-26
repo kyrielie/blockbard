@@ -52,6 +52,15 @@ object BlockBardClient : ClientModInitializer {
         KeyboardInputHandler.register()
         PlaybackHud.register()
 
+        // Phase 2: prime rotation in START_CLIENT_TICK — this fires before LocalPlayer.tick(),
+        // which calls sendPosition(). Setting yRot/xRot here means the rotation is already
+        // in the movement packet the engine sends this tick. The interact (useItemOn) fires
+        // in END_CLIENT_TICK below, so the server sees rotation-packet → use-packet in order.
+        // This matches how Baritone's MixinClientPlayerEntity.onPreUpdate hook works.
+        ClientTickEvents.START_CLIENT_TICK.register { _ ->
+            ArpeggioScheduler.peekNextPos()?.let { PlayerController.primeRotation(it) }
+        }
+
         ClientTickEvents.END_CLIENT_TICK.register { mc ->
             while (openGuiKey.consumeClick()) {
                 logger.info("B pressed — opening MainScreen")
@@ -61,11 +70,6 @@ object BlockBardClient : ClientModInitializer {
                 PlaybackHud.isVisible = !PlaybackHud.isVisible
                 logger.info("H pressed — HUD visible=${PlaybackHud.isVisible}")
             }
-            // Phase 2: aim at the next queued block BEFORE dispatching the interact.
-            // This puts the rotation into the movement packet that the engine sends this
-            // tick, so the server sees the updated facing before the use packet arrives
-            // next tick — matching Baritone's PRE player-update rotation pattern.
-            ArpeggioScheduler.peekNextPos()?.let { PlayerController.primeRotation(it) }
             ArpeggioScheduler.onTick()
         }
 
