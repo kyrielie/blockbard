@@ -1,4 +1,3 @@
-
 package kyrielie.blockbard.client.player
 
 import kyrielie.blockbard.organ.NoteBlockEntry
@@ -9,15 +8,33 @@ import kyrielie.blockbard.util.vecToYawPitch
 import net.minecraft.client.Minecraft
 import net.minecraft.core.BlockPos
 import net.minecraft.core.Direction
+import net.minecraft.util.Mth
 import net.minecraft.world.InteractionHand
 import net.minecraft.world.level.GameType
 import net.minecraft.world.phys.BlockHitResult
 import net.minecraft.world.phys.HitResult
 import net.minecraft.world.phys.Vec3
 import org.slf4j.LoggerFactory
+import kotlin.math.abs
 
 /** Survival reach distance from eye position (blocks). */
 const val REACH_DISTANCE = 4.5
+
+/**
+ * Maximum yaw/pitch change allowed in a single tick while priming rotation toward a
+ * target. Many anticheat plugins flag any single-tick rotation delta beyond a
+ * threshold well below human-mouse-speed as a "rotation hack" signature and will
+ * silently drop the following use-item packet even though the rotation packet itself
+ * is accepted and rendered locally on the client. Snapping yaw/pitch instantly to the
+ * target every tick (the old behavior) produced exactly that signature whenever notes
+ * were on opposite sides of the player. Easing toward the target at a capped rate
+ * removes the signature without slowing down playback overall, since interactWith()
+ * is only invoked once the eased rotation has converged (see rotationConverged()).
+ */
+const val MAX_ROTATION_DEGREES_PER_TICK = 35f
+
+/** How close yaw/pitch must be to the target (degrees) before a note is considered aimed. */
+const val ROTATION_CONVERGENCE_THRESHOLD_DEGREES = 2f
 
 sealed class CenterResult {
     object NoPlayer : CenterResult()
@@ -123,17 +140,19 @@ object PlayerController {
 
     /**
      * Phase 2: holds the rotation computed for the next pending note.
-     * Triple is (targetPos, yaw, pitch). Set by primeRotation() one tick before
-     * interactWith() fires, so the rotation packet reaches the server before the
-     * use packet — matching Baritone's PRE/POST player-update hook pattern.
+     * Triple is (targetPos, yaw, pitch). Set/updated by primeRotation() every tick the
+     * note is pending, eased toward the target — see MAX_ROTATION_DEGREES_PER_TICK.
      * Consumed and cleared by interactWith(); null if no note is pending.
      */
     private var primedRotation: Triple<BlockPos, Float, Float>? = null
 
     /**
-     * Aims the player at [pos] and records the rotation for this tick's movement packet.
-     * Call this BEFORE ArpeggioScheduler.onTick() in END_CLIENT_TICK so the server
-     * receives the rotation in the movement packet one tick before the use packet.
+     * Eases yaw/pitch toward [pos] by at most MAX_ROTATION_DEGREES_PER_TICK per call,
+     * and records the in-progress rotation for this tick's movement packet. Call this
+     * every tick a note is pending (BEFORE ArpeggioScheduler.onTick() in END_CLIENT_TICK),
+     * not just once — convergence may take several ticks for large angle changes.
+     *
+     * Use rotationConverged(pos) to check whether it's safe to fire interactWith(pos) yet.
      */
     fun primeRotation(pos: BlockPos) {
         val mc = Minecraft.getInstance()
@@ -142,27 +161,64 @@ object PlayerController {
         val target = Vec3(pos.x + 0.5, pos.y + 1.0, pos.z + 0.5)
         val delta = target.subtract(eyePos)
         val reach = organMap?.getReachInfo(pos)
-        val (yaw, pitch) = reach?.let { Pair(it.yaw, it.pitch) } ?: vecToYawPitch(delta)
+        val (targetYaw, targetPitch) = reach?.let { Pair(it.yaw, it.pitch) } ?: vecToYawPitch(delta)
+
         val yRotBefore = player.yRot
         val xRotBefore = player.xRot
-        player.setYRot(yaw)
-        player.setXRot(pitch)
+
+        val yawStep = clampedStep(yRotBefore, targetYaw)
+        val pitchStep = clampedStep(xRotBefore, targetPitch)
+        val newYaw = Mth.wrapDegrees(yRotBefore + yawStep)
+        val newPitch = (xRotBefore + pitchStep).coerceIn(-90f, 90f)
+
+        player.setYRot(newYaw)
+        player.setXRot(newPitch)
         val yRotAfter = player.yRot
         val xRotAfter = player.xRot
-        primedRotation = Triple(pos, yaw, pitch)
-        // Rotation readback: if after != what we set, something is overriding us this tick.
-        if (yRotAfter != yaw || xRotAfter != pitch) {
+        primedRotation = Triple(pos, targetYaw, targetPitch)
+
+        if (yRotAfter != newYaw || xRotAfter != newPitch) {
             logger.warn(
-                "primeRotation $pos: rotation did not take! wanted yaw=${"%.2f".format(yaw)} pitch=${"%.2f".format(pitch)}" +
+                "primeRotation $pos: rotation did not take! wanted yaw=${"%.2f".format(newYaw)} pitch=${"%.2f".format(newPitch)}" +
                     " got yaw=${"%.2f".format(yRotAfter)} pitch=${"%.2f".format(xRotAfter)}" +
                     " (before: yaw=${"%.2f".format(yRotBefore)} pitch=${"%.2f".format(xRotBefore)})"
             )
         } else {
             logger.debug(
                 "primeRotation $pos: yaw ${"%.2f".format(yRotBefore)}->${"%.2f".format(yRotAfter)}" +
-                    " pitch ${"%.2f".format(xRotBefore)}->${"%.2f".format(xRotAfter)}"
+                    " (target ${"%.2f".format(targetYaw)}) pitch ${"%.2f".format(xRotBefore)}->${"%.2f".format(xRotAfter)}" +
+                    " (target ${"%.2f".format(targetPitch)})"
             )
         }
+    }
+
+    /** Signed shortest-path step from [from] toward [to], capped at MAX_ROTATION_DEGREES_PER_TICK. */
+    private fun clampedStep(from: Float, to: Float): Float {
+        val diff = Mth.wrapDegrees(to - from)
+        val capped = diff.coerceIn(-MAX_ROTATION_DEGREES_PER_TICK, MAX_ROTATION_DEGREES_PER_TICK)
+        return capped
+    }
+
+    /**
+     * Returns true once the player's current rotation is within
+     * ROTATION_CONVERGENCE_THRESHOLD_DEGREES of [pos]'s target rotation. Callers
+     * (ArpeggioScheduler) should wait for this before invoking interactWith(pos) —
+     * firing the use packet while still mid-turn reproduces the same "instant rotation
+     * + click" signature this easing was added to avoid.
+     */
+    fun rotationConverged(pos: BlockPos): Boolean {
+        val mc = Minecraft.getInstance()
+        val player = mc.player ?: return false
+        val primed = primedRotation?.takeIf { it.first == pos } ?: run {
+            // No primed rotation recorded for this pos yet (e.g. first tick it became
+            // the head of the queue, before primeRotation has run for it this tick).
+            return false
+        }
+        val (_, targetYaw, targetPitch) = primed
+        val yawDiff = abs(Mth.wrapDegrees(targetYaw - player.yRot))
+        val pitchDiff = abs(targetPitch - player.xRot)
+        return yawDiff <= ROTATION_CONVERGENCE_THRESHOLD_DEGREES &&
+            pitchDiff <= ROTATION_CONVERGENCE_THRESHOLD_DEGREES
     }
 
     /**

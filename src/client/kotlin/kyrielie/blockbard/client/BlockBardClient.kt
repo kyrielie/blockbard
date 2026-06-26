@@ -1,4 +1,3 @@
-
 package kyrielie.blockbard.client
 
 import kyrielie.blockbard.client.config.ConfigManager
@@ -40,6 +39,9 @@ object BlockBardClient : ClientModInitializer {
             logger.debug("interactDelegate: → $pos")
             PlayerController.interactWith(pos)
         }
+        ArpeggioScheduler.rotationConvergedDelegate = { pos ->
+            PlayerController.rotationConverged(pos)
+        }
 
         openGuiKey = KeyMappingHelper.registerKeyMapping(
             KeyMapping("key.blockbard.open_gui", GLFW.GLFW_KEY_B, KeyMapping.Category.MISC)
@@ -52,11 +54,14 @@ object BlockBardClient : ClientModInitializer {
         KeyboardInputHandler.register()
         PlaybackHud.register()
 
-        // Phase 2: prime rotation in START_CLIENT_TICK — this fires before LocalPlayer.tick(),
-        // which calls sendPosition(). Setting yRot/xRot here means the rotation is already
-        // in the movement packet the engine sends this tick. The interact (useItemOn) fires
-        // in END_CLIENT_TICK below, so the server sees rotation-packet → use-packet in order.
-        // This matches how Baritone's MixinClientPlayerEntity.onPreUpdate hook works.
+        // Prime rotation in START_CLIENT_TICK — this fires before LocalPlayer.tick(),
+        // which calls sendPosition(), so each tick's eased rotation step is in that
+        // tick's movement packet before END_CLIENT_TICK runs. primeRotation() now eases
+        // toward the target at a capped degrees/tick rate (see PlayerController.
+        // MAX_ROTATION_DEGREES_PER_TICK) rather than snapping instantly — large turns
+        // take several ticks to converge. ArpeggioScheduler.onTick() (END_CLIENT_TICK,
+        // below) only fires the actual interact once PlayerController.rotationConverged()
+        // confirms the turn has finished, so the use packet never arrives mid-turn.
         ClientTickEvents.START_CLIENT_TICK.register { _ ->
             ArpeggioScheduler.peekNextPos()?.let { PlayerController.primeRotation(it) }
         }
