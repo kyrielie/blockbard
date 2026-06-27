@@ -40,11 +40,28 @@ object NoteBlockRegistry {
     fun allMobHeadEntries(): List<NoteBlockEntry> =
         entries.values.filter { it.status == NoteBlockStatus.MOB_HEAD }
 
-    /** Find the closest PLAYABLE noteblock with exactly the given MIDI note. */
+    /** Find the closest PLAYABLE noteblock with exactly the given MIDI note, any instrument. */
     fun findBestForMidi(midiNote: Int): NoteBlockEntry? =
         allPlayable()
             .filter { it.midiNote == midiNote }
             .minByOrNull { it.distanceFromPlayer }
+
+    /**
+     * Find the closest PLAYABLE noteblock with exactly the given MIDI note AND
+     * instrument, if [instrument] is non-null; falls back to any instrument
+     * (same as [findBestForMidi]) if [instrument] is null or no exact-instrument
+     * match exists. Used by playback paths that know which instrument a note was
+     * authored for (NBS instrument byte, MIDI channel program) — without this,
+     * a song's instrument choice is ignored entirely and any block at the right
+     * pitch is used regardless of its instrument timbre.
+     */
+    fun findBestFor(midiNote: Int, instrument: NoteBlockInstrument?): NoteBlockEntry? {
+        if (instrument == null) return findBestForMidi(midiNote)
+        val exact = allPlayable()
+            .filter { it.midiNote == midiNote && it.instrument == instrument }
+            .minByOrNull { it.distanceFromPlayer }
+        return exact ?: findBestForMidi(midiNote)
+    }
 
     /** All distinct MIDI notes that are currently playable in the organ. */
     fun allPlayableMidiNotes(): Set<Int> =

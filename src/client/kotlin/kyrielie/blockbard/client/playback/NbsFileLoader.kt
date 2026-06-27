@@ -5,8 +5,44 @@ import kyrielie.blockbard.organ.NoteRequest
 import kyrielie.blockbard.util.readLEInt
 import kyrielie.blockbard.util.readLEShort
 import kyrielie.blockbard.util.readNBSString
+import net.minecraft.world.level.block.state.properties.NoteBlockInstrument
 import java.io.DataInputStream
 import java.io.File
+
+/**
+ * NBS instrument byte (0-15) -> NoteBlockInstrument, per the vanilla instrument order
+ * defined by Open Note Block Studio. Indices 0-9 are the original instrument set;
+ * 10-15 were added as Minecraft introduced more note block instruments. Files may
+ * specify instrumentCount < 16 in the header (older Minecraft versions had fewer
+ * note block instruments) but the byte values for any instrument present are stable
+ * across versions, so a single fixed table covers all of them.
+ *
+ * Instrument index >= 16 means a custom instrument (a player-imported sound, not a
+ * vanilla noteblock instrument) — there's no NoteBlockInstrument to map it to, so
+ * nbsInstrumentToBlock returns null and the caller falls back to pitch-only matching.
+ */
+private val NBS_INSTRUMENTS = arrayOf(
+    NoteBlockInstrument.HARP,
+    NoteBlockInstrument.BASS,
+    NoteBlockInstrument.BASEDRUM,
+    NoteBlockInstrument.SNARE,
+    NoteBlockInstrument.HAT,
+    NoteBlockInstrument.GUITAR,
+    NoteBlockInstrument.FLUTE,
+    NoteBlockInstrument.BELL,
+    NoteBlockInstrument.CHIME,
+    NoteBlockInstrument.XYLOPHONE,
+    NoteBlockInstrument.IRON_XYLOPHONE,
+    NoteBlockInstrument.COW_BELL,
+    NoteBlockInstrument.DIDGERIDOO,
+    NoteBlockInstrument.BIT,
+    NoteBlockInstrument.BANJO,
+    NoteBlockInstrument.PLING
+)
+
+/** Converts an NBS instrument byte to a NoteBlockInstrument, or null if it's a custom instrument (index >= 16). */
+fun nbsInstrumentToBlock(nbsInstrument: Int): NoteBlockInstrument? =
+    NBS_INSTRUMENTS.getOrNull(nbsInstrument)
 
 data class NbsNote(
     val tick: Int,
@@ -137,7 +173,13 @@ object NbsPlayer {
                     if (!isPlaying) return@Thread
                     notesByTick[tick]?.forEach { note ->
                         val midiNote = note.key + 21  // NBS key → MIDI note
-                        ArpeggioScheduler.enqueue(NoteRequest(midiNote))
+                        // Resolve the NBS instrument byte so playback targets a block
+                        // tuned for the right instrument, not just any block at this
+                        // pitch — see nbsInstrumentToBlock kdoc. null for custom
+                        // (non-vanilla) instruments, which falls back to pitch-only
+                        // matching in ArpeggioScheduler.resolvePos.
+                        val instrument = nbsInstrumentToBlock(note.instrument)
+                        ArpeggioScheduler.enqueue(NoteRequest(midiNote, instrument = instrument))
                     }
                 }
                 isPlaying = false

@@ -1113,15 +1113,17 @@ object OrganReadinessChecker {
 <file path="src/client/kotlin/kyrielie/blockbard/client/playback/MidiFilePlayer.kt">
 package kyrielie.blockbard.client.playback
 
+import kyrielie.blockbard.midi.MidiChannelResolver
 import kyrielie.blockbard.organ.ArpeggioScheduler
+import kyrielie.blockbard.organ.NotePitch
 import kyrielie.blockbard.organ.NoteRequest
+import net.minecraft.world.level.block.state.properties.NoteBlockInstrument
 import javax.sound.midi.MetaMessage
 import javax.sound.midi.MidiSystem
 import javax.sound.midi.Sequence
-import javax.sound.midi.ShortMessage
 import java.io.File
 
-data class TimedNoteEvent(val tick: Long, val midiNote: Int)
+data class TimedNoteEvent(val tick: Long, val midiNote: Int, val instrument: NoteBlockInstrument)
 
 data class LoadedMidi(
     val file: File,
@@ -1130,8 +1132,14 @@ data class LoadedMidi(
     val baseTempoUsPerBeat: Int,
     val events: List<TimedNoteEvent>,
     val distinctNotes: Set<Int>,
-    /** Maps note usage counts for MidiToOrganMapper priority. */
-    val noteUsageCounts: Map<Int, Int>
+    /**
+     * Usage counts per (midiNote, instrument) pair, for MidiToOrganMapper priority —
+     * the most-used notes get first pick of available blocks. Instrument is resolved
+     * per MIDI channel via MidiChannelResolver (GM program → NoteBlockInstrument),
+     * so two channels playing the same pitch on different instruments are counted
+     * and later assigned separately rather than collapsed into one pitch bucket.
+     */
+    val noteUsageCounts: Map<NotePitch, Int>
 )
 
 /** Duration of the sequence in milliseconds at 1x tempo. */
@@ -1172,32 +1180,38 @@ object MidiFilePlayer {
 
     fun load(file: File): LoadedMidi {
         val sequence = MidiSystem.getSequence(file)
-        val events = mutableListOf<TimedNoteEvent>()
         var tempoUs = 500000  // default 120 BPM
 
+        // Tempo (MetaMessage 0x51) is not a channel-voice message, so MidiChannelResolver
+        // (which only collects ShortMessages) doesn't see it — read it directly here.
         sequence.tracks.forEach { track ->
             for (i in 0 until track.size()) {
-                val event = track.get(i)
-                val msg = event.message
-                when {
-                    msg is MetaMessage && msg.type == 0x51 -> {
-                        // Tempo change: 3 bytes big-endian microseconds per beat
-                        val d = msg.data
-                        if (d.size >= 3) {
-                            tempoUs = ((d[0].toInt() and 0xFF) shl 16) or
-                                    ((d[1].toInt() and 0xFF) shl 8) or
-                                    (d[2].toInt() and 0xFF)
-                        }
-                    }
-                    msg is ShortMessage && msg.command == ShortMessage.NOTE_ON && msg.data2 > 0 -> {
-                        events.add(TimedNoteEvent(event.tick, msg.data1))
+                val msg = track.get(i).message
+                if (msg is MetaMessage && msg.type == 0x51) {
+                    val d = msg.data
+                    if (d.size >= 3) {
+                        tempoUs = ((d[0].toInt() and 0xFF) shl 16) or
+                                ((d[1].toInt() and 0xFF) shl 8) or
+                                (d[2].toInt() and 0xFF)
                     }
                 }
             }
         }
 
-        val sortedEvents = events.sortedBy { it.tick }
-        val usageCounts = sortedEvents.groupBy { it.midiNote }.mapValues { it.value.size }
+        // MidiChannelResolver resolves each NOTE_ON to the instrument the minecraft3.sf2
+        // soundfont would use for that channel's GM program (or percussion for channel 10),
+        // tracking PROGRAM_CHANGE per channel as it scans. See its kdoc for details.
+        // Note: this re-parses the file independently via its own MidiSystem.getSequence
+        // call rather than reusing `sequence` above — a small duplicate parse, traded for
+        // keeping MidiChannelResolver's resolve(File) signature self-contained and usable
+        // by other callers (e.g. OrganReadinessChecker) without needing a Sequence handle.
+        val resolvedEvents = MidiChannelResolver.resolve(file)
+        val sortedEvents = resolvedEvents
+            .map { TimedNoteEvent(it.tick, it.midiNote, it.instrument) }
+            .sortedBy { it.tick }
+        val usageCounts = sortedEvents
+            .groupBy { NotePitch(it.midiNote, it.instrument) }
+            .mapValues { it.value.size }
 
         val midi = LoadedMidi(
             file = file,
@@ -1249,7 +1263,12 @@ object MidiFilePlayer {
 
                     currentTick = event.tick
                     onTickUpdate?.invoke(currentTick, midi.events.lastOrNull()?.tick ?: 0L)
-                    ArpeggioScheduler.enqueue(NoteRequest(event.midiNote))
+                    // instrument is passed through so ArpeggioScheduler.resolvePos can
+                    // look up the (midiNote, instrument) assignment built at tuning time
+                    // (see MainScreen.startTuning) instead of falling back to a
+                    // pitch-only live lookup that ignores which instrument this note
+                    // was authored for.
+                    ArpeggioScheduler.enqueue(NoteRequest(event.midiNote, instrument = event.instrument))
                 }
                 isPlaying = false
                 onFinished?.invoke()
@@ -1304,8 +1323,44 @@ import kyrielie.blockbard.organ.NoteRequest
 import kyrielie.blockbard.util.readLEInt
 import kyrielie.blockbard.util.readLEShort
 import kyrielie.blockbard.util.readNBSString
+import net.minecraft.world.level.block.state.properties.NoteBlockInstrument
 import java.io.DataInputStream
 import java.io.File
+
+/**
+ * NBS instrument byte (0-15) -> NoteBlockInstrument, per the vanilla instrument order
+ * defined by Open Note Block Studio. Indices 0-9 are the original instrument set;
+ * 10-15 were added as Minecraft introduced more note block instruments. Files may
+ * specify instrumentCount < 16 in the header (older Minecraft versions had fewer
+ * note block instruments) but the byte values for any instrument present are stable
+ * across versions, so a single fixed table covers all of them.
+ *
+ * Instrument index >= 16 means a custom instrument (a player-imported sound, not a
+ * vanilla noteblock instrument) — there's no NoteBlockInstrument to map it to, so
+ * nbsInstrumentToBlock returns null and the caller falls back to pitch-only matching.
+ */
+private val NBS_INSTRUMENTS = arrayOf(
+    NoteBlockInstrument.HARP,
+    NoteBlockInstrument.BASS,
+    NoteBlockInstrument.BASEDRUM,
+    NoteBlockInstrument.SNARE,
+    NoteBlockInstrument.HAT,
+    NoteBlockInstrument.GUITAR,
+    NoteBlockInstrument.FLUTE,
+    NoteBlockInstrument.BELL,
+    NoteBlockInstrument.CHIME,
+    NoteBlockInstrument.XYLOPHONE,
+    NoteBlockInstrument.IRON_XYLOPHONE,
+    NoteBlockInstrument.COW_BELL,
+    NoteBlockInstrument.DIDGERIDOO,
+    NoteBlockInstrument.BIT,
+    NoteBlockInstrument.BANJO,
+    NoteBlockInstrument.PLING
+)
+
+/** Converts an NBS instrument byte to a NoteBlockInstrument, or null if it's a custom instrument (index >= 16). */
+fun nbsInstrumentToBlock(nbsInstrument: Int): NoteBlockInstrument? =
+    NBS_INSTRUMENTS.getOrNull(nbsInstrument)
 
 data class NbsNote(
     val tick: Int,
@@ -1436,7 +1491,13 @@ object NbsPlayer {
                     if (!isPlaying) return@Thread
                     notesByTick[tick]?.forEach { note ->
                         val midiNote = note.key + 21  // NBS key → MIDI note
-                        ArpeggioScheduler.enqueue(NoteRequest(midiNote))
+                        // Resolve the NBS instrument byte so playback targets a block
+                        // tuned for the right instrument, not just any block at this
+                        // pitch — see nbsInstrumentToBlock kdoc. null for custom
+                        // (non-vanilla) instruments, which falls back to pitch-only
+                        // matching in ArpeggioScheduler.resolvePos.
+                        val instrument = nbsInstrumentToBlock(note.instrument)
+                        ArpeggioScheduler.enqueue(NoteRequest(midiNote, instrument = instrument))
                     }
                 }
                 isPlaying = false
@@ -3931,7 +3992,9 @@ rootProject.name = 'blockbard'
 <file path="src/main/kotlin/kyrielie/blockbard/organ/InstrumentShifter.kt">
 package kyrielie.blockbard.organ
 
+import kyrielie.blockbard.util.clicksNeeded
 import kyrielie.blockbard.util.coversNatively
+import kyrielie.blockbard.util.midiBase
 
 enum class ShiftMode {
     EXACT_ONLY,       // Skip the note if no exact match
@@ -3977,11 +4040,25 @@ object InstrumentShifter {
      * Instrument shift: find any block whose instrument natively covers this MIDI note,
      * regardless of what the block's current tuning is (it will be re-tuned).
      * This is distinct from findExact — it checks the instrument's *range*, not the current note.
+     *
+     * Among candidates, prefers the one needing the fewest tuning clicks to reach the
+     * target note (DiscJockey's SongPlayer.onStartTick does the same — see
+     * bestBlockTuningSteps), tie-broken by distance. Picking by distance alone (the old
+     * behavior) ignores how close each candidate's current note already is to the
+     * target, so re-running assignment (e.g. loading a different song, or after a
+     * rescan reorders candidates by distance) can reassign an already-correctly-tuned
+     * block to a different note than before, forcing real, avoidable re-tuning clicks
+     * even though nothing about the physical noteblocks changed.
      */
     private fun findInstrumentShift(midiNote: Int, candidates: List<NoteBlockEntry>): ShiftResult? =
         candidates
             .filter { it.instrument.coversNatively(midiNote) }
-            .minByOrNull { it.distanceFromPlayer }
+            .minWithOrNull(
+                compareBy(
+                    { clicksNeeded(it.noteIndex, midiNote - it.instrument.midiBase) },
+                    { it.distanceFromPlayer }
+                )
+            )
             ?.let { ShiftResult(it, 0) }
 
     /** Octave shift: try ±12 then ±24 semitones until a match is found. */
@@ -4046,11 +4123,28 @@ object NoteBlockRegistry {
     fun allMobHeadEntries(): List<NoteBlockEntry> =
         entries.values.filter { it.status == NoteBlockStatus.MOB_HEAD }
 
-    /** Find the closest PLAYABLE noteblock with exactly the given MIDI note. */
+    /** Find the closest PLAYABLE noteblock with exactly the given MIDI note, any instrument. */
     fun findBestForMidi(midiNote: Int): NoteBlockEntry? =
         allPlayable()
             .filter { it.midiNote == midiNote }
             .minByOrNull { it.distanceFromPlayer }
+
+    /**
+     * Find the closest PLAYABLE noteblock with exactly the given MIDI note AND
+     * instrument, if [instrument] is non-null; falls back to any instrument
+     * (same as [findBestForMidi]) if [instrument] is null or no exact-instrument
+     * match exists. Used by playback paths that know which instrument a note was
+     * authored for (NBS instrument byte, MIDI channel program) — without this,
+     * a song's instrument choice is ignored entirely and any block at the right
+     * pitch is used regardless of its instrument timbre.
+     */
+    fun findBestFor(midiNote: Int, instrument: NoteBlockInstrument?): NoteBlockEntry? {
+        if (instrument == null) return findBestForMidi(midiNote)
+        val exact = allPlayable()
+            .filter { it.midiNote == midiNote && it.instrument == instrument }
+            .minByOrNull { it.distanceFromPlayer }
+        return exact ?: findBestForMidi(midiNote)
+    }
 
     /** All distinct MIDI notes that are currently playable in the organ. */
     fun allPlayableMidiNotes(): Set<Int> =
@@ -4569,165 +4663,122 @@ object OrganScanner {
 }
 </file>
 
-<file path="src/main/kotlin/kyrielie/blockbard/organ/ArpeggioScheduler.kt">
-package kyrielie.blockbard.organ
-
-import net.minecraft.core.BlockPos
-import org.slf4j.LoggerFactory
-
-data class NoteRequest(
-    val midiNote: Int,
-    val enqueuedAtMs: Long = System.currentTimeMillis(),
-    /**
-     * Pre-resolved block position. When set, bypasses the assignment map entirely.
-     * Used by the scale test and any direct-play path that already knows which block to hit.
-     */
-    val resolvedPos: BlockPos? = null
-)
-
-/**
- * Tick-based queue that serialises simultaneous note requests into sequential
- * block interactions. One note is dispatched per tick via [onTick].
- *
- * [interactDelegate] is wired by BlockBardClient to PlayerController.interactWith().
- */
-object ArpeggioScheduler {
-
-    private val logger = LoggerFactory.getLogger("BlockBard/ArpeggioScheduler")
-
-    /** Populated by MidiToOrganMapper: midiNote → assigned BlockPos. */
-    var assignment: Map<Int, BlockPos> = emptyMap()
-
-    /** Requests older than this are dropped to prevent note build-up after lag. */
-    var staleTimeoutMs: Long = 200L
-
-    /** Wired to PlayerController.interactWith() by the client entrypoint. */
-    var interactDelegate: ((BlockPos) -> Boolean)? = null
-
-    private val queue: ArrayDeque<NoteRequest> = ArrayDeque()
-
-    /** Called every client tick. Dispatches one queued note. */
-    fun onTick() {
-        // Iterative stale-skip — never recursive
-        while (queue.isNotEmpty()) {
-            val request = queue.first()
-            val age = System.currentTimeMillis() - request.enqueuedAtMs
-
-            if (age > staleTimeoutMs) {
-                queue.removeFirst()
-                logger.warn("dropping stale MIDI ${request.midiNote} (age ${age}ms > ${staleTimeoutMs}ms) — increase staleTimeoutMs if this fires during normal playback")
-                continue
-            }
-
-            // Fresh note — find the block
-            queue.removeFirst()
-            val pos = request.resolvedPos
-                ?: assignment[request.midiNote]
-                ?: NoteBlockRegistry.findBestForMidi(request.midiNote)?.pos
-
-            if (pos == null) {
-                logger.warn("no block found for MIDI ${request.midiNote} — skipping (assignment has ${assignment.size} entries, resolvedPos=${request.resolvedPos})")
-                return
-            }
-
-            val dispatched = interactDelegate?.invoke(pos) ?: false
-            logger.info("dispatch MIDI ${request.midiNote} -> $pos result=$dispatched age=${age}ms queueRemaining=${queue.size}")
-            if (!dispatched) {
-                logger.warn("interactDelegate returned false for $pos (MIDI ${request.midiNote}) — check PlayerController logs above")
-            }
-            return
-        }
-    }
-
-    /**
-     * Returns the BlockPos the next pending (non-stale) note will be dispatched to,
-     * without consuming it. Used by BlockBardClient to prime the player rotation one
-     * tick before the interact fires (Phase 2).
-     */
-    fun peekNextPos(): BlockPos? {
-        val request = queue.firstOrNull() ?: return null
-        val age = System.currentTimeMillis() - request.enqueuedAtMs
-        if (age > staleTimeoutMs) return null  // will be dropped on next onTick
-        return request.resolvedPos
-            ?: assignment[request.midiNote]
-            ?: NoteBlockRegistry.findBestForMidi(request.midiNote)?.pos
-    }
-
-    fun enqueue(request: NoteRequest) {
-        logger.info("enqueue MIDI ${request.midiNote} resolvedPos=${request.resolvedPos} queueSize=${queue.size + 1}")
-        queue.addLast(request)
-    }
-
-    fun clear() {
-        logger.info("queue cleared (had ${queue.size} items)")
-        queue.clear()
-    }
-
-    fun isEmpty(): Boolean = queue.isEmpty()
-    val queueSize: Int get() = queue.size
-}
-</file>
-
 <file path="src/main/kotlin/kyrielie/blockbard/organ/MidiToOrganMapper.kt">
 package kyrielie.blockbard.organ
 
+import kyrielie.blockbard.util.clicksNeeded
 import kyrielie.blockbard.util.coversNatively
 import kyrielie.blockbard.util.midiBase
 import kyrielie.blockbard.util.midiNoteToName
 import net.minecraft.core.BlockPos
+import net.minecraft.world.level.block.state.properties.NoteBlockInstrument
 import org.slf4j.LoggerFactory
 
+/**
+ * A distinct note to be assigned a noteblock: its pitch plus the instrument it was
+ * authored for, if known. [instrument] is null for sources with no instrument
+ * information (e.g. a bare MIDI note list with no channel/program resolved) — such
+ * notes are assigned a block at the right pitch regardless of instrument, same as
+ * the old pitch-only behavior.
+ */
+data class NotePitch(val midiNote: Int, val instrument: NoteBlockInstrument? = null)
+
+/** Human-readable display name, e.g. "C4" or "C4 (BELL)" if an instrument is specified. */
+fun NotePitch.displayName(): String =
+    midiNoteToName(midiNote) + (instrument?.let { " (${it.name})" } ?: "")
+
 data class OrganAssignment(
-    /** Maps each distinct MIDI note used in the song to a noteblock position. */
-    val assignment: Map<Int, BlockPos>,
-    /** MIDI notes that could not be assigned to any block. */
-    val unplayable: List<Int>,
-    /** Shifts applied: midiNote → semitone shift used. */
-    val shifts: Map<Int, Int>
+    /** Maps each distinct (midiNote, instrument) pair used in the song to a noteblock position. */
+    val assignment: Map<NotePitch, BlockPos>,
+    /** Notes that could not be assigned to any block. */
+    val unplayable: List<NotePitch>,
+    /** Shifts applied: note → semitone shift used. */
+    val shifts: Map<NotePitch, Int>
 )
 
 object MidiToOrganMapper {
 
     private val logger = LoggerFactory.getLogger("BlockBard/MidiToOrganMapper")
 
+    /**
+     * @param noteUsageCounts how many times each (midiNote, instrument) pair occurs in
+     * the song — used only to prioritize assignment order (most-used notes get first
+     * pick of blocks). Pass instrument=null for sources without instrument information.
+     */
     fun buildAssignment(
-        midiNoteUsageCounts: Map<Int, Int>,
+        noteUsageCounts: Map<NotePitch, Int>,
         reachableBlocks: List<NoteBlockEntry>
     ): OrganAssignment {
-        val assignment = mutableMapOf<Int, BlockPos>()
-        val unplayable = mutableListOf<Int>()
-        val shifts = mutableMapOf<Int, Int>()
+        val assignment = mutableMapOf<NotePitch, BlockPos>()
+        val unplayable = mutableListOf<NotePitch>()
+        val shifts = mutableMapOf<NotePitch, Int>()
         val usedPositions = mutableSetOf<BlockPos>()
 
-        val sortedNotes = midiNoteUsageCounts.entries.sortedByDescending { it.value }.map { it.key }
+        val sortedNotes = noteUsageCounts.entries.sortedByDescending { it.value }.map { it.key }
         logger.info("buildAssignment: ${sortedNotes.size} distinct notes, ${reachableBlocks.size} reachable blocks")
 
-        for (midiNote in sortedNotes) {
+        for (note in sortedNotes) {
+            val midiNote = note.midiNote
             val available = reachableBlocks.filter { it.pos !in usedPositions }
+            // If the note specifies an instrument, only consider blocks of that
+            // instrument as "native" candidates — otherwise the instrument the song
+            // authored this note for would be ignored. If no instrument is specified
+            // (note.instrument == null), any instrument covering the pitch qualifies,
+            // same as the old pitch-only behavior.
+            val instrumentFiltered = if (note.instrument != null) {
+                available.filter { it.instrument == note.instrument }
+            } else {
+                available
+            }
 
-            val nativeCandidate = available
+            // Among blocks whose instrument natively covers this note, prefer the one
+            // needing the fewest tuning clicks (DiscJockey's bestBlockTuningSteps
+            // pattern), tie-broken by distance. Picking by distance alone (the old
+            // behavior) ignores how close each candidate's current note already is to
+            // the target, so re-running buildAssignment (new song loaded, or a rescan
+            // reorders candidates) can reassign an already-correctly-tuned block to a
+            // different note than before, forcing avoidable re-tuning clicks even though
+            // no physical noteblock changed.
+            val nativeCandidate = instrumentFiltered
                 .filter { it.instrument.coversNatively(midiNote) }
-                .minByOrNull { it.distanceFromPlayer }
+                .minWithOrNull(
+                    compareBy(
+                        { clicksNeeded(it.noteIndex, midiNote - it.instrument.midiBase) },
+                        { it.distanceFromPlayer }
+                    )
+                )
 
             if (nativeCandidate != null) {
-                assignment[midiNote] = nativeCandidate.pos
+                assignment[note] = nativeCandidate.pos
                 usedPositions.add(nativeCandidate.pos)
-                shifts[midiNote] = 0
-                logger.debug("  ${midiNoteToName(midiNote)} → ${nativeCandidate.pos} (${nativeCandidate.instrument.name}, native)")
+                shifts[note] = 0
+                logger.debug("  ${note.displayName()} → ${nativeCandidate.pos} (${nativeCandidate.instrument.name}, native)")
                 continue
             }
 
-            val shiftResult = InstrumentShifter.findBest(midiNote, available)
+            // Octave-shift fallback. If the note specified an instrument and no native
+            // block of that instrument was found, shifting only makes sense within that
+            // same instrument — switching instruments here would defeat the point of
+            // having specified one. If no instrument was specified, search all instruments.
+            //
+            // Note: when note.instrument is non-null, instrumentFiltered already only
+            // contains that instrument's blocks, so InstrumentShifter's internal
+            // INSTRUMENT_SHIFT step is a redundant no-op here (it would just re-run the
+            // same native-coverage check we already did above on the same restricted
+            // set) — only its OCTAVE_SHIFT step can find something new in that case.
+            // This still goes through findBest() rather than calling findOctaveShift
+            // directly so the user's configured ShiftMode (e.g. EXACT_ONLY) is respected.
+            val shiftResult = InstrumentShifter.findBest(midiNote, instrumentFiltered)
             if (shiftResult != null) {
-                assignment[midiNote] = shiftResult.entry.pos
+                assignment[note] = shiftResult.entry.pos
                 usedPositions.add(shiftResult.entry.pos)
-                shifts[midiNote] = shiftResult.semitoneShift
-                logger.debug("  ${midiNoteToName(midiNote)} → ${shiftResult.entry.pos} (${shiftResult.entry.instrument.name}, shift=${shiftResult.semitoneShift})")
+                shifts[note] = shiftResult.semitoneShift
+                logger.debug("  ${note.displayName()} → ${shiftResult.entry.pos} (${shiftResult.entry.instrument.name}, shift=${shiftResult.semitoneShift})")
                 continue
             }
 
-            unplayable.add(midiNote)
-            logger.warn("  ${midiNoteToName(midiNote)} UNPLAYABLE — no suitable block found")
+            unplayable.add(note)
+            logger.warn("  ${note.displayName()} UNPLAYABLE — no suitable block found")
         }
 
         logger.info("buildAssignment: ${assignment.size} assigned, ${unplayable.size} unplayable")
@@ -4746,13 +4797,13 @@ object MidiToOrganMapper {
         val blockByPos = reachableBlocks.associateBy { it.pos }
         val targets = mutableListOf<TuneTarget>()
 
-        for ((midiNote, pos) in assignment.assignment) {
+        for ((note, pos) in assignment.assignment) {
             val entry = blockByPos[pos] ?: run {
-                logger.warn("computeTuneTargets: no entry for pos $pos (midiNote=${midiNoteToName(midiNote)}) — skipping")
+                logger.warn("computeTuneTargets: no entry for pos $pos (note=${midiNoteToName(note.midiNote)}) — skipping")
                 continue
             }
-            val shift = assignment.shifts[midiNote] ?: 0
-            val effectiveMidi = midiNote + shift
+            val shift = assignment.shifts[note] ?: 0
+            val effectiveMidi = note.midiNote + shift
             val rawIndex = effectiveMidi - entry.instrument.midiBase
 
             // Validate range — do NOT silently clamp
@@ -5008,8 +5059,10 @@ package kyrielie.blockbard.client.gui
 
 import kyrielie.blockbard.client.config.ConfigManager
 import kyrielie.blockbard.client.playback.MidiFilePlayer
+import kyrielie.blockbard.client.playback.NbsFile
 import kyrielie.blockbard.client.playback.NbsFileLoader
 import kyrielie.blockbard.client.playback.NbsPlayer
+import kyrielie.blockbard.client.playback.nbsInstrumentToBlock
 import kyrielie.blockbard.organ.*
 import kyrielie.blockbard.client.organ.OrganScanner
 import kyrielie.blockbard.client.player.CenterResult
@@ -5050,6 +5103,12 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
     private var tuner: NoteBlockTuner? = null
     private var assignment: OrganAssignment? = null
     private var tuneStatusMsg: String = ""
+
+    // NBS playback state — NbsFileLoader.load() is a pure function with no caching
+    // of its own (unlike MidiFilePlayer.loadedMidi), so MainScreen caches the result
+    // here keyed by file, the same way it already does for MIDI. Without this,
+    // startTuning() would have no NBS data to build an assignment from at all.
+    private var loadedNbs: NbsFile? = null
 
     // General status
     private var organScanMessage: String = "Press Scan to detect noteblocks"
@@ -5118,21 +5177,22 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
 
         // ── Playback controls ──
         addRenderableWidget(Button.builder(Component.literal("▶ Play")) {
-            logger.info("Play clicked — isPaused=${MidiFilePlayer.isPaused}, file=${selectedFile?.name}")
-            if (MidiFilePlayer.isPaused) {
-                MidiFilePlayer.resume()
-                chat("Resumed")
-            } else {
-                startPlayback()
+            logger.info("Play clicked — midiPaused=${MidiFilePlayer.isPaused}, nbsPaused=${NbsPlayer.isPaused}, file=${selectedFile?.name}")
+            when {
+                MidiFilePlayer.isPaused -> { MidiFilePlayer.resume(); chat("Resumed") }
+                NbsPlayer.isPaused -> { NbsPlayer.resume(); chat("Resumed") }
+                else -> startPlayback()
             }
         }.pos(10, 222).size(55, 16).build())
 
         addRenderableWidget(Button.builder(Component.literal("⏸ Pause")) {
             logger.info("Pause clicked")
-            if (MidiFilePlayer.isPaused) {
-                MidiFilePlayer.resume(); chat("Resumed")
-            } else {
-                MidiFilePlayer.pause(); chat("Paused")
+            when {
+                MidiFilePlayer.isPaused -> { MidiFilePlayer.resume(); chat("Resumed") }
+                NbsPlayer.isPaused -> { NbsPlayer.resume(); chat("Resumed") }
+                MidiFilePlayer.isActive() -> { MidiFilePlayer.pause(); chat("Paused") }
+                NbsPlayer.isPlaying -> { NbsPlayer.pause(); chat("Paused") }
+                else -> chat("Nothing playing")
             }
         }.pos(70, 222).size(60, 16).build())
 
@@ -5237,26 +5297,46 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
 
         val targets: List<TuneTarget>
 
-        val midi = MidiFilePlayer.loadedMidi
-        if (midi != null) {
-            // MIDI loaded — map notes from the song to blocks
-            logger.info("startTuning: MIDI mode — ${reachable.size} reachable blocks, ${midi.distinctNotes.size} distinct notes")
-            val result = MidiToOrganMapper.buildAssignment(midi.noteUsageCounts, reachable)
+        // Shared by both MIDI and NBS branches: builds an assignment from a set of
+        // (midiNote, instrument) usage counts, wires it into ArpeggioScheduler so
+        // playback actually uses what was just tuned, and reports coverage.
+        fun assignAndReport(noteUsageCounts: Map<NotePitch, Int>): List<TuneTarget> {
+            val result = MidiToOrganMapper.buildAssignment(noteUsageCounts, reachable)
             assignment = result
+            ArpeggioScheduler.assignment = result.assignment
             if (result.unplayable.isNotEmpty()) {
-                val names = result.unplayable.map { midiNoteToName(it) }
+                val names = result.unplayable.map { it.displayName() }
                 chatWarn("Warning: ${names.size} notes unplayable: ${names.take(6).joinToString()}")
             }
             updateCoverageMessage(result)
-            targets = MidiToOrganMapper.computeTuneTargets(result, reachable)
+            return MidiToOrganMapper.computeTuneTargets(result, reachable)
+        }
+
+        val midi = MidiFilePlayer.loadedMidi
+        val nbs = loadedNbs?.takeIf { it.file == selectedFile }
+        if (midi != null) {
+            // MIDI loaded — map notes from the song to blocks
+            logger.info("startTuning: MIDI mode — ${reachable.size} reachable blocks, ${midi.distinctNotes.size} distinct notes")
+            targets = assignAndReport(midi.noteUsageCounts)
+        } else if (nbs != null) {
+            // NBS loaded — same assignment pipeline as MIDI, keyed by (key+21, resolved
+            // instrument) so two NBS layers using the same pitch on different
+            // instruments (e.g. a harp melody and a bell harmony at the same note)
+            // get separate, correctly-instrumented assignments instead of colliding.
+            val noteUsageCounts = nbs.notes
+                .map { NotePitch(it.key + 21, nbsInstrumentToBlock(it.instrument)) }
+                .groupingBy { it }
+                .eachCount()
+            logger.info("startTuning: NBS mode — ${reachable.size} reachable blocks, ${noteUsageCounts.size} distinct (note, instrument) pairs")
+            targets = assignAndReport(noteUsageCounts)
         } else {
-            // No MIDI — tune blocks to a chromatic scale starting at F#3 (MIDI 54, noteIndex 0 on HARP)
+            // No song loaded — tune blocks to a chromatic scale starting at F#3 (MIDI 54, noteIndex 0 on HARP)
             // This is the natural test target: one block per semitone, ascending, *per instrument*.
             // Note indices are scoped to each instrument independently (DiscJockey-style:
             // noteblocksForInstrument is grouped per NoteBlockInstrument) — otherwise blocks
             // past the 25th in a flat ordering would all collide on noteIndex 24.
-            logger.info("startTuning: no-MIDI mode — tuning ${reachable.size} blocks to chromatic scale from F#3")
-            chat("No MIDI loaded — tuning blocks to chromatic scale (F#3 upward)")
+            logger.info("startTuning: no-song mode — tuning ${reachable.size} blocks to chromatic scale from F#3")
+            chat("No song loaded — tuning blocks to chromatic scale (F#3 upward)")
             val sorted = reachable.sortedBy { it.distanceFromPlayer }
             targets = sorted
                 .groupBy { it.instrument }
@@ -5267,6 +5347,7 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
                     }
                 }
             assignment = null
+            ArpeggioScheduler.assignment = emptyMap()
             val perInstrumentCounts = sorted.groupBy { it.instrument }.mapValues { it.value.size }
             coverageMessage = "Test scale: ${sorted.size} blocks across ${perInstrumentCounts.size} instrument(s) → noteIndex 0–24 per instrument"
         }
@@ -5312,7 +5393,7 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
     private fun updateCoverageMessage(result: OrganAssignment) {
         val covered   = result.assignment.size
         val total     = covered + result.unplayable.size
-        val unplayable = result.unplayable.map { midiNoteToName(it) }
+        val unplayable = result.unplayable.map { it.displayName() }
         coverageMessage = "$covered/$total notes covered" +
                 if (unplayable.isNotEmpty()) ". Missing: ${unplayable.take(4).joinToString()}" else ""
         logger.info("coverage: $coverageMessage")
@@ -5388,7 +5469,7 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
         logger.info("startPlayback: ${file.name}")
         chat("Playing: ${file.name}")
         if (file.extension.lowercase() == "nbs") {
-            val nbs = NbsFileLoader.load(file)
+            val nbs = loadedNbs?.takeIf { it.file == file } ?: NbsFileLoader.load(file).also { loadedNbs = it }
             logger.info("startPlayback: NBS '${nbs.title}' ${nbs.notes.size} notes at ${nbs.tempo} tps")
             NbsPlayer.play(nbs, MidiFilePlayer.tempoMultiplier)
         } else {
@@ -5410,10 +5491,19 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
         selectedFile = file
         selectedIndex = midiFiles.indexOf(file)
         MidiFilePlayer.stop()
+        NbsPlayer.stop()
         if (file.extension.lowercase() in listOf("mid", "midi")) {
+            loadedNbs = null
             val midi = MidiFilePlayer.load(file)
             logger.info("selectFile: ${file.name} — ${midi.events.size} events, tempo=${midi.baseTempoUsPerBeat}µs/beat")
             chat("Loaded: ${file.name} (${midi.distinctNotes.size} distinct notes)")
+        } else if (file.extension.lowercase() == "nbs") {
+            val nbs = NbsFileLoader.load(file)
+            loadedNbs = nbs
+            logger.info("selectFile: ${file.name} — ${nbs.notes.size} notes, tempo=${nbs.tempo} tps")
+            chat("Loaded: ${file.name} (${nbs.notes.size} notes)")
+        } else {
+            loadedNbs = null
         }
         ConfigManager.config.lastPlayedTrack = file.name
         organScanMessage = "Loaded: ${file.name}. Run Scan → Center → Tune → Play."
@@ -5518,13 +5608,16 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
             graphics.text(font, "♪ Scale: ${midiNoteToName(entry.midiNote)} ($scaleIndex/${scaleNotes.size})", 10, cy + 2, 0xAAFF44)
         }
 
-        // Playback status bar
+        // Playback status bar — checks both players since either MidiFilePlayer or
+        // NbsPlayer may be the one actively playing depending on the loaded file type.
         val pbY = height - 42
         val status = when {
             MidiFilePlayer.isActive() && !MidiFilePlayer.isPaused ->
                 "▶ PLAYING  ${selectedFile?.name ?: ""}"
-            MidiFilePlayer.isPaused -> "⏸ PAUSED"
-            else                    -> "⏹ IDLE"
+            NbsPlayer.isPlaying && !NbsPlayer.isPaused ->
+                "▶ PLAYING  ${selectedFile?.name ?: ""}"
+            MidiFilePlayer.isPaused || NbsPlayer.isPaused -> "⏸ PAUSED"
+            else -> "⏹ IDLE"
         }
         graphics.text(font, status, 10, pbY, 0xAAFFAA)
         graphics.text(font, "Tempo: ${"%.1f".format(MidiFilePlayer.tempoMultiplier)}x", 200, pbY, 0xCCCCCC)
@@ -5645,6 +5738,200 @@ object KeyboardInputHandler {
 }
 </file>
 
+<file path="src/main/kotlin/kyrielie/blockbard/organ/ArpeggioScheduler.kt">
+package kyrielie.blockbard.organ
+
+import net.minecraft.core.BlockPos
+import net.minecraft.world.level.block.state.properties.NoteBlockInstrument
+import org.slf4j.LoggerFactory
+
+data class NoteRequest(
+    val midiNote: Int,
+    /**
+     * The instrument this note was authored for (NBS instrument byte, or MIDI channel
+     * program resolved via MidiChannelResolver), if known. Null means "any instrument
+     * at this pitch is fine" — used by callers with no instrument source, like
+     * KeyboardInputHandler's direct 1-9 key presses or the chromatic-scale test.
+     * Without this, two notes at the same pitch but different instruments (e.g. a
+     * harp middle-C and a bell middle-C) would be indistinguishable and could each
+     * land on whichever block happens to match the pitch, ignoring the instrument
+     * the source file actually specified.
+     */
+    val instrument: NoteBlockInstrument? = null,
+    val enqueuedAtMs: Long = System.currentTimeMillis(),
+    /**
+     * Pre-resolved block position. When set, bypasses the assignment map entirely.
+     * Used by the scale test and any direct-play path that already knows which block to hit.
+     */
+    val resolvedPos: BlockPos? = null
+)
+
+/**
+ * Tick-based queue that serialises simultaneous note requests into sequential
+ * block interactions. One note is dispatched per tick via [onTick].
+ *
+ * [interactDelegate] is wired by BlockBardClient to PlayerController.interactWith().
+ */
+object ArpeggioScheduler {
+
+    private val logger = LoggerFactory.getLogger("BlockBard/ArpeggioScheduler")
+
+    /**
+     * Populated by MidiToOrganMapper: NotePitch (midiNote, instrument) → assigned BlockPos.
+     * Keyed by instrument as well as pitch so two notes at the same pitch but
+     * different instruments don't collide on one assignment slot — see NoteRequest
+     * kdoc. A null instrument in the key means "any instrument" and is only ever
+     * looked up as a fallback when no instrument-specific entry exists (see resolvePos).
+     * Must match OrganAssignment.assignment's key type (NotePitch) exactly, since
+     * MainScreen assigns ArpeggioScheduler.assignment = result.assignment directly.
+     */
+    var assignment: Map<NotePitch, BlockPos> = emptyMap()
+
+    /** Requests older than this are dropped to prevent note build-up after lag. */
+    var staleTimeoutMs: Long = 200L
+
+    /**
+     * Safety cap for a note that is actively converging rotation (see onTick kdoc).
+     * Sized generously above the worst-case turn time at MAX_ROTATION_DEGREES_PER_TICK
+     * (a full 180 deg yaw turn takes ~6 ticks / 300ms at the default 35 deg/tick cap)
+     * so it only fires if rotation genuinely got stuck (e.g. overridden by something
+     * else, or organMap stale for this pos), not on a normal large turn.
+     */
+    var rotationInProgressTimeoutMs: Long = 1500L
+
+    /** Wired to PlayerController.interactWith() by the client entrypoint. */
+    var interactDelegate: ((BlockPos) -> Boolean)? = null
+
+    /**
+     * Wired to PlayerController.rotationConverged() by the client entrypoint. Gates
+     * dispatch so interactWith() never fires while the eased rotation (see
+     * PlayerController.MAX_ROTATION_DEGREES_PER_TICK) is still mid-turn — firing early
+     * would reproduce the same instant-rotation-plus-click signature the easing was
+     * added to avoid. If unset, dispatch proceeds unconditionally (back-compat / tests).
+     */
+    var rotationConvergedDelegate: ((BlockPos) -> Boolean)? = null
+
+    private val queue: ArrayDeque<NoteRequest> = ArrayDeque()
+
+    /**
+     * Resolves a request to a target BlockPos, trying in order:
+     * 1. resolvedPos, if the caller already knows the exact block (scale test).
+     * 2. assignment for the exact (midiNote, instrument) pair, if instrument is known.
+     * 3. assignment for (midiNote, null) — an instrument-agnostic assignment entry.
+     * 4. NoteBlockRegistry.findBestFor(midiNote, instrument) — live lookup, preferring
+     *    an exact instrument match but falling back to any instrument at that pitch.
+     */
+    private fun resolvePos(request: NoteRequest): BlockPos? =
+        request.resolvedPos
+            ?: assignment[NotePitch(request.midiNote, request.instrument)]
+            ?: assignment[NotePitch(request.midiNote, null)]
+            ?: NoteBlockRegistry.findBestFor(request.midiNote, request.instrument)?.pos
+
+    /**
+     * Called every client tick. Dispatches one queued note once rotation has converged
+     * on its target. The head of the queue blocks until converged (deliberately serial
+     * — see class doc) and is re-checked next tick; staleTimeoutMs prunes backlog
+     * sitting behind the head so a burst of enqueued notes can't build up unboundedly
+     * while the head note is turning, but does NOT retroactively cancel the head note
+     * itself once its convergence wait has begun — see rotationInProgressTimeoutMs for
+     * the cap that applies to the head note instead. Large-angle turns (observed up to
+     * ~180 deg yaw in practice) can legitimately take several ticks longer than
+     * staleTimeoutMs to converge under MAX_ROTATION_DEGREES_PER_TICK easing, and a turn
+     * that successfully converges should still play even if it took a while — it was
+     * never idle, the player was visibly turning toward it the whole time.
+     */
+    fun onTick() {
+        // Prune stale backlog sitting behind the head first — these notes haven't started
+        // converging yet and may have been waiting the entire time the head note was
+        // turning. The head note itself is handled separately below and is exempt from
+        // staleTimeoutMs once its convergence wait has begun (see kdoc above).
+        while (queue.size > 1) {
+            val behindHead = queue[1]
+            val behindAge = System.currentTimeMillis() - behindHead.enqueuedAtMs
+            if (behindAge > staleTimeoutMs) {
+                queue.removeAt(1)
+                logger.warn("dropping stale backlogged MIDI ${behindHead.midiNote} (age ${behindAge}ms > ${staleTimeoutMs}ms) — queue building up faster than notes can be dispatched")
+            } else {
+                break
+            }
+        }
+
+        // Iterative stale-skip — never recursive
+        while (queue.isNotEmpty()) {
+            val request = queue.first()
+            val age = System.currentTimeMillis() - request.enqueuedAtMs
+
+            val pos = resolvePos(request)
+
+            if (pos == null) {
+                queue.removeFirst()
+                logger.warn("no block found for MIDI ${request.midiNote} — skipping (assignment has ${assignment.size} entries, resolvedPos=${request.resolvedPos})")
+                return
+            }
+
+            val converged = rotationConvergedDelegate?.invoke(pos) ?: true
+
+            if (!converged) {
+                if (age > rotationInProgressTimeoutMs) {
+                    queue.removeFirst()
+                    logger.warn("dropping MIDI ${request.midiNote} at $pos — rotation did not converge within ${rotationInProgressTimeoutMs}ms (age ${age}ms); check for a stuck/overridden rotation")
+                    continue
+                }
+                // Still turning toward this note — leave it at the head of the queue
+                // and try again next tick. staleTimeoutMs does not apply to the head
+                // note once convergence waiting has begun — see kdoc above.
+                logger.debug("waiting for rotation convergence on $pos (MIDI ${request.midiNote}, age ${age}ms)")
+                return
+            }
+
+            // Converged — consume and dispatch regardless of age. A note that took
+            // a while to converge because of a large turn is not stale; it was never
+            // idle. staleTimeoutMs prunes idle backlog elsewhere (see kdoc above), not
+            // a note that just finished a legitimate in-progress turn.
+            queue.removeFirst()
+            val dispatched = interactDelegate?.invoke(pos) ?: false
+            logger.info("dispatch MIDI ${request.midiNote} -> $pos result=$dispatched age=${age}ms queueRemaining=${queue.size}")
+            if (!dispatched) {
+                logger.warn("interactDelegate returned false for $pos (MIDI ${request.midiNote}) — check PlayerController logs above")
+            }
+            return
+        }
+    }
+
+    /**
+     * Returns the BlockPos the next pending note will be dispatched to, without
+     * consuming it. Used by BlockBardClient to drive PlayerController.primeRotation()
+     * every tick a note is pending.
+     *
+     * Deliberately does NOT apply staleTimeoutMs here. onTick() exempts a note from the
+     * staleness drop once rotation convergence is in progress for it (see onTick kdoc);
+     * if this method instead started returning null for that same note once it crossed
+     * staleTimeoutMs, primeRotation() would stop being called and the rotation would
+     * freeze mid-turn — convergence would then never complete and the note would sit
+     * forever, since onTick() is waiting on a convergence that's no longer advancing.
+     * staleTimeoutMs is still enforced in onTick() for notes that haven't started
+     * converging.
+     */
+    fun peekNextPos(): BlockPos? {
+        val request = queue.firstOrNull() ?: return null
+        return resolvePos(request)
+    }
+
+    fun enqueue(request: NoteRequest) {
+        logger.info("enqueue MIDI ${request.midiNote} instrument=${request.instrument?.name ?: "any"} resolvedPos=${request.resolvedPos} queueSize=${queue.size + 1}")
+        queue.addLast(request)
+    }
+
+    fun clear() {
+        logger.info("queue cleared (had ${queue.size} items)")
+        queue.clear()
+    }
+
+    fun isEmpty(): Boolean = queue.isEmpty()
+    val queueSize: Int get() = queue.size
+}
+</file>
+
 <file path="src/client/kotlin/kyrielie/blockbard/client/player/PlayerController.kt">
 package kyrielie.blockbard.client.player
 
@@ -5656,15 +5943,33 @@ import kyrielie.blockbard.util.vecToYawPitch
 import net.minecraft.client.Minecraft
 import net.minecraft.core.BlockPos
 import net.minecraft.core.Direction
+import net.minecraft.util.Mth
 import net.minecraft.world.InteractionHand
 import net.minecraft.world.level.GameType
 import net.minecraft.world.phys.BlockHitResult
 import net.minecraft.world.phys.HitResult
 import net.minecraft.world.phys.Vec3
 import org.slf4j.LoggerFactory
+import kotlin.math.abs
 
 /** Survival reach distance from eye position (blocks). */
 const val REACH_DISTANCE = 4.5
+
+/**
+ * Maximum yaw/pitch change allowed in a single tick while priming rotation toward a
+ * target. Many anticheat plugins flag any single-tick rotation delta beyond a
+ * threshold well below human-mouse-speed as a "rotation hack" signature and will
+ * silently drop the following use-item packet even though the rotation packet itself
+ * is accepted and rendered locally on the client. Snapping yaw/pitch instantly to the
+ * target every tick (the old behavior) produced exactly that signature whenever notes
+ * were on opposite sides of the player. Easing toward the target at a capped rate
+ * removes the signature without slowing down playback overall, since interactWith()
+ * is only invoked once the eased rotation has converged (see rotationConverged()).
+ */
+const val MAX_ROTATION_DEGREES_PER_TICK = 35f
+
+/** How close yaw/pitch must be to the target (degrees) before a note is considered aimed. */
+const val ROTATION_CONVERGENCE_THRESHOLD_DEGREES = 2f
 
 sealed class CenterResult {
     object NoPlayer : CenterResult()
@@ -5770,17 +6075,19 @@ object PlayerController {
 
     /**
      * Phase 2: holds the rotation computed for the next pending note.
-     * Triple is (targetPos, yaw, pitch). Set by primeRotation() one tick before
-     * interactWith() fires, so the rotation packet reaches the server before the
-     * use packet — matching Baritone's PRE/POST player-update hook pattern.
+     * Triple is (targetPos, yaw, pitch). Set/updated by primeRotation() every tick the
+     * note is pending, eased toward the target — see MAX_ROTATION_DEGREES_PER_TICK.
      * Consumed and cleared by interactWith(); null if no note is pending.
      */
     private var primedRotation: Triple<BlockPos, Float, Float>? = null
 
     /**
-     * Aims the player at [pos] and records the rotation for this tick's movement packet.
-     * Call this BEFORE ArpeggioScheduler.onTick() in END_CLIENT_TICK so the server
-     * receives the rotation in the movement packet one tick before the use packet.
+     * Eases yaw/pitch toward [pos] by at most MAX_ROTATION_DEGREES_PER_TICK per call,
+     * and records the in-progress rotation for this tick's movement packet. Call this
+     * every tick a note is pending (BEFORE ArpeggioScheduler.onTick() in END_CLIENT_TICK),
+     * not just once — convergence may take several ticks for large angle changes.
+     *
+     * Use rotationConverged(pos) to check whether it's safe to fire interactWith(pos) yet.
      */
     fun primeRotation(pos: BlockPos) {
         val mc = Minecraft.getInstance()
@@ -5789,27 +6096,64 @@ object PlayerController {
         val target = Vec3(pos.x + 0.5, pos.y + 1.0, pos.z + 0.5)
         val delta = target.subtract(eyePos)
         val reach = organMap?.getReachInfo(pos)
-        val (yaw, pitch) = reach?.let { Pair(it.yaw, it.pitch) } ?: vecToYawPitch(delta)
+        val (targetYaw, targetPitch) = reach?.let { Pair(it.yaw, it.pitch) } ?: vecToYawPitch(delta)
+
         val yRotBefore = player.yRot
         val xRotBefore = player.xRot
-        player.setYRot(yaw)
-        player.setXRot(pitch)
+
+        val yawStep = clampedStep(yRotBefore, targetYaw)
+        val pitchStep = clampedStep(xRotBefore, targetPitch)
+        val newYaw = Mth.wrapDegrees(yRotBefore + yawStep)
+        val newPitch = (xRotBefore + pitchStep).coerceIn(-90f, 90f)
+
+        player.setYRot(newYaw)
+        player.setXRot(newPitch)
         val yRotAfter = player.yRot
         val xRotAfter = player.xRot
-        primedRotation = Triple(pos, yaw, pitch)
-        // Rotation readback: if after != what we set, something is overriding us this tick.
-        if (yRotAfter != yaw || xRotAfter != pitch) {
+        primedRotation = Triple(pos, targetYaw, targetPitch)
+
+        if (yRotAfter != newYaw || xRotAfter != newPitch) {
             logger.warn(
-                "primeRotation $pos: rotation did not take! wanted yaw=${"%.2f".format(yaw)} pitch=${"%.2f".format(pitch)}" +
+                "primeRotation $pos: rotation did not take! wanted yaw=${"%.2f".format(newYaw)} pitch=${"%.2f".format(newPitch)}" +
                     " got yaw=${"%.2f".format(yRotAfter)} pitch=${"%.2f".format(xRotAfter)}" +
                     " (before: yaw=${"%.2f".format(yRotBefore)} pitch=${"%.2f".format(xRotBefore)})"
             )
         } else {
             logger.debug(
                 "primeRotation $pos: yaw ${"%.2f".format(yRotBefore)}->${"%.2f".format(yRotAfter)}" +
-                    " pitch ${"%.2f".format(xRotBefore)}->${"%.2f".format(xRotAfter)}"
+                    " (target ${"%.2f".format(targetYaw)}) pitch ${"%.2f".format(xRotBefore)}->${"%.2f".format(xRotAfter)}" +
+                    " (target ${"%.2f".format(targetPitch)})"
             )
         }
+    }
+
+    /** Signed shortest-path step from [from] toward [to], capped at MAX_ROTATION_DEGREES_PER_TICK. */
+    private fun clampedStep(from: Float, to: Float): Float {
+        val diff = Mth.wrapDegrees(to - from)
+        val capped = diff.coerceIn(-MAX_ROTATION_DEGREES_PER_TICK, MAX_ROTATION_DEGREES_PER_TICK)
+        return capped
+    }
+
+    /**
+     * Returns true once the player's current rotation is within
+     * ROTATION_CONVERGENCE_THRESHOLD_DEGREES of [pos]'s target rotation. Callers
+     * (ArpeggioScheduler) should wait for this before invoking interactWith(pos) —
+     * firing the use packet while still mid-turn reproduces the same "instant rotation
+     * + click" signature this easing was added to avoid.
+     */
+    fun rotationConverged(pos: BlockPos): Boolean {
+        val mc = Minecraft.getInstance()
+        val player = mc.player ?: return false
+        val primed = primedRotation?.takeIf { it.first == pos } ?: run {
+            // No primed rotation recorded for this pos yet (e.g. first tick it became
+            // the head of the queue, before primeRotation has run for it this tick).
+            return false
+        }
+        val (_, targetYaw, targetPitch) = primed
+        val yawDiff = abs(Mth.wrapDegrees(targetYaw - player.yRot))
+        val pitchDiff = abs(targetPitch - player.xRot)
+        return yawDiff <= ROTATION_CONVERGENCE_THRESHOLD_DEGREES &&
+            pitchDiff <= ROTATION_CONVERGENCE_THRESHOLD_DEGREES
     }
 
     /**
@@ -5969,6 +6313,9 @@ object BlockBardClient : ClientModInitializer {
             logger.debug("interactDelegate: → $pos")
             PlayerController.interactWith(pos)
         }
+        ArpeggioScheduler.rotationConvergedDelegate = { pos ->
+            PlayerController.rotationConverged(pos)
+        }
 
         openGuiKey = KeyMappingHelper.registerKeyMapping(
             KeyMapping("key.blockbard.open_gui", GLFW.GLFW_KEY_B, KeyMapping.Category.MISC)
@@ -5981,11 +6328,14 @@ object BlockBardClient : ClientModInitializer {
         KeyboardInputHandler.register()
         PlaybackHud.register()
 
-        // Phase 2: prime rotation in START_CLIENT_TICK — this fires before LocalPlayer.tick(),
-        // which calls sendPosition(). Setting yRot/xRot here means the rotation is already
-        // in the movement packet the engine sends this tick. The interact (useItemOn) fires
-        // in END_CLIENT_TICK below, so the server sees rotation-packet → use-packet in order.
-        // This matches how Baritone's MixinClientPlayerEntity.onPreUpdate hook works.
+        // Prime rotation in START_CLIENT_TICK — this fires before LocalPlayer.tick(),
+        // which calls sendPosition(), so each tick's eased rotation step is in that
+        // tick's movement packet before END_CLIENT_TICK runs. primeRotation() now eases
+        // toward the target at a capped degrees/tick rate (see PlayerController.
+        // MAX_ROTATION_DEGREES_PER_TICK) rather than snapping instantly — large turns
+        // take several ticks to converge. ArpeggioScheduler.onTick() (END_CLIENT_TICK,
+        // below) only fires the actual interact once PlayerController.rotationConverged()
+        // confirms the turn has finished, so the use packet never arrives mid-turn.
         ClientTickEvents.START_CLIENT_TICK.register { _ ->
             ArpeggioScheduler.peekNextPos()?.let { PlayerController.primeRotation(it) }
         }

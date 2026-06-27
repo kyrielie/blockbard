@@ -1,14 +1,16 @@
 package kyrielie.blockbard.client.playback
 
+import kyrielie.blockbard.midi.MidiChannelResolver
 import kyrielie.blockbard.organ.ArpeggioScheduler
+import kyrielie.blockbard.organ.NotePitch
 import kyrielie.blockbard.organ.NoteRequest
+import net.minecraft.world.level.block.state.properties.NoteBlockInstrument
 import javax.sound.midi.MetaMessage
 import javax.sound.midi.MidiSystem
 import javax.sound.midi.Sequence
-import javax.sound.midi.ShortMessage
 import java.io.File
 
-data class TimedNoteEvent(val tick: Long, val midiNote: Int)
+data class TimedNoteEvent(val tick: Long, val midiNote: Int, val instrument: NoteBlockInstrument)
 
 data class LoadedMidi(
     val file: File,
@@ -17,8 +19,14 @@ data class LoadedMidi(
     val baseTempoUsPerBeat: Int,
     val events: List<TimedNoteEvent>,
     val distinctNotes: Set<Int>,
-    /** Maps note usage counts for MidiToOrganMapper priority. */
-    val noteUsageCounts: Map<Int, Int>
+    /**
+     * Usage counts per (midiNote, instrument) pair, for MidiToOrganMapper priority —
+     * the most-used notes get first pick of available blocks. Instrument is resolved
+     * per MIDI channel via MidiChannelResolver (GM program → NoteBlockInstrument),
+     * so two channels playing the same pitch on different instruments are counted
+     * and later assigned separately rather than collapsed into one pitch bucket.
+     */
+    val noteUsageCounts: Map<NotePitch, Int>
 )
 
 /** Duration of the sequence in milliseconds at 1x tempo. */
@@ -59,32 +67,38 @@ object MidiFilePlayer {
 
     fun load(file: File): LoadedMidi {
         val sequence = MidiSystem.getSequence(file)
-        val events = mutableListOf<TimedNoteEvent>()
         var tempoUs = 500000  // default 120 BPM
 
+        // Tempo (MetaMessage 0x51) is not a channel-voice message, so MidiChannelResolver
+        // (which only collects ShortMessages) doesn't see it — read it directly here.
         sequence.tracks.forEach { track ->
             for (i in 0 until track.size()) {
-                val event = track.get(i)
-                val msg = event.message
-                when {
-                    msg is MetaMessage && msg.type == 0x51 -> {
-                        // Tempo change: 3 bytes big-endian microseconds per beat
-                        val d = msg.data
-                        if (d.size >= 3) {
-                            tempoUs = ((d[0].toInt() and 0xFF) shl 16) or
-                                    ((d[1].toInt() and 0xFF) shl 8) or
-                                    (d[2].toInt() and 0xFF)
-                        }
-                    }
-                    msg is ShortMessage && msg.command == ShortMessage.NOTE_ON && msg.data2 > 0 -> {
-                        events.add(TimedNoteEvent(event.tick, msg.data1))
+                val msg = track.get(i).message
+                if (msg is MetaMessage && msg.type == 0x51) {
+                    val d = msg.data
+                    if (d.size >= 3) {
+                        tempoUs = ((d[0].toInt() and 0xFF) shl 16) or
+                                ((d[1].toInt() and 0xFF) shl 8) or
+                                (d[2].toInt() and 0xFF)
                     }
                 }
             }
         }
 
-        val sortedEvents = events.sortedBy { it.tick }
-        val usageCounts = sortedEvents.groupBy { it.midiNote }.mapValues { it.value.size }
+        // MidiChannelResolver resolves each NOTE_ON to the instrument the minecraft3.sf2
+        // soundfont would use for that channel's GM program (or percussion for channel 10),
+        // tracking PROGRAM_CHANGE per channel as it scans. See its kdoc for details.
+        // Note: this re-parses the file independently via its own MidiSystem.getSequence
+        // call rather than reusing `sequence` above — a small duplicate parse, traded for
+        // keeping MidiChannelResolver's resolve(File) signature self-contained and usable
+        // by other callers (e.g. OrganReadinessChecker) without needing a Sequence handle.
+        val resolvedEvents = MidiChannelResolver.resolve(file)
+        val sortedEvents = resolvedEvents
+            .map { TimedNoteEvent(it.tick, it.midiNote, it.instrument) }
+            .sortedBy { it.tick }
+        val usageCounts = sortedEvents
+            .groupBy { NotePitch(it.midiNote, it.instrument) }
+            .mapValues { it.value.size }
 
         val midi = LoadedMidi(
             file = file,
@@ -136,7 +150,12 @@ object MidiFilePlayer {
 
                     currentTick = event.tick
                     onTickUpdate?.invoke(currentTick, midi.events.lastOrNull()?.tick ?: 0L)
-                    ArpeggioScheduler.enqueue(NoteRequest(event.midiNote))
+                    // instrument is passed through so ArpeggioScheduler.resolvePos can
+                    // look up the (midiNote, instrument) assignment built at tuning time
+                    // (see MainScreen.startTuning) instead of falling back to a
+                    // pitch-only live lookup that ignores which instrument this note
+                    // was authored for.
+                    ArpeggioScheduler.enqueue(NoteRequest(event.midiNote, instrument = event.instrument))
                 }
                 isPlaying = false
                 onFinished?.invoke()
