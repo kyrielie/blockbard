@@ -1,10 +1,22 @@
 package kyrielie.blockbard.organ
 
 import net.minecraft.core.BlockPos
+import net.minecraft.world.level.block.state.properties.NoteBlockInstrument
 import org.slf4j.LoggerFactory
 
 data class NoteRequest(
     val midiNote: Int,
+    /**
+     * The instrument this note was authored for (NBS instrument byte, or MIDI channel
+     * program resolved via MidiChannelResolver), if known. Null means "any instrument
+     * at this pitch is fine" — used by callers with no instrument source, like
+     * KeyboardInputHandler's direct 1-9 key presses or the chromatic-scale test.
+     * Without this, two notes at the same pitch but different instruments (e.g. a
+     * harp middle-C and a bell middle-C) would be indistinguishable and could each
+     * land on whichever block happens to match the pitch, ignoring the instrument
+     * the source file actually specified.
+     */
+    val instrument: NoteBlockInstrument? = null,
     val enqueuedAtMs: Long = System.currentTimeMillis(),
     /**
      * Pre-resolved block position. When set, bypasses the assignment map entirely.
@@ -23,8 +35,16 @@ object ArpeggioScheduler {
 
     private val logger = LoggerFactory.getLogger("BlockBard/ArpeggioScheduler")
 
-    /** Populated by MidiToOrganMapper: midiNote → assigned BlockPos. */
-    var assignment: Map<Int, BlockPos> = emptyMap()
+    /**
+     * Populated by MidiToOrganMapper: NotePitch (midiNote, instrument) → assigned BlockPos.
+     * Keyed by instrument as well as pitch so two notes at the same pitch but
+     * different instruments don't collide on one assignment slot — see NoteRequest
+     * kdoc. A null instrument in the key means "any instrument" and is only ever
+     * looked up as a fallback when no instrument-specific entry exists (see resolvePos).
+     * Must match OrganAssignment.assignment's key type (NotePitch) exactly, since
+     * MainScreen assigns ArpeggioScheduler.assignment = result.assignment directly.
+     */
+    var assignment: Map<NotePitch, BlockPos> = emptyMap()
 
     /** Requests older than this are dropped to prevent note build-up after lag. */
     var staleTimeoutMs: Long = 200L
@@ -51,6 +71,20 @@ object ArpeggioScheduler {
     var rotationConvergedDelegate: ((BlockPos) -> Boolean)? = null
 
     private val queue: ArrayDeque<NoteRequest> = ArrayDeque()
+
+    /**
+     * Resolves a request to a target BlockPos, trying in order:
+     * 1. resolvedPos, if the caller already knows the exact block (scale test).
+     * 2. assignment for the exact (midiNote, instrument) pair, if instrument is known.
+     * 3. assignment for (midiNote, null) — an instrument-agnostic assignment entry.
+     * 4. NoteBlockRegistry.findBestFor(midiNote, instrument) — live lookup, preferring
+     *    an exact instrument match but falling back to any instrument at that pitch.
+     */
+    private fun resolvePos(request: NoteRequest): BlockPos? =
+        request.resolvedPos
+            ?: assignment[NotePitch(request.midiNote, request.instrument)]
+            ?: assignment[NotePitch(request.midiNote, null)]
+            ?: NoteBlockRegistry.findBestFor(request.midiNote, request.instrument)?.pos
 
     /**
      * Called every client tick. Dispatches one queued note once rotation has converged
@@ -86,9 +120,7 @@ object ArpeggioScheduler {
             val request = queue.first()
             val age = System.currentTimeMillis() - request.enqueuedAtMs
 
-            val pos = request.resolvedPos
-                ?: assignment[request.midiNote]
-                ?: NoteBlockRegistry.findBestForMidi(request.midiNote)?.pos
+            val pos = resolvePos(request)
 
             if (pos == null) {
                 queue.removeFirst()
@@ -141,13 +173,11 @@ object ArpeggioScheduler {
      */
     fun peekNextPos(): BlockPos? {
         val request = queue.firstOrNull() ?: return null
-        return request.resolvedPos
-            ?: assignment[request.midiNote]
-            ?: NoteBlockRegistry.findBestForMidi(request.midiNote)?.pos
+        return resolvePos(request)
     }
 
     fun enqueue(request: NoteRequest) {
-        logger.info("enqueue MIDI ${request.midiNote} resolvedPos=${request.resolvedPos} queueSize=${queue.size + 1}")
+        logger.info("enqueue MIDI ${request.midiNote} instrument=${request.instrument?.name ?: "any"} resolvedPos=${request.resolvedPos} queueSize=${queue.size + 1}")
         queue.addLast(request)
     }
 

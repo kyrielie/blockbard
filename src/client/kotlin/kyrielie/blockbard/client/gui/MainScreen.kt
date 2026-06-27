@@ -2,8 +2,10 @@ package kyrielie.blockbard.client.gui
 
 import kyrielie.blockbard.client.config.ConfigManager
 import kyrielie.blockbard.client.playback.MidiFilePlayer
+import kyrielie.blockbard.client.playback.NbsFile
 import kyrielie.blockbard.client.playback.NbsFileLoader
 import kyrielie.blockbard.client.playback.NbsPlayer
+import kyrielie.blockbard.client.playback.nbsInstrumentToBlock
 import kyrielie.blockbard.organ.*
 import kyrielie.blockbard.client.organ.OrganScanner
 import kyrielie.blockbard.client.player.CenterResult
@@ -44,6 +46,12 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
     private var tuner: NoteBlockTuner? = null
     private var assignment: OrganAssignment? = null
     private var tuneStatusMsg: String = ""
+
+    // NBS playback state — NbsFileLoader.load() is a pure function with no caching
+    // of its own (unlike MidiFilePlayer.loadedMidi), so MainScreen caches the result
+    // here keyed by file, the same way it already does for MIDI. Without this,
+    // startTuning() would have no NBS data to build an assignment from at all.
+    private var loadedNbs: NbsFile? = null
 
     // General status
     private var organScanMessage: String = "Press Scan to detect noteblocks"
@@ -112,21 +120,22 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
 
         // ── Playback controls ──
         addRenderableWidget(Button.builder(Component.literal("▶ Play")) {
-            logger.info("Play clicked — isPaused=${MidiFilePlayer.isPaused}, file=${selectedFile?.name}")
-            if (MidiFilePlayer.isPaused) {
-                MidiFilePlayer.resume()
-                chat("Resumed")
-            } else {
-                startPlayback()
+            logger.info("Play clicked — midiPaused=${MidiFilePlayer.isPaused}, nbsPaused=${NbsPlayer.isPaused}, file=${selectedFile?.name}")
+            when {
+                MidiFilePlayer.isPaused -> { MidiFilePlayer.resume(); chat("Resumed") }
+                NbsPlayer.isPaused -> { NbsPlayer.resume(); chat("Resumed") }
+                else -> startPlayback()
             }
         }.pos(10, 222).size(55, 16).build())
 
         addRenderableWidget(Button.builder(Component.literal("⏸ Pause")) {
             logger.info("Pause clicked")
-            if (MidiFilePlayer.isPaused) {
-                MidiFilePlayer.resume(); chat("Resumed")
-            } else {
-                MidiFilePlayer.pause(); chat("Paused")
+            when {
+                MidiFilePlayer.isPaused -> { MidiFilePlayer.resume(); chat("Resumed") }
+                NbsPlayer.isPaused -> { NbsPlayer.resume(); chat("Resumed") }
+                MidiFilePlayer.isActive() -> { MidiFilePlayer.pause(); chat("Paused") }
+                NbsPlayer.isPlaying -> { NbsPlayer.pause(); chat("Paused") }
+                else -> chat("Nothing playing")
             }
         }.pos(70, 222).size(60, 16).build())
 
@@ -231,26 +240,46 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
 
         val targets: List<TuneTarget>
 
-        val midi = MidiFilePlayer.loadedMidi
-        if (midi != null) {
-            // MIDI loaded — map notes from the song to blocks
-            logger.info("startTuning: MIDI mode — ${reachable.size} reachable blocks, ${midi.distinctNotes.size} distinct notes")
-            val result = MidiToOrganMapper.buildAssignment(midi.noteUsageCounts, reachable)
+        // Shared by both MIDI and NBS branches: builds an assignment from a set of
+        // (midiNote, instrument) usage counts, wires it into ArpeggioScheduler so
+        // playback actually uses what was just tuned, and reports coverage.
+        fun assignAndReport(noteUsageCounts: Map<NotePitch, Int>): List<TuneTarget> {
+            val result = MidiToOrganMapper.buildAssignment(noteUsageCounts, reachable)
             assignment = result
+            ArpeggioScheduler.assignment = result.assignment
             if (result.unplayable.isNotEmpty()) {
-                val names = result.unplayable.map { midiNoteToName(it) }
+                val names = result.unplayable.map { it.displayName() }
                 chatWarn("Warning: ${names.size} notes unplayable: ${names.take(6).joinToString()}")
             }
             updateCoverageMessage(result)
-            targets = MidiToOrganMapper.computeTuneTargets(result, reachable)
+            return MidiToOrganMapper.computeTuneTargets(result, reachable)
+        }
+
+        val midi = MidiFilePlayer.loadedMidi
+        val nbs = loadedNbs?.takeIf { it.file == selectedFile }
+        if (midi != null) {
+            // MIDI loaded — map notes from the song to blocks
+            logger.info("startTuning: MIDI mode — ${reachable.size} reachable blocks, ${midi.distinctNotes.size} distinct notes")
+            targets = assignAndReport(midi.noteUsageCounts)
+        } else if (nbs != null) {
+            // NBS loaded — same assignment pipeline as MIDI, keyed by (key+21, resolved
+            // instrument) so two NBS layers using the same pitch on different
+            // instruments (e.g. a harp melody and a bell harmony at the same note)
+            // get separate, correctly-instrumented assignments instead of colliding.
+            val noteUsageCounts = nbs.notes
+                .map { NotePitch(it.key + 21, nbsInstrumentToBlock(it.instrument)) }
+                .groupingBy { it }
+                .eachCount()
+            logger.info("startTuning: NBS mode — ${reachable.size} reachable blocks, ${noteUsageCounts.size} distinct (note, instrument) pairs")
+            targets = assignAndReport(noteUsageCounts)
         } else {
-            // No MIDI — tune blocks to a chromatic scale starting at F#3 (MIDI 54, noteIndex 0 on HARP)
+            // No song loaded — tune blocks to a chromatic scale starting at F#3 (MIDI 54, noteIndex 0 on HARP)
             // This is the natural test target: one block per semitone, ascending, *per instrument*.
             // Note indices are scoped to each instrument independently (DiscJockey-style:
             // noteblocksForInstrument is grouped per NoteBlockInstrument) — otherwise blocks
             // past the 25th in a flat ordering would all collide on noteIndex 24.
-            logger.info("startTuning: no-MIDI mode — tuning ${reachable.size} blocks to chromatic scale from F#3")
-            chat("No MIDI loaded — tuning blocks to chromatic scale (F#3 upward)")
+            logger.info("startTuning: no-song mode — tuning ${reachable.size} blocks to chromatic scale from F#3")
+            chat("No song loaded — tuning blocks to chromatic scale (F#3 upward)")
             val sorted = reachable.sortedBy { it.distanceFromPlayer }
             targets = sorted
                 .groupBy { it.instrument }
@@ -261,6 +290,7 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
                     }
                 }
             assignment = null
+            ArpeggioScheduler.assignment = emptyMap()
             val perInstrumentCounts = sorted.groupBy { it.instrument }.mapValues { it.value.size }
             coverageMessage = "Test scale: ${sorted.size} blocks across ${perInstrumentCounts.size} instrument(s) → noteIndex 0–24 per instrument"
         }
@@ -306,7 +336,7 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
     private fun updateCoverageMessage(result: OrganAssignment) {
         val covered   = result.assignment.size
         val total     = covered + result.unplayable.size
-        val unplayable = result.unplayable.map { midiNoteToName(it) }
+        val unplayable = result.unplayable.map { it.displayName() }
         coverageMessage = "$covered/$total notes covered" +
                 if (unplayable.isNotEmpty()) ". Missing: ${unplayable.take(4).joinToString()}" else ""
         logger.info("coverage: $coverageMessage")
@@ -382,7 +412,7 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
         logger.info("startPlayback: ${file.name}")
         chat("Playing: ${file.name}")
         if (file.extension.lowercase() == "nbs") {
-            val nbs = NbsFileLoader.load(file)
+            val nbs = loadedNbs?.takeIf { it.file == file } ?: NbsFileLoader.load(file).also { loadedNbs = it }
             logger.info("startPlayback: NBS '${nbs.title}' ${nbs.notes.size} notes at ${nbs.tempo} tps")
             NbsPlayer.play(nbs, MidiFilePlayer.tempoMultiplier)
         } else {
@@ -404,10 +434,19 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
         selectedFile = file
         selectedIndex = midiFiles.indexOf(file)
         MidiFilePlayer.stop()
+        NbsPlayer.stop()
         if (file.extension.lowercase() in listOf("mid", "midi")) {
+            loadedNbs = null
             val midi = MidiFilePlayer.load(file)
             logger.info("selectFile: ${file.name} — ${midi.events.size} events, tempo=${midi.baseTempoUsPerBeat}µs/beat")
             chat("Loaded: ${file.name} (${midi.distinctNotes.size} distinct notes)")
+        } else if (file.extension.lowercase() == "nbs") {
+            val nbs = NbsFileLoader.load(file)
+            loadedNbs = nbs
+            logger.info("selectFile: ${file.name} — ${nbs.notes.size} notes, tempo=${nbs.tempo} tps")
+            chat("Loaded: ${file.name} (${nbs.notes.size} notes)")
+        } else {
+            loadedNbs = null
         }
         ConfigManager.config.lastPlayedTrack = file.name
         organScanMessage = "Loaded: ${file.name}. Run Scan → Center → Tune → Play."
@@ -512,13 +551,16 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
             graphics.text(font, "♪ Scale: ${midiNoteToName(entry.midiNote)} ($scaleIndex/${scaleNotes.size})", 10, cy + 2, 0xAAFF44)
         }
 
-        // Playback status bar
+        // Playback status bar — checks both players since either MidiFilePlayer or
+        // NbsPlayer may be the one actively playing depending on the loaded file type.
         val pbY = height - 42
         val status = when {
             MidiFilePlayer.isActive() && !MidiFilePlayer.isPaused ->
                 "▶ PLAYING  ${selectedFile?.name ?: ""}"
-            MidiFilePlayer.isPaused -> "⏸ PAUSED"
-            else                    -> "⏹ IDLE"
+            NbsPlayer.isPlaying && !NbsPlayer.isPaused ->
+                "▶ PLAYING  ${selectedFile?.name ?: ""}"
+            MidiFilePlayer.isPaused || NbsPlayer.isPaused -> "⏸ PAUSED"
+            else -> "⏹ IDLE"
         }
         graphics.text(font, status, 10, pbY, 0xAAFFAA)
         graphics.text(font, "Tempo: ${"%.1f".format(MidiFilePlayer.tempoMultiplier)}x", 200, pbY, 0xCCCCCC)
