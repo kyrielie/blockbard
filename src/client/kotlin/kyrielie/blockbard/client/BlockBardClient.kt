@@ -1,3 +1,4 @@
+
 package kyrielie.blockbard.client
 
 import kyrielie.blockbard.client.config.ConfigManager

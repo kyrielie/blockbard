@@ -1,3 +1,4 @@
+
 package kyrielie.blockbard.client.gui
 
 import kyrielie.blockbard.client.config.ConfigManager
@@ -397,7 +398,7 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
 
         val entry = scaleNotes[scaleIndex]
         val noteName = midiNoteToName(entry.midiNote)
-        logger.info("tickScale: [$scaleIndex/${scaleNotes.size - 1}] ${entry.instrument.name} noteIndex=${entry.noteIndex} midi=${entry.midiNote} ($noteName) @ ${entry.pos}")
+        logger.info("tickScale: [$scaleIndex/${scaleNotes.size - 1}] ${entry.instrument.name} noteIndex=${entry.noteIndex} midi=${entry.midiNote} ($noteName) @ ${entry.pos} — enqueuing")
         minecraft.player?.sendSystemMessage(
             Component.literal("§b[BlockBard] §f[$scaleIndex] ${entry.instrument.name} §a$noteName §7@ ${entry.pos.toShortString()}")
         )
