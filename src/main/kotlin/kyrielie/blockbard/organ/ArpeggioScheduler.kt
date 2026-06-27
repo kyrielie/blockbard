@@ -1,3 +1,4 @@
+
 package kyrielie.blockbard.organ
 
 import net.minecraft.core.BlockPos
@@ -100,6 +101,12 @@ object ArpeggioScheduler {
      * never idle, the player was visibly turning toward it the whole time.
      */
     fun onTick() {
+        // Catch misconfiguration early — interactDelegate should be wired at init
+        if (queue.isNotEmpty() && interactDelegate == null) {
+            logger.warn("onTick: interactDelegate is null — notes will never be dispatched (check BlockBardClient init)")
+            return
+        }
+
         // Prune stale backlog sitting behind the head first — these notes haven't started
         // converging yet and may have been waiting the entire time the head note was
         // turning. The head note itself is handled separately below and is exempt from
@@ -173,7 +180,9 @@ object ArpeggioScheduler {
      */
     fun peekNextPos(): BlockPos? {
         val request = queue.firstOrNull() ?: return null
-        return resolvePos(request)
+        val pos = resolvePos(request)
+        logger.debug("peekNextPos: MIDI ${request.midiNote} instrument=${request.instrument?.name ?: "any"} -> $pos")
+        return pos
     }
 
     fun enqueue(request: NoteRequest) {

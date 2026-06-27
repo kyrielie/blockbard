@@ -1,3 +1,4 @@
+
 package kyrielie.blockbard.client.player
 
 import kyrielie.blockbard.organ.NoteBlockEntry
