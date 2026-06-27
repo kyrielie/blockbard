@@ -1,6 +1,16 @@
 # BlockBard — Engineering Plan
 ### Fabric 26.2 Kotlin Mod | NoteBlock Performance System
 
+> **STATUS: HISTORICAL — pre-implementation design document.**
+> This is the original design plan, written before most of the codebase existed. It
+> describes intended architecture and algorithms, not the current implementation.
+> Substantial divergence has occurred since (instrument-aware note assignment via
+> `NotePitch`, eased rotation for anti-cheat compatibility, an `NbsPlayer` this doc never
+> anticipated, and more). **For current-state documentation, read `ARCHITECTURE.md`
+> instead.** Use this doc only for original design rationale or to understand *why* a
+> particular approach was chosen — not to learn what the code currently does. Where the
+> two docs disagree, `ARCHITECTURE.md` (and ultimately the source itself) is correct.
+
 ---
 
 ## Table of Contents

@@ -107,6 +107,7 @@ src/
 .gitignore
 ARCHITECTURE.md
 BLOCKBARD_PLAN.md
+blockbard-engineering-plan.md
 build.gradle
 CLAUDE.md
 gradle.properties
@@ -121,6 +122,387 @@ SKILL.md
 
 <files>
 This section contains the contents of the repository's files.
+
+<file path="blockbard-engineering-plan.md">
+# BlockBard — Engineering Plan for Next Engineer
+
+**Read this first, before `ARCHITECTURE.md` or `BLOCKBARD_PLAN.md`.** Those two docs are
+stale relative to the actual code and will mislead you on several specific points — see
+"Doc trust calibration" at the bottom before consulting them for anything.
+
+Verified against the actual current source (repomix-output.xml, 44 files). Build currently
+compiles successfully (`./gradlew build`) — confirmed via two compile-error round-trips in
+prior sessions, both now resolved. This plan assumes you are starting from a clean,
+building codebase, not debugging a broken build.
+
+Target: Minecraft 26.2, Fabric, unobfuscated Mojang names (no Yarn mapping layer needed —
+see `gradle.properties`). Kotlin, client-only mod, no server-side code.
+
+---
+
+## How to use this plan
+
+Each item below is independently shippable — implement and verify one before moving to
+the next rather than batching. Items are ordered by priority within each tier, but tiers
+themselves should be done in order (don't start Tier 2 with open Tier 1 items, since
+several Tier 2 items assume Tier 1 fixes are already in place).
+
+For every item: read the referenced file(s) in full first — do not pattern-match from this
+plan's description alone, since exact line numbers will have shifted by the time you reach
+this. Verify the actual current signatures before writing any fix. Do not invent Minecraft
+API behavior; this project's `CLAUDE.md` instructions require verifying APIs by reading
+code or docs before asserting them — that applies to you too.
+
+---
+
+## Tier 1 — Correctness bugs (do these first; everything downstream assumes the queue is sound)
+
+### 1.1 Thread-safety: MIDI input races with the scheduler tick
+
+**File:** `client/input/MidiInputHandler.kt`, `main/organ/ArpeggioScheduler.kt`
+
+`MidiInputHandler.connect()` installs a `Receiver` whose `send()` callback fires on a
+MIDI-device thread (owned by `javax.sound.midi`, not Minecraft). It calls
+`ArpeggioScheduler.enqueue(...)` directly. `ArpeggioScheduler`'s queue is a
+`kotlin.collections.ArrayDeque`, not thread-safe, and `onTick()`/`peekNextPos()` run
+concurrently on the Minecraft client thread via `END_CLIENT_TICK`/`START_CLIENT_TICK`.
+This is a real, live data race whenever a physical MIDI keyboard is connected.
+
+**Fix:**
+- Add a `private val lock = Any()` to `ArpeggioScheduler` and wrap every method that
+  touches `queue` (`enqueue`, `onTick`, `peekNextPos`, `clear`, `isEmpty`, the `queueSize`
+  getter) in `synchronized(lock) { ... }`.
+- Alternative if you'd rather avoid lock contention on the hot tick path: have
+  `MidiInputHandler`'s receiver push into a separate `java.util.concurrent.ConcurrentLinkedQueue<NoteRequest>`,
+  and have `ArpeggioScheduler.onTick()` drain that queue into its own `ArrayDeque` at the
+  top of each tick (single-threaded from that point on). This avoids locking the
+  performance-sensitive tick path at the cost of one extra queue.
+- Either approach is acceptable; prefer `synchronized` for simplicity unless profiling
+  shows contention.
+
+**Verify:** connect a real or virtual MIDI input device, play notes rapidly while a song
+is also queued via `MidiFilePlayer`, confirm no `ConcurrentModificationException` in logs
+over an extended session (10+ minutes of mixed input).
+
+### 1.2 NoteBlockTuner retry loop has no exit condition
+
+**File:** `main/organ/NoteBlockTuner.kt`
+
+`tickVerifying()` clears `notePredictions` and sets `state = TunerState.TUNING` on any
+mismatch with no retry counter. A block that can never converge (anticheat dropping
+packets server-side, a block destroyed mid-tune and respawned elsewhere, persistent lag)
+cycles `TUNING ↔ VERIFYING` forever. The GUI shows "Retrying N mismatched blocks..."
+indefinitely with no way out short of closing the screen.
+
+**Fix:**
+- Add `private var retryCount: Int = 0` and `private val maxRetries = 3` (or make it a
+  constructor parameter, defaulting to 3, for testability).
+- Reset `retryCount = 0` in `start()`.
+- In `tickVerifying()`'s mismatch branch, increment `retryCount` before retrying; if
+  `retryCount > maxRetries`, set `state = TunerState.FAILED` instead of looping back to
+  `TUNING`, and report exactly which `target.pos`s never converged in the `onProgress`
+  message (the `mismatches` list is already built — just don't discard it on the final
+  failure).
+
+**Verify:** construct a `NoteBlockTuner` in a unit test (or manually, via a fake
+`worldNoteReader` that never returns the target note for one specific `pos`) and confirm
+it reaches `FAILED` after exactly `maxRetries + 1` verification attempts, not before and
+not never.
+
+---
+
+## Tier 2 — Dead/duplicate code (resolve before adding new features on top of either path)
+
+### 2.1 Two competing instrument-fallback systems exist; only one is wired in
+
+**Files:** `client/midi/FallbackMapper.kt` (unwired), `main/organ/InstrumentShifter.kt` +
+`main/organ/MidiToOrganMapper.kt` (wired, used by `MainScreen.startTuning()`)
+
+`FallbackMapper.plan()` has zero callers anywhere in the codebase — confirmed by grep
+across every `.kt` file. It implements its own ladder-walk instrument-shift + octave-clamp
+logic (`PITCH_LADDER`, `instrumentShift()`, `octaveClamp()`), which overlaps but does not
+match `InstrumentShifter`'s native-match → instrument-shift → octave-shift logic (already
+wired into `buildAssignment()` in `MidiToOrganMapper.kt`).
+
+**Decision needed before coding:** pick one. Recommendation: keep `InstrumentShifter` +
+`MidiToOrganMapper` (already integrated, already handles the `NotePitch`
+instrument-keying from the last refactor) and delete `FallbackMapper.kt` entirely, along
+with `RemappedNoteEvent`/`FallbackPlan` if nothing else references them (re-grep before
+deleting — `ARCHITECTURE.md` claims the GUI uses `FallbackPlan` for a warning display, but
+that claim should be verified against actual `MainScreen.kt` usage, not assumed; if no
+real GUI usage exists, it's safe to delete).
+
+**If you instead decide `FallbackMapper`'s pitch-ladder approach is better** (it does have
+one real advantage: it operates on whatever's *actually present* in the organ rather than
+walking instrument ranges abstractly), then the task inverts: wire `FallbackMapper.plan()`
+into `MainScreen.startTuning()` in place of the `InstrumentShifter` calls, and remove
+`InstrumentShifter`/the shift logic in `MidiToOrganMapper` instead. Do not keep both.
+
+**Either way:** after removing one, re-run the full import/symbol cross-check (see
+"Verification methodology" below) since deleting a file changes what's importable.
+
+### 2.2 OrganReadinessChecker is built but never invoked
+
+**File:** `client/midi/OrganReadinessChecker.kt`, `client/gui/MainScreen.kt`
+
+Cross-references a loaded MIDI file's required `(instrument, midiNote)` pairs against
+`NoteBlockRegistry`. Zero callers. Currently the only way to discover coverage gaps is to
+run `startTuning()` and read the `unplayable` list it produces after the fact.
+
+**Fix:** call `OrganReadinessChecker` (check its actual current method signature first —
+don't assume it matches `ARCHITECTURE.md`'s description) from `MainScreen` right after a
+MIDI file is selected (in `selectFile()`, alongside the existing `MidiFilePlayer.load(file)`
+call), and surface the result as a chat message or a coverage line in the GUI — before the
+user clicks Tune, not after. This turns a post-hoc discovery into a pre-flight check.
+
+**Verify:** load a MIDI file that uses an instrument range your test organ doesn't cover;
+confirm the gap is reported immediately on file selection, not only after tuning.
+
+---
+
+## Tier 3 — Input handling
+
+### 3.1 Number keys 1-9 do not register while MainScreen is open
+
+**File:** `client/gui/MainScreen.kt`, `client/input/KeyboardInputHandler.kt`
+
+Root cause (verified by reading both files in full): `KeyboardInputHandler` relies on
+`KeyMapping.consumeClick()`, the polling mechanism for gameplay keybinds active when no GUI
+owns input focus. While `MainScreen` is open — required for these keys to be "active" per
+the class's own design — raw key events are first handled by `Screen`'s input pipeline.
+`MainScreen` currently overrides `mouseClicked` but **never overrides `keyPressed` at
+all**, so there is no code path through which a 1-9 press while the screen is open can
+register on the `KeyMapping`'s click-counter the way it would during ordinary gameplay.
+
+**Fix:**
+- Override `keyPressed(keyCode: Int, scanCode: Int, modifiers: Int): Boolean` directly in
+  `MainScreen` (check the exact current method signature against whatever Screen base
+  class this Minecraft version uses — do not assume the 1.20-era signature is identical;
+  this project is on 26.2).
+- Inside the override, check `keyCode` against `GLFW.GLFW_KEY_1` through
+  `GLFW.GLFW_KEY_9` (or whatever range `ConfigManager.config.keyMappings` actually
+  represents — re-read `KeyboardInputHandler.kt`'s current mapping comment for the
+  authoritative key→MIDI table before wiring this).
+- Call `ArpeggioScheduler.enqueue(NoteRequest(midiNote))` directly from the override,
+  matching what `KeyboardInputHandler.onTick()` currently does — you can either move that
+  logic into `MainScreen` entirely and delete the polling-based version in
+  `KeyboardInputHandler`, or keep `KeyboardInputHandler` as a shared helper function called
+  from both places. Prefer consolidating into one path to avoid double-handling if the
+  `KeyMapping`-based path turns out to fire in some circumstances after all.
+- Return `true` when a key was consumed so it doesn't also fall through to vanilla
+  hotbar-slot switching.
+
+**Verify:** open MainScreen, press 1-9, confirm chat messages and noteblock clicks fire —
+this was the original unresolved symptom from the start of this project's debugging
+history and has never actually been root-caused or fixed until this item.
+
+---
+
+## Tier 4 — Feature parity between MidiFilePlayer and NbsPlayer
+
+The two playback paths have drifted; NBS is missing capabilities MIDI has.
+
+### 4.1 NbsPlayer has no tick/progress getters
+
+**File:** `client/playback/NbsFileLoader.kt` (contains `object NbsPlayer` — it is not a
+separate file, despite what `ARCHITECTURE.md`'s "not yet implemented" list claims; verify
+this yourself by grepping for `object NbsPlayer` before doing anything else in this item,
+since trusting the stale doc here would send you looking for a nonexistent file).
+
+`MidiFilePlayer` exposes `getCurrentTick()`/`getTotalTicks()`; `NbsPlayer` has neither.
+
+**Fix:** add `currentTick`/`totalTick` tracking to `NbsPlayer`, mirroring
+`MidiFilePlayer`'s pattern — a private var updated inside the playback loop each time a
+tick's notes are dispatched, plus public getters. `NbsFile.notes.last().tick` (need to
+confirm this is sorted — check `NbsFileLoader.load()`'s actual note-ordering guarantee
+before relying on `.last()`) gives total ticks.
+
+### 4.2 NbsPlayer's tempo multiplier is captured once at play() start, not read live
+
+**File:** `client/playback/NbsFileLoader.kt`
+
+`tickDurationMs` is computed once in `play()` from the `tempoMultiplier` parameter and
+baked into `targetMs = startWallMs + tick * tickDurationMs` for the rest of playback.
+`MidiFilePlayer` recomputes its scaled timing fresh per event
+(`tickToScaledMs(..., tempoMultiplier)` inside the loop), so its tempo slider has live
+effect; NBS's does not.
+
+**Fix:** restructure the wait loop to recompute the target time per-tick from a live
+tempo value (read `MidiFilePlayer.tempoMultiplier` fresh, the same shared value
+`MainScreen` already passes in, rather than the captured parameter) rather than baking a
+fixed `tickDurationMs` once. Match `MidiFilePlayer`'s approach precisely so both players
+behave identically under a live tempo change — read its actual current loop structure
+first since this plan's earlier description of it may not reflect later edits.
+
+### 4.3 PlaybackHud doesn't know NbsPlayer exists
+
+**File:** `client/gui/PlaybackHud.kt`
+
+`render()` only checks `MidiFilePlayer.isActive()`/`isPaused`. During NBS playback it
+always falls through to the idle branch. This is the same class of bug already fixed in
+`MainScreen`'s in-GUI status bar (check that fix's exact branching logic in `MainScreen.kt`
+and mirror it here) — but `PlaybackHud` is a separate render path and was never updated.
+
+**Fix:** add `NbsPlayer.isPlaying`/`isPaused` branches matching the pattern already used
+in `MainScreen`, plus (once 4.1 is done) NBS tick/total display analogous to the existing
+MIDI tick display.
+
+**Do 4.1 before 4.3** — 4.3 needs the getters from 4.1 to show real progress, not just a
+playing/paused state.
+
+---
+
+## Tier 5 — Robustness
+
+### 5.1 LittleEndianReader has no EOF handling
+
+**File:** `main/util/LittleEndianReader.kt`
+
+`DataInputStream.read()` returns `-1` at end-of-stream. `readLEShort()`/`readLEInt()`
+don't check for it — a truncated/corrupted `.nbs` file silently produces garbage
+tick/key/instrument values baked from `-1` bytes instead of failing cleanly.
+
+**Fix:** after each `read()` call, check for `-1` and throw
+`java.io.EOFException("Unexpected end of NBS file while reading ...")` with a description
+of what was being read (tick, key, instrument byte, etc. — be specific per call site, not
+one generic message) rather than letting `-1` flow into the bit-shift math. Confirm
+`NbsFileLoader.load()`'s caller in `MainScreen.kt` already wraps the load call in
+something that surfaces an exception as a chat warning rather than crashing the GUI — if
+it doesn't, add a `try/catch` there too so a bad file produces a clear in-game message
+instead of a silent failure or an unhandled crash.
+
+### 5.2 OrganScanner cost scales as O(r³), runs on the client thread, on a timer, even during playback
+
+**File:** `client/organ/OrganScanner.kt`, `client/gui/MainScreen.kt`
+
+`scan()` is a triple-nested loop over `(2r+1)³` blocks (up to 9261 at the documented max
+radius 10), each iteration calling `world.getBlockState()` twice. Runs synchronously on
+the client thread. `MainScreen` triggers it automatically every
+`autoRescanIntervalSeconds` (default 3s, per current `BlockBardConfig.kt` — verify this
+default hasn't changed), including while a song is playing.
+
+**Fix (pick at least one, b is cheapest and highest-value):**
+- (a) Replace the cube iteration with a sphere check (`if (x*x + y*y + z*z > r*r) continue`)
+  — cuts roughly 48% of iterations at radius 5+ for free.
+- (b) Skip the automatic rescan entirely while `MidiFilePlayer.isActive()` or
+  `NbsPlayer.isPlaying` or a `NoteBlockTuner` is active — re-scanning while actively
+  playing or tuning serves no purpose and is the worst time to spend client-thread budget.
+  Check `MainScreen`'s tick method for where the auto-rescan timer fires and add this
+  guard there.
+- (c) Raise the default `autoRescanIntervalSeconds` or convert it to "only auto-rescan when
+  idle and the screen has been open more than N seconds," reserving manual rescans (the
+  Scan button) for the rest.
+
+Implement (b) at minimum — it's a small, low-risk change with a clear, immediate benefit
+and no behavioral downside (there's never a good reason to rescan mid-playback).
+
+### 5.3 Config silently swallows parse errors
+
+**File:** `client/config/BlockBardConfig.kt`
+
+`ConfigManager.load()`'s `catch (_: Exception)` discards the actual exception and resets
+to defaults with no log line. A malformed `config.json` gives zero indication of why
+settings reverted.
+
+**Fix:** change to `catch (e: Exception) { logger.warn("Config parse failed, resetting to defaults: ${e.message}", e); ... }`
+— add a `private val logger` if one doesn't already exist in this object (check current
+state; `ARCHITECTURE.md` doesn't mention one).
+
+### 5.4 Rotation/anticheat tunables are hardcoded, unlike every comparable config value
+
+**Files:** `client/player/PlayerController.kt` (`MAX_ROTATION_DEGREES_PER_TICK`,
+`ROTATION_CONVERGENCE_THRESHOLD_DEGREES`), `main/organ/ArpeggioScheduler.kt`
+(`rotationInProgressTimeoutMs`)
+
+Every other comparable tunable (`arpeggioStaleTimeoutMs`, `scanRadius`, `maxOctaveShift`)
+is config-driven, set at init in `BlockBardClient.onInitializeClient()`. These three
+constants control anticheat-compatibility behavior directly — exactly the kind of value
+that needs per-server tuning — but are hardcoded.
+
+**Fix:** add corresponding fields to `BlockBardConfig` with the current hardcoded values
+as defaults, and wire them in `BlockBardClient.onInitializeClient()` the same way
+`arpeggioStaleTimeoutMs` already is. Check `PlayerController.kt`'s current declaration
+style (`const val` vs `var`) — moving from `const val` to a settable `var` is required for
+this to be configurable at runtime, so this touches the declaration, not just the value.
+
+---
+
+## Tier 6 — Documentation debt (do last, once the above is stable)
+
+### 6.1 ARCHITECTURE.md is stale and actively misleading on several points
+
+Specific confirmed contradictions with current code (verify each yourself before fixing,
+since the actual code may have moved again by the time you read this):
+
+- Claims `OrganAssignment.assignment: Map<Int, BlockPos>` — actual current type uses a
+  `NotePitch` key (instrument-aware), not bare `Int`.
+- Claims `ArpeggioScheduler.interactDelegate: ((BlockPos) -> Unit)?` — actual signature
+  returns `Boolean`, and there's also a `rotationConvergedDelegate` that gates dispatch,
+  entirely unmentioned.
+- Describes `PlayerController.interactWith` as a simple rotate-then-click with no mention
+  of the multi-tick rotation-easing/convergence mechanism — the single most significant
+  behavioral mechanism in the player-control subsystem, completely undocumented.
+- Describes `MidiFilePlayer` as instrument-unaware (`List<TimedNoteEvent>` with no
+  instrument field) — it now resolves instrument per event via `MidiChannelResolver`.
+- **Explicitly lists `NbsPlayer` under "Not Yet Implemented"** — `NbsPlayer` exists, is
+  fully wired into `MainScreen`, and is one of the two primary playback paths. This is the
+  most actively misleading line in the doc and should be fixed first within this item.
+- Claims config persists "via Cloth Config / AutoConfig" — actual implementation is plain
+  Gson serialization with no Cloth Config dependency visible in `BlockBardConfig.kt`.
+- States MC version 1.21.1 with Yarn mappings — actual `gradle.properties` targets 26.2
+  with no mapping layer (unobfuscated Mojang names natively, per this Minecraft version's
+  own packaging).
+
+**Fix:** rewrite the affected sections rather than patch individual lines — given the
+volume of drift, a full pass re-reading every current source file and rewriting the
+corresponding `ARCHITECTURE.md` section is more reliable than line-editing a doc that's
+already proven to drift silently. Add a line at the top noting the doc's last-verified
+state (date or commit) so future readers can judge staleness risk themselves.
+
+### 6.2 BLOCKBARD_PLAN.md is the pre-implementation design doc, not a living spec
+
+Not inaccurate exactly, but easy to mistake for current-state documentation since nothing
+in the doc itself flags it as historical. Confirm with whoever maintains this repo whether
+it should be archived (e.g. moved to `docs/history/` or prefixed `[HISTORICAL]`) now that
+`ARCHITECTURE.md` exists as the "what's actually built" reference, to prevent the same
+confusion that affected this plan's own research phase.
+
+---
+
+## Verification methodology (apply to every item above)
+
+This codebase has hit the same class of mistake twice already in its history: an edit
+that looks correct in isolation but breaks at compile time because a type or import
+wasn't checked against its actual current cross-file usage. Before considering any item
+above complete:
+
+1. **Re-read the actual current file** — not this plan's description of it — immediately
+   before editing. Multiple edits may have landed between when this plan was written and
+   when you act on it.
+2. **Grep for every other usage of anything you change** — a changed type, removed
+   function, or renamed field needs every call site checked, not just the one you're
+   editing. `grep -rn "SymbolName" src --include="*.kt"` across the whole `src/` tree, not
+   just the file you're touching.
+3. **Check imports explicitly** — adding a call to a new extension function or top-level
+   symbol from another package requires an explicit import unless it's same-package or
+   covered by an existing wildcard import already present in that exact file. Don't assume.
+4. **If you have actual Gradle/JDK access (unlike the environment this plan was written
+   in), run `./gradlew compileKotlin compileClientKotlin` after every item**, not just at
+   the end — catching one compile error at a time is dramatically cheaper than untangling
+   several at once.
+
+---
+
+## Doc trust calibration
+
+| Doc | Trust for | Don't trust for |
+|---|---|---|
+| Actual `.kt` source files | Everything — always the ground truth | — |
+| `CLAUDE.md` | Process rules (verify APIs, no guessing, concise output) | Project specifics (it has none) |
+| `ARCHITECTURE.md` | Rough orientation, source tree layout, package boundaries | Specific type signatures, NbsPlayer's existence, config mechanism, MC version |
+| `BLOCKBARD_PLAN.md` | Original design intent, instrument reference tables (verify against `NoteUtils.kt` before trusting numbers) | Current implementation state — this is a pre-build plan, not a status doc |
+| `README.md` | Not yet reviewed in this pass — check before relying on it | Unknown until reviewed |
+</file>
 
 <file path=".github/workflows/build.yml">
 name: Build BlockBard
@@ -1420,7 +1802,14 @@ replay_*.log
 # BlockBard — Architecture Reference
 
 Quick-parse guide for engineers (and AI sessions) coming in cold.
-Covers what exists in the repo today, not what `BLOCKBARD_PLAN.md` describes as future intent.
+Covers what exists in the repo today, not what `BLOCKBARD_PLAN.md` describes as original
+design intent — that doc predates most of what's actually built and should be treated as
+historical context, not a status reference.
+
+**Last verified against source:** full read of every `.kt` file, this pass. If you find
+a mismatch between this doc and the actual code, trust the code and fix this doc — that
+exact failure mode (doc drifting silently out of sync) is why the previous version of this
+file was rewritten.
 
 ---
 
@@ -1430,13 +1819,16 @@ Covers what exists in the repo today, not what `BLOCKBARD_PLAN.md` describes as 
 |---|---|
 | Mod name | BlockBard |
 | Loader | Fabric |
-| MC version | 1.21.1 (Yarn mappings 1.21.1+build.3) |
+| MC version | **26.2** (see `gradle.properties`) |
+| Mapping layer | **None** — Minecraft ships unobfuscated Mojang names from 26.1 onward; no Yarn/Intermediary step needed |
 | Language | Kotlin |
 | Entry point | `BlockBardClient : ClientModInitializer` |
 | Mod ID | `blockbard` |
 | Root package | `kyrielie.blockbard` |
 
-**Client-only.** No server-side code, no mixins touching network packets. Every noteblock interaction goes through vanilla `InteractionManager.interactBlock(...)`.
+**Client-only.** No server-side code, no mixins touching network packets. Every noteblock
+interaction goes through `PlayerController.interactWith()`, which wraps the client's
+normal block-interaction call — there is no packet manipulation.
 
 ---
 
@@ -1447,44 +1839,50 @@ src/
   client/kotlin/kyrielie/blockbard/client/
     BlockBardClient.kt          ← ClientModInitializer; wires all subsystems together
     config/
-      BlockBardConfig.kt        ← config data class + ConfigManager
+      BlockBardConfig.kt        ← config data class + ConfigManager (plain Gson — see Config section)
     gui/
-      MainScreen.kt             ← primary GUI (file picker, organ overlay, controls)
-      PlaybackHud.kt            ← HudRenderCallback overlay + mini controls
+      MainScreen.kt             ← primary GUI (file picker, organ overlay, controls, tuning, playback)
+      PlaybackHud.kt            ← HUD overlay via HudElementRegistry (not HudRenderCallback — see note below)
       BlockBardModMenuIntegration.kt
     input/
-      KeyboardInputHandler.kt   ← keys 1–9 → NoteRequest
-      MidiInputHandler.kt       ← javax.sound.midi device → NoteRequest
-    midi/
-      FallbackMapper.kt         ← RemappedNoteEvent + FallbackPlan data classes
-      MidiChannelResolver.kt
-      MidiInstrumentMap.kt
-      OrganReadinessChecker.kt
+      KeyboardInputHandler.kt   ← keys 1–9 → NoteRequest (currently non-functional while MainScreen is open — see Known Issues)
+      MidiInputHandler.kt       ← javax.sound.midi device → NoteRequest (runs on a foreign thread — see Known Issues)
+    midi/                       ← package declared as kyrielie.blockbard.midi, NOT .client.midi (directory/package name mismatch, harmless but worth knowing when searching)
+      FallbackMapper.kt         ← RemappedNoteEvent + FallbackPlan — DEAD CODE, zero callers anywhere (see Known Issues)
+      MidiChannelResolver.kt    ← resolves each MIDI NOTE_ON to a NoteBlockInstrument via per-channel GM program tracking
+      MidiInstrumentMap.kt      ← GM program (0-127) + percussion → NoteBlockInstrument table
+      OrganReadinessChecker.kt  ← coverage check (MIDI requirements vs. NoteBlockRegistry) — built, currently never called
     organ/
       OrganScanner.kt           ← world scan → NoteBlockRegistry.update()
     playback/
-      MidiFilePlayer.kt         ← javax.sound.midi load + timed event dispatch
-      NbsFileLoader.kt          ← .nbs binary parser
+      MidiFilePlayer.kt         ← loads .mid via MidiChannelResolver, timed dispatch via ArpeggioScheduler
+      NbsFileLoader.kt          ← .nbs binary parser AND NbsPlayer (object NbsPlayer lives in this same file)
     player/
-      PlayerController.kt       ← rotate/micro-step/interactBlock
+      PlayerController.kt       ← eased rotation + interactWith; see "Rotation & Anti-Cheat Compatibility" below
 
   main/kotlin/kyrielie/blockbard/
     organ/
-      ArpeggioScheduler.kt      ← tick queue; one note per tick
-      InstrumentShifter.kt      ← ShiftMode resolution (EXACT/INSTRUMENT/OCTAVE/BEST_EFFORT)
-      MidiToOrganMapper.kt      ← MIDI note → BlockPos assignment
+      ArpeggioScheduler.kt      ← tick queue; dispatches one note per tick once rotation has converged
+      InstrumentShifter.kt      ← ShiftMode resolution (EXACT_ONLY/INSTRUMENT_SHIFT/OCTAVE_SHIFT/BEST_EFFORT)
+      MidiToOrganMapper.kt      ← (midiNote, instrument) → BlockPos assignment; defines NotePitch
       MobHeadBlocks.kt          ← MOB_HEAD_BLOCKS constant set
       NoteBlockEntry.kt         ← data class (pos, instrument, noteIndex, midiNote, status)
       NoteBlockRegistry.kt      ← singleton Map<BlockPos, NoteBlockEntry>
-      NoteBlockTuner.kt         ← TuneTarget data class + click-count math
-      OrganMap.kt               ← Map<BlockPos, ReachInfo> built by PlayerController
+      NoteBlockTuner.kt         ← TuneTarget + stateful tuning state machine (TUNING/VERIFYING/DONE/FAILED)
+      OrganMap.kt               ← Map<BlockPos, ReachInfo> built by PlayerController.centerOnOrgan()
     util/
-      LittleEndianReader.kt     ← DataInputStream extensions for NBS parsing
-      NoteUtils.kt              ← midiBase per instrument, noteIndex↔MIDI conversions
-      VecMath.kt                ← yaw/pitch helpers
+      LittleEndianReader.kt     ← DataInputStream extensions for NBS parsing (no EOF checking — see Known Issues)
+      NoteUtils.kt              ← midiBase per instrument, noteIndex↔MIDI conversions, clicksNeeded
+      VecMath.kt                ← vecToYawPitch (direction vector → yaw/pitch degrees)
 ```
 
-**Package split note:** `organ/` and `util/` live under `src/main/` (shared/common). Everything under `src/client/` is client-only. There is no server-side source root.
+**Package split note:** `organ/` and `util/` live under `src/main/` (shared/common, would
+also be visible to a dedicated server if this mod ever gained one). Everything under
+`src/client/` is client-only and cannot be referenced from `src/main/` code — this
+boundary has caused real compile errors in the past when a type needed by both sides
+(`NotePitch`, `NoteBlockInstrument`-keyed assignment) was initially placed on the wrong
+side of the split. If you need a type usable from both `ArpeggioScheduler` (main) and
+`MidiFilePlayer` (client), it must live under `src/main/`.
 
 ---
 
@@ -1492,43 +1890,100 @@ src/
 
 ```
 OrganScanner.scan()
-      │  iterates blocks within scanRadius, reads BlockState
+      │  O(r³) cube iteration around the player, reads BlockState — see Known Issues
       ▼
 NoteBlockRegistry        (singleton, Map<BlockPos, NoteBlockEntry>)
       │
-      ├── queried by MidiToOrganMapper.buildAssignment()
-      │         │
-      │         │  also consults InstrumentShifter for notes
-      │         │  with no exact-match block
+      ├── queried by MidiToOrganMapper.buildAssignment(noteUsageCounts, reachableBlocks)
+      │         │  noteUsageCounts: Map<NotePitch, Int> — NotePitch(midiNote, instrument?)
+      │         │  native-match preferred by fewest tuning clicks (not just distance),
+      │         │  then InstrumentShifter for notes with no exact-instrument match
       │         ▼
-      │   OrganAssignment  { assignment: Map<Int,BlockPos>, unplayable, shifts }
-      │         │
-      │         ▼
-      │   MidiToOrganMapper.computeTuneTargets()
+      │   OrganAssignment { assignment: Map<NotePitch, BlockPos>, unplayable: List<NotePitch>, shifts: Map<NotePitch, Int> }
       │         │
       │         ▼
-      │   List<TuneTarget>  { pos, currentNote, targetNote, instrument }
+      │   MidiToOrganMapper.computeTuneTargets(assignment, reachableBlocks)
       │         │
       │         ▼
-      │   NoteBlockTuner  (calls PlayerController.interactWith per click)
+      │   List<TuneTarget> { pos, snapshotNote, targetNote, instrument }
+      │         │
+      │         ▼
+      │   NoteBlockTuner (TUNING → VERIFYING → DONE/FAILED state machine; calls PlayerController.interactWith per click)
       │
-      └── queried at playback time by ArpeggioScheduler
-                │  via interactDelegate: (BlockPos) -> Unit
-                │
+      └── ArpeggioScheduler.assignment = result.assignment   ← wired by MainScreen.startTuning()
+                │  consulted at playback time by ArpeggioScheduler.resolvePos()
+                │  fallback chain: resolvedPos → assignment[exact NotePitch] → assignment[pitch-only NotePitch] → NoteBlockRegistry.findBestFor() live lookup
+                ▼
+          ArpeggioScheduler.onTick()  (END_CLIENT_TICK)
+                │  only dispatches once PlayerController.rotationConverged(pos) is true
                 ▼
           PlayerController.interactWith(pos)
-                │  rotates player, calls InteractionManager.interactBlock()
+                │  re-snaps to final rotation (already within ~2° by this point), then interacts
 ```
 
 **MIDI file → timed events:**
 
 ```
 MidiFilePlayer.load(file)
-      │  javax.sound.midi.MidiSystem.getSequence()
-      │  extracts NOTE_ON events → List<TimedNoteEvent>
+      │  reads tempo via raw MetaMessage scan (0x51)
+      │  reads notes via MidiChannelResolver.resolve(file) — re-parses the file independently
+      │  for instrument resolution (tracks PROGRAM_CHANGE per channel; channel 10 = percussion)
       ▼
-ArpeggioScheduler.enqueue(NoteRequest)   ← called per-tick during playback
+List<TimedNoteEvent>(tick, midiNote, instrument)   ← instrument is non-null, always resolved
+      │
+      ▼  (on play(), per scheduled tick)
+ArpeggioScheduler.enqueue(NoteRequest(midiNote, instrument = event.instrument))
 ```
+
+**NBS file → timed events:**
+
+```
+NbsFileLoader.load(file)
+      │  binary parse via LittleEndianReader; version-gated fields (velocity/panning/pitch only on version >= 4 — verified correct against the NBS spec)
+      ▼
+NbsFile { notes: List<NbsNote>, tempo, title, ... }
+      │
+      ▼  (NbsPlayer.play(), per scheduled tick)
+nbsInstrumentToBlock(note.instrument)   ← 16-entry NBS instrument byte table → NoteBlockInstrument?
+      │  null for custom (index >= 16) instruments — falls back to pitch-only matching
+      ▼
+ArpeggioScheduler.enqueue(NoteRequest(note.key + 21, instrument = resolvedInstrument))
+```
+
+Both playback paths converge on the same `ArpeggioScheduler`/`NoteRequest` pipeline — see
+Key Types below for `NoteRequest`'s exact fields.
+
+---
+
+## Rotation & Anti-Cheat Compatibility
+
+This is the single most important behavioral mechanism in the player-control subsystem
+and is not obvious from the type signatures alone, so it gets its own section.
+
+`PlayerController.primeRotation(pos)` does **not** snap yaw/pitch instantly to a target.
+It eases toward it at a capped rate (`MAX_ROTATION_DEGREES_PER_TICK`, currently `35f`
+degrees/tick, a `const val`) because many anti-cheat plugins flag large single-tick
+rotation deltas as a "rotation hack" signature and will silently drop the following
+use-item packet — even though the rotation packet itself is accepted and renders
+correctly on the client, which makes the bug look like "the player visibly turns to face
+the block but the click does nothing," with no client-side error to point at the cause.
+
+`PlayerController.rotationConverged(pos)` reports once the eased rotation is within
+`ROTATION_CONVERGENCE_THRESHOLD_DEGREES` (currently `2f`, also `const val`) of the target.
+`ArpeggioScheduler.onTick()` will not dispatch the actual interaction
+(`interactDelegate`) until `rotationConvergedDelegate` confirms convergence — this is
+wired via two separate function-reference delegates set in
+`BlockBardClient.onInitializeClient()`, not a direct call, so a unit test or alternate
+client entrypoint could substitute different rotation logic without `ArpeggioScheduler`
+needing to know about `PlayerController` directly (required by the `main`/`client` source
+split — `ArpeggioScheduler` lives in `main` and cannot import client-only classes).
+
+A large turn (observed up to ~178° yaw in real testing) can take several ticks to
+converge. `ArpeggioScheduler.staleTimeoutMs` (default 200ms) does **not** apply to a note
+once it has become the head of the queue and started converging — only to notes still
+waiting behind it. A separate `rotationInProgressTimeoutMs` (1500ms, a `var` — already
+config-wireable, just not yet wired) caps a genuinely stuck rotation (e.g. overridden by
+something else) so the queue can't deadlock on one note forever.
 
 ---
 
@@ -1552,158 +2007,300 @@ data class NoteBlockEntry(
 enum class NoteBlockStatus { PLAYABLE, SILENCED, MOB_HEAD }
 ```
 - `SILENCED`: non-air, non-mob-head block directly above the noteblock
-- `MOB_HEAD`: mob skull above — plays fixed ambient sound, not a musical note
+- `MOB_HEAD`: floor-mounted mob skull above (see `MobHeadBlocks.kt` for the exact set —
+  wall-mounted variants are intentionally excluded) — plays a fixed ambient sound, not a
+  musical note
+
+### `NotePitch` (defined in `MidiToOrganMapper.kt`, package `kyrielie.blockbard.organ`)
+```kotlin
+data class NotePitch(val midiNote: Int, val instrument: NoteBlockInstrument? = null)
+fun NotePitch.displayName(): String  // e.g. "C4 (BELL)", or "C4" if instrument is null
+```
+The instrument-aware key used throughout the assignment/scheduling pipeline.
+`instrument = null` means "any instrument at this pitch is acceptable" — used by callers
+with no instrument source (keyboard 1-9 presses, the chromatic-scale test). This exists
+because a pitch-only key would let two notes at the same pitch but different instruments
+(e.g. a harp note and a bell note at the same MIDI value) collide on one assignment slot,
+silently picking whichever instrument happened to be assigned first.
+
+There is a second, structurally near-identical type, `MidiNoteRequirement(instrument: NoteBlockInstrument, midiNote: Int)`
+in `OrganReadinessChecker.kt` (package `kyrielie.blockbard.midi`, client-only). It cannot
+currently be unified with `NotePitch` without moving `OrganReadinessChecker` into the
+`main` source set, since `NotePitch` must stay in `main` for `ArpeggioScheduler` to use
+it. Known duplication, not yet resolved — see `BLOCKBARD_ENGINEERING_PLAN.md`.
+
+### `NoteRequest` (in `ArpeggioScheduler.kt`)
+```kotlin
+data class NoteRequest(
+    val midiNote: Int,
+    val instrument: NoteBlockInstrument? = null,
+    val enqueuedAtMs: Long = System.currentTimeMillis(),
+    val resolvedPos: BlockPos? = null   // bypasses assignment lookup entirely when set
+)
+```
+`resolvedPos` is used by the chromatic-scale test and any caller that already knows
+exactly which block to hit, skipping the `assignment`/`NoteBlockRegistry` lookup chain.
 
 ### `OrganAssignment`
 ```kotlin
 data class OrganAssignment(
-    val assignment: Map<Int, BlockPos>,  // midiNote → pos
-    val unplayable: List<Int>,
-    val shifts: Map<Int, Int>            // midiNote → semitone shift applied
+    val assignment: Map<NotePitch, BlockPos>,
+    val unplayable: List<NotePitch>,
+    val shifts: Map<NotePitch, Int>     // semitone shift applied per note, 0 if native match
 )
 ```
+**Not** `Map<Int, BlockPos>` — this was the type before the instrument-threading work;
+every consumer (`ArpeggioScheduler.assignment`, `MainScreen`'s coverage display) must
+agree on `NotePitch` as the key or the project will not compile. This exact mismatch has
+caused a real build failure once already (`ArpeggioScheduler.assignment` was declared with
+a separate `Pair<Int, NoteBlockInstrument?>` key type during the same refactor that
+introduced `NotePitch`, before being reconciled) — if you see a `Pair<Int, ...>` key
+anywhere related to note assignment, it's very likely a stale leftover and should be
+converted to `NotePitch`.
 
 ### `ShiftMode`
 ```kotlin
 enum class ShiftMode { EXACT_ONLY, INSTRUMENT_SHIFT, OCTAVE_SHIFT, BEST_EFFORT }
 ```
-Default: `BEST_EFFORT` (instrument shift first, octave shift fallback).
+Default: `BEST_EFFORT` (instrument shift first, octave shift fallback). Resolved via
+`InstrumentShifter.findBest(midiNote, candidates)`. Note: when `MidiToOrganMapper` calls
+this with a candidate list already filtered to one specific instrument (because the note
+specified an instrument), `findBest`'s internal instrument-shift step becomes a
+structural no-op — only its octave-shift step can find anything new in that case, since
+every candidate already shares the same instrument. This is intentional (switching
+instruments away from what a note explicitly specified would defeat the point), not a bug.
 
 ### `ReachInfo` / `OrganMap`
 ```kotlin
 data class ReachInfo(val isReachable: Boolean, val yaw: Float, val pitch: Float, val distance: Double)
-
 class OrganMap(val standPos: BlockPos, private val reachMap: Map<BlockPos, ReachInfo>)
 ```
-Built once by `PlayerController.centerOnOrgan()`. Pre-computed facing angles used during playback to avoid per-tick recalculation.
-
----
-
-## Instrument MIDI Bases
-
-From `NoteUtils.kt` — the `NoteBlockInstrument.midiBase` extension:
-
-| midiBase | Instruments |
-|---|---|
-| 30 (F♯1) | BASS, DIDGERIDOO |
-| 42 (F♯2) | GUITAR, TRUMPET_WEATHERED, TRUMPET_OXIDIZED |
-| 54 (F♯3) | HARP, BASS_DRUM, SNARE, HAT, BANJO, COW_BELL, BIT, IRON_XYLOPHONE, PLING, TRUMPET, TRUMPET_EXPOSED |
-| 66 (F♯4) | FLUTE |
-| 78 (F♯5) | BELL, CHIME, XYLOPHONE |
-
-Formula: `midiNote = instrument.midiBase + noteIndex` (noteIndex 0–24).
+Built once by `PlayerController.centerOnOrgan()`. Pre-computed facing angles, consulted by
+`primeRotation`/`interactWith` to avoid recomputing yaw/pitch from scratch every tick —
+falls back to live `vecToYawPitch()` computation for any position not in the map (e.g.
+stale map after blocks moved, or map never built this session).
 
 ---
 
 ## Subsystem Summaries
 
 ### `OrganScanner` (client)
-Iterates a cube of `scanRadius` (default 5, max 10) blocks around the player on demand. Calls `NoteBlockRegistry.update(found)`. Also checks for instrument overflow (>25 blocks of one instrument) and emits chat warnings. Triggered from `MainScreen` button or on-tick rescan.
+Iterates a cube of `scanRadius` (default 5, max 10 per config) blocks around the player.
+**O((2r+1)³)** — up to 9261 block-state reads at max radius, run synchronously on the
+client thread. Calls `NoteBlockRegistry.update(found)`. Also checks for instrument
+overflow (>25 blocks of one instrument) and emits chat warnings. Triggered from
+`MainScreen`'s Scan button or an automatic timer (`autoRescanIntervalSeconds`, default 3s)
+that currently runs unconditionally — including during active playback or tuning, which
+is wasted client-thread work with no benefit (see Known Issues).
 
 ### `NoteBlockRegistry` (main, singleton)
 Authoritative in-memory store. Key query methods:
-- `findBestForMidi(midiNote)` — closest PLAYABLE exact match
-- `allPlayableMidiNotes()` — used by GUI to grey unavailable keys
-- `updateTunedNote(pos, newNoteIndex)` — called by tuner after each click
+- `findBestForMidi(midiNote)` — closest PLAYABLE block at that exact pitch, any instrument
+- `findBestFor(midiNote, instrument)` — prefers exact instrument match, falls back to
+  `findBestForMidi` if no instrument match exists or `instrument` is null
+- `updateTunedNote(pos, newNoteIndex)` — called by the tuner after each confirmed click
 
 ### `MidiToOrganMapper` (main)
 Two-phase:
-1. `buildAssignment(midiNoteUsageCounts, reachableBlocks)` — assigns most-used notes first; native-range blocks preferred, `InstrumentShifter` for remainder.
-2. `computeTuneTargets(assignment, reachableBlocks)` — converts assignment to per-block click counts. Drops (with warning) any effective MIDI note outside the instrument's 0–24 range.
+1. `buildAssignment(noteUsageCounts: Map<NotePitch, Int>, reachableBlocks)` — assigns
+   most-used notes first; among candidates whose instrument natively covers the note,
+   prefers the one needing the *fewest tuning clicks* (not just nearest distance) so
+   re-running assignment after a song change or rescan doesn't gratuitously reassign an
+   already-correctly-tuned block. Falls back to `InstrumentShifter` for notes with no
+   native match.
+2. `computeTuneTargets(assignment, reachableBlocks)` — converts assignment to per-block
+   `TuneTarget`s. Drops (with a warning, not silently) any effective MIDI note that falls
+   outside the assigned instrument's 0–24 range after a shift is applied.
 
 ### `InstrumentShifter` (main, singleton)
-Stateful: `mode` and `maxOctaveShift` set at init from config. `findBest(midiNote, candidates)` dispatches by `ShiftMode`. Instrument shift checks `instrument.coversNatively(midiNote)` (range check); octave shift tries ±12/±24 semitones.
+Stateful: `mode` and `maxOctaveShift` set at init from config. `findBest(midiNote, candidates)`
+dispatches by `ShiftMode`. Instrument shift checks `instrument.coversNatively(midiNote)`
+(range check) and, among multiple covering candidates, prefers fewest tuning clicks
+(same fix as `MidiToOrganMapper`'s native-match step, for consistency). Octave shift tries
+±12/±24 semitones depending on `maxOctaveShift`.
 
 ### `ArpeggioScheduler` (main, singleton)
-Tick-driven queue (`ArrayDeque<NoteRequest>`). Called every tick from `BlockBardClient`'s `ClientTickEvents.END_CLIENT_TICK`. Drops stale entries (>`staleTimeoutMs`, default from config). Delegates actual interaction via `interactDelegate: ((BlockPos) -> Unit)?` — set to `PlayerController::interactWith` at init.
+Tick-driven queue (`kotlin.collections.ArrayDeque<NoteRequest>` — **not thread-safe**, see
+Known Issues). Called every tick from `BlockBardClient`'s `ClientTickEvents.END_CLIENT_TICK`.
+Only dispatches the head of the queue once `rotationConvergedDelegate` confirms the player
+has finished turning toward it (see Rotation section above). `staleTimeoutMs` prunes
+backlog sitting behind an in-progress head note; `rotationInProgressTimeoutMs` caps a
+stuck head note. Delegates the actual interaction via `interactDelegate: ((BlockPos) -> Boolean)?`
+— wired to `PlayerController::interactWith` at init, **not** `Unit`-returning; the boolean
+result is logged and used to detect a failed dispatch.
 
 ### `PlayerController` (client)
 Handles:
 - `centerOnOrgan(blocks)` — finds best stand position, builds `OrganMap`
-- `interactWith(pos)` — looks up `ReachInfo`, rotates player, calls `InteractionManager.interactBlock()`
-- Micro-step logic when a block falls outside 4.5-block reach
+- `primeRotation(pos)` — eases rotation toward target, called every tick a note is
+  pending (`START_CLIENT_TICK`, before the dispatch-gating tick)
+- `rotationConverged(pos)` — convergence query, consulted by `ArpeggioScheduler`
+- `interactWith(pos)` — looks up `ReachInfo` (or computes live), re-snaps to final
+  rotation, calls the actual block-interaction; returns `Boolean` success/failure
 
 ### `NoteBlockTuner` (main)
-`TuneTarget` carries `(pos, currentNote, targetNote, instrument)` plus `estimatedClicks = ((target - current) % 25 + 25) % 25`. Tuning is purely sequential right-clicks; only goes forward in the 0→24→0 cycle.
+Stateful (`TunerState`: `IDLE → TUNING → VERIFYING → DONE` or `FAILED`). Re-reads live
+world blockstate every tick for every target rather than trusting the scan-time snapshot;
+the snapshot (`TuneTarget.snapshotNote`) is only used for the initial click-count estimate.
+Skips blocks already at their target note (checked against live world state, not the
+snapshot). Token-bucket rate limiter (8 interacts / 310ms, matching Paper's server-side
+limit) and a verification phase that waits `ping*2 + 100ms` before declaring success.
+**On a verification mismatch it currently retries with no retry cap** — see Known Issues;
+a block that can never converge will cycle `TUNING ↔ VERIFYING` indefinitely.
 
 ### `MidiFilePlayer` (client)
-Loads `.mid` via `javax.sound.midi.MidiSystem`. Extracts `NOTE_ON` events (velocity > 0) into `List<TimedNoteEvent>`. Supports tempo scaling: `tickToScaledMs(tick, ticksPerBeat, usPerBeat, tempoMultiplier)`. Pause/resume by recording current tick position.
+Loads `.mid` files. Tempo read via a direct `MetaMessage` (0x51) scan; notes resolved via
+`MidiChannelResolver.resolve(file)`, which independently re-parses the file (a small
+deliberate duplicate parse, traded for keeping `MidiChannelResolver`'s signature
+self-contained). Every `TimedNoteEvent` carries a resolved `NoteBlockInstrument` —
+this is not optional/best-effort; channel 10 is always treated as percussion regardless of
+program, and any unset channel defaults to GM program 0 (piano → HARP). Tempo scaling is
+read live per-event during playback (`tickToScaledMs(..., tempoMultiplier)`), so changing
+the tempo slider has immediate effect on a song already playing.
 
-### `NbsFileLoader` (client)
-Parses `.nbs` binary format (little-endian) using `LittleEndianReader`. NBS key offset: add 21 to NBS key for MIDI note number. Tempo field is ticks-per-second × 100.
+### `NbsFileLoader` / `NbsPlayer` (client — same file)
+`NbsFileLoader` parses `.nbs` binary format via `LittleEndianReader`. Version-gated fields
+(velocity/panning/pitch, version ≥ 4) are correctly gated — verified against the published
+NBS spec. NBS key offset: `midiNote = note.key + 21`. Tempo field is ticks-per-second × 100
+(divide by 100.0 for real ticks/sec). `nbsInstrumentToBlock()` maps the 16 standard NBS
+instrument byte values (0-15) to `NoteBlockInstrument`; values ≥ 16 are custom
+(non-vanilla) instruments and resolve to `null`, falling back to pitch-only matching.
 
-### `FallbackMapper` / MIDI channel files (client/midi)
-`RemappedNoteEvent` and `FallbackPlan` support the GUI's fallback warning display when a MIDI channel's instrument has no exact noteblock coverage. `MidiChannelResolver` and `MidiInstrumentMap` handle channel-to-instrument mapping for MIDI file analysis. `OrganReadinessChecker` cross-references `NoteBlockRegistry` against a loaded MIDI file to produce readiness status before tuning.
+`NbsPlayer` is a **separate `object` in this same file**, not a distinct class — search
+here, not for a file named `NbsPlayer.kt`. Unlike `MidiFilePlayer`, its tempo multiplier
+is captured once at `play()` start and not re-read live during playback (see Known
+Issues), and it currently has no tick/progress getters equivalent to
+`MidiFilePlayer.getCurrentTick()`/`getTotalTicks()`.
+
+### `FallbackMapper` / MIDI channel files (client/midi, package `kyrielie.blockbard.midi`)
+`MidiChannelResolver` and `MidiInstrumentMap` are live and load-bearing — they're what
+`MidiFilePlayer` actually uses to resolve instrument per note (see above).
+`OrganReadinessChecker` is built and correct but has zero callers anywhere in the codebase
+— nothing currently invokes a pre-tuning coverage check. `FallbackMapper` (`RemappedNoteEvent`,
+`FallbackPlan`, its own `PITCH_LADDER` instrument-shift logic) is **entirely dead code** —
+confirmed by grep, zero callers anywhere, including no usage in `MainScreen`'s GUI despite
+what older documentation claimed. It implements an overlapping but different fallback
+strategy from `InstrumentShifter`/`MidiToOrganMapper`, which is the one actually wired in.
 
 ---
 
 ## Initialization Sequence (`BlockBardClient.onInitializeClient`)
 
-1. `ConfigManager.load()` — reads `config/blockbard/config.json`
-2. Applies config to `OrganScanner.scanRadius`, `InstrumentShifter.mode/maxOctaveShift`, `ArpeggioScheduler.staleTimeoutMs`
-3. Sets `ArpeggioScheduler.interactDelegate = { pos -> PlayerController.interactWith(pos) }`
+1. `ConfigManager.load()` — reads `config/blockbard/config.json` (plain Gson; a malformed
+   file is currently caught and silently reset to defaults with no log line — see Known
+   Issues)
+2. Applies config to `OrganScanner.scanRadius`, `InstrumentShifter.mode`/`maxOctaveShift`,
+   `ArpeggioScheduler.staleTimeoutMs`
+3. Wires two `ArpeggioScheduler` delegates: `interactDelegate = { pos -> PlayerController.interactWith(pos) }`
+   and `rotationConvergedDelegate = { pos -> PlayerController.rotationConverged(pos) }`
 4. Registers keybindings: `B` (open GUI), `H` (toggle HUD)
 5. `KeyboardInputHandler.register()`, `PlaybackHud.register()`
-6. `ClientTickEvents.END_CLIENT_TICK` — polls keybindings, calls `ArpeggioScheduler.onTick()`
-7. `MidiInputHandler.autoConnect()` — attempts to open saved MIDI device
+6. `ClientTickEvents.START_CLIENT_TICK` — primes rotation toward the next pending note
+   (`ArpeggioScheduler.peekNextPos()?.let { PlayerController.primeRotation(it) }`)
+7. `ClientTickEvents.END_CLIENT_TICK` — polls the GUI/HUD keybindings, calls
+   `ArpeggioScheduler.onTick()` (the actual dispatch-gated-on-convergence step)
+8. `MidiInputHandler.autoConnect()` — attempts to open a saved MIDI device; its receiver
+   callback runs on a foreign (non-Minecraft) thread — see Known Issues
 
 ---
 
 ## Config (`BlockBardConfig`)
 
-Persisted to `config/blockbard/config.json` via Cloth Config / AutoConfig. Key fields:
-- `scanRadius: Int` — default 5
-- `shiftMode: String` — maps to `ShiftMode` enum via `shiftModeEnum()`
-- `maxOctaveShift: Int` — 1 or 2
-- `arpeggioStaleTimeoutMs: Long`
-- MIDI device name, HUD visibility, tempo default, rescan interval
+**Plain Gson serialization to `config/blockbard/config.json`** — there is no Cloth Config
+or AutoConfig dependency involved in how this mod persists its own settings (Cloth Config
+is listed in `BLOCKBARD_PLAN.md` as a mods-folder runtime dependency for a config-screen
+UI library, which is a different thing; verify against that doc's actual context if this
+distinction matters for your task).
+
+Current fields (`BlockBardConfig.kt`):
+`scanRadius: Int = 5`, `shiftMode: String = "BEST_EFFORT"`, `maxOctaveShift: Int = 1`,
+`reportShiftsInHud: Boolean = true`, `hudEnabled: Boolean = true`,
+`arpeggioStaleTimeoutMs: Long = 200L`, `defaultTempoMultiplier: Float = 1.0f`,
+`autoRescanIntervalSeconds: Int = 3`, `maxTuningClicksPerTick: Int = 1`,
+`lastPlayedTrack: String?`, `shuffleHistory: MutableList<String>`, `defaultOctave: Int = 4`,
+`midiDeviceName: String?`, `keyMappings: List<Int> = [54..62]` (MIDI notes for keys 1-9).
+
+**Not yet config-driven, despite being directly comparable to the above:**
+`PlayerController.MAX_ROTATION_DEGREES_PER_TICK` (35f) and
+`ROTATION_CONVERGENCE_THRESHOLD_DEGREES` (2f) are `const val`, and
+`ArpeggioScheduler.rotationInProgressTimeoutMs` (1500L) is a `var` but not yet wired from
+config — all three directly affect anti-cheat compatibility and are plausible candidates
+for per-server tuning.
 
 ---
 
-## What Is Not Yet Implemented (per plan vs. current code)
+## Known Issues (verified against current source — fix details in `BLOCKBARD_ENGINEERING_PLAN.md`)
 
-These are called out in `BLOCKBARD_PLAN.md` but have no corresponding source file in the repo:
-
-- `VirtualKeyboardScreen` (Section 5.11) — no file found
-- `FileListWidget`, `OrganOverlayPanel`, `PlaybackControlBar` (Section 5.12 sub-components) — logic is inside `MainScreen.kt` directly
-- `ReachCalculator` (separate class) — reach logic is inline in `PlayerController`
-- `NbsPlayer` (coroutine-based playback) — `NbsFileLoader` exists but no dedicated player class
-- Data generation, DataProvider classes — no `runData` resources exist; no data pack content
+- **Thread safety:** `MidiInputHandler`'s MIDI-device callback thread calls
+  `ArpeggioScheduler.enqueue()` directly; the scheduler's queue is not synchronized against
+  the concurrent client-thread `onTick()`/`peekNextPos()` calls. Live data race whenever a
+  MIDI keyboard is connected.
+- **`NoteBlockTuner` has no retry cap:** a block that never converges during verification
+  cycles `TUNING ↔ VERIFYING` forever instead of eventually reaching `FAILED`.
+- **Keyboard keys 1-9 don't register while `MainScreen` is open.** Root cause:
+  `KeyboardInputHandler` relies on `KeyMapping.consumeClick()`, the polling mechanism for
+  gameplay keybinds with no GUI focus. `MainScreen` never overrides `keyPressed`, so there's
+  no path for these keys to reach the scheduler while the GUI (required for the feature to
+  be "active" at all) is open.
+- **`FallbackMapper` is dead code**; `OrganReadinessChecker` is unwired. Two issues, not
+  one — see the subsystem summary above.
+- **`NbsPlayer` lacks feature parity with `MidiFilePlayer`:** no tick/progress getters; tempo
+  multiplier captured once at `play()` start rather than read live, so the tempo slider has
+  no effect on NBS playback already in progress.
+- **`PlaybackHud` doesn't check `NbsPlayer` state at all** — shows idle during NBS playback.
+- **`LittleEndianReader` doesn't check for EOF** (`DataInputStream.read()` returning `-1`)
+  — a truncated/corrupted `.nbs` file produces silently-garbage values instead of a clean
+  error.
+- **`OrganScanner.scan()` is O(r³)**, runs synchronously on the client thread, and the
+  automatic rescan timer in `MainScreen` currently fires unconditionally — including during
+  active playback or tuning.
+- **`ConfigManager.load()` swallows parse exceptions silently** — a corrupt `config.json`
+  resets to defaults with zero log output explaining why.
 
 ---
 
 ## Build Commands
 
 ```bash
-./gradlew runClient     # dev client with mod loaded
-./gradlew clean build   # production JAR → build/libs/blockbard-*+1.21.1.jar
-./gradlew genSources    # generate Yarn-mapped MC sources for IDE navigation
+./gradlew build          # full build → build/libs/
+./gradlew runClient      # dev client with mod loaded
 ```
 
-CI: `.github/workflows/build.yml` — runs `clean build` on push to `main`/`dev`, uploads JAR artifact.
+CI: `.github/workflows/build.yml` — check this file directly for the current trigger
+branches and steps rather than assuming; it has not been re-verified in this pass.
 
 ---
 
 ## Quick Orientation Checklist
 
-Coming in to work on a specific area? Start here:
-
 | Task | Files to read first |
 |---|---|
 | Change scan logic | `OrganScanner.kt`, `NoteBlockRegistry.kt`, `NoteBlockEntry.kt` |
-| Change note assignment | `MidiToOrganMapper.kt`, `InstrumentShifter.kt` |
-| Change tuning behavior | `NoteBlockTuner.kt`, `NoteUtils.kt` (click math) |
-| Change playback timing | `ArpeggioScheduler.kt`, `MidiFilePlayer.kt` |
-| Change player movement | `PlayerController.kt`, `OrganMap.kt` |
+| Change note assignment | `MidiToOrganMapper.kt` (`NotePitch`, `buildAssignment`), `InstrumentShifter.kt` |
+| Change tuning behavior | `NoteBlockTuner.kt`, `NoteUtils.kt` (`clicksNeeded`) |
+| Change playback timing | `ArpeggioScheduler.kt`, `MidiFilePlayer.kt`, `NbsFileLoader.kt` (`NbsPlayer`) |
+| Change player movement / rotation | `PlayerController.kt` — read the Rotation & Anti-Cheat section above first |
 | Change GUI | `MainScreen.kt`, `PlaybackHud.kt` |
 | Change instrument ranges | `NoteUtils.kt` (`midiBase` extension) |
-| Add a config option | `BlockBardConfig.kt`, `BlockBardClient.kt` (apply it at init) |
-| Debug MIDI file issues | `MidiFilePlayer.kt`, `midi/MidiChannelResolver.kt`, `midi/OrganReadinessChecker.kt` |
+| Add a config option | `BlockBardConfig.kt`, then wire it in `BlockBardClient.onInitializeClient()` |
+| Debug MIDI file issues | `MidiFilePlayer.kt`, `midi/MidiChannelResolver.kt`, `midi/OrganReadinessChecker.kt` (currently unwired — won't run unless you call it) |
+| Debug NBS file issues | `NbsFileLoader.kt` (parser + `NbsPlayer`), `LittleEndianReader.kt` (no EOF handling — see Known Issues) |
+| Debug instrument mismatches during playback | `NotePitch`, `ArpeggioScheduler.resolvePos()`'s fallback chain |
 </file>
 
 <file path="BLOCKBARD_PLAN.md">
 # BlockBard — Engineering Plan
 ### Fabric 26.2 Kotlin Mod | NoteBlock Performance System
+
+> **STATUS: HISTORICAL — pre-implementation design document.**
+> This is the original design plan, written before most of the codebase existed. It
+> describes intended architecture and algorithms, not the current implementation.
+> Substantial divergence has occurred since (instrument-aware note assignment via
+> `NotePitch`, eased rotation for anti-cheat compatibility, an `NbsPlayer` this doc never
+> anticipated, and more). **For current-state documentation, read `ARCHITECTURE.md`
+> instead.** Use this doc only for original design rationale or to understand *why* a
+> particular approach was chosen — not to learn what the code currently does. Where the
+> two docs disagree, `ARCHITECTURE.md` (and ultimately the source itself) is correct.
 
 ---
 
