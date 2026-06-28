@@ -1,4 +1,3 @@
-
 package kyrielie.blockbard.client
 
 import kyrielie.blockbard.client.config.ConfigManager
@@ -6,7 +5,9 @@ import kyrielie.blockbard.client.gui.MainScreen
 import kyrielie.blockbard.client.gui.PlaybackHud
 import kyrielie.blockbard.client.input.KeyboardInputHandler
 import kyrielie.blockbard.client.input.MidiInputHandler
+import kyrielie.blockbard.client.player.MAX_ROTATION_DEGREES_PER_TICK
 import kyrielie.blockbard.client.player.PlayerController
+import kyrielie.blockbard.client.player.ROTATION_CONVERGENCE_THRESHOLD_DEGREES
 import kyrielie.blockbard.organ.ArpeggioScheduler
 import kyrielie.blockbard.organ.InstrumentShifter
 import kyrielie.blockbard.client.organ.OrganScanner
@@ -35,6 +36,9 @@ object BlockBardClient : ClientModInitializer {
         InstrumentShifter.mode = cfg.shiftModeEnum()
         InstrumentShifter.maxOctaveShift = cfg.maxOctaveShift
         ArpeggioScheduler.staleTimeoutMs = cfg.arpeggioStaleTimeoutMs
+        ArpeggioScheduler.rotationInProgressTimeoutMs = cfg.rotationInProgressTimeoutMs
+        MAX_ROTATION_DEGREES_PER_TICK = cfg.maxRotationDegreesPerTick
+        ROTATION_CONVERGENCE_THRESHOLD_DEGREES = cfg.rotationConvergenceThresholdDegrees
 
         ArpeggioScheduler.interactDelegate = { pos ->
             logger.debug("interactDelegate: → $pos")

@@ -37,6 +37,7 @@ class NoteBlockTuner(
     private val worldNoteReader: (BlockPos) -> Int?,
     private val interactBlock: (BlockPos) -> Boolean,
     private val pingMs: () -> Int = { 0 },
+    private val maxRetries: Int = 3,
     val onProgress: (done: Int, total: Int, msg: String) -> Unit = { _, _, _ -> }
 ) {
     private val logger = LoggerFactory.getLogger("BlockBard/NoteBlockTuner")
@@ -60,6 +61,12 @@ class NoteBlockTuner(
     // How many targets were already at their target note when tuning started
     private var alreadyTunedAtStart: Int = 0
 
+    // Number of TUNING<->VERIFYING retry cycles caused by a verification mismatch.
+    // Without this cap, a block that can never converge (anticheat dropping packets
+    // server-side, a block destroyed mid-tune and respawned elsewhere, persistent lag)
+    // would cycle TUNING <-> VERIFYING forever.
+    private var retryCount: Int = 0
+
     fun start() {
         if (targets.isEmpty()) {
             logger.info("NoteBlockTuner: no targets — already done")
@@ -79,6 +86,7 @@ class NoteBlockTuner(
         notePredictions.clear()
         verifyStartedAt = -1L
         confirmedCount = 0
+        retryCount = 0
 
         val needClicks = total - alreadyTunedAtStart
         logger.info("NoteBlockTuner: starting — $total targets, $alreadyTunedAtStart already correct, $needClicks need clicks")
@@ -213,10 +221,17 @@ class NoteBlockTuner(
             logger.info("NoteBlockTuner: DONE — $total verified ($skipped were already correct)")
             onProgress(confirmedCount, total, "Complete! ($skipped already correct, ${total - skipped} tuned)")
         } else {
-            logger.warn("NoteBlockTuner: ${mismatches.size} mismatches — retrying")
-            notePredictions.clear()
-            state = TunerState.TUNING
-            onProgress(confirmedCount, total, "Retrying ${mismatches.size} mismatched blocks...")
+            retryCount++
+            if (retryCount > maxRetries) {
+                state = TunerState.FAILED
+                logger.warn("NoteBlockTuner: ${mismatches.size} mismatches after $retryCount retries — giving up")
+                onProgress(confirmedCount, total, "FAILED: ${mismatches.size} blocks never converged: ${mismatches.joinToString("; ")}")
+            } else {
+                logger.warn("NoteBlockTuner: ${mismatches.size} mismatches — retrying (attempt $retryCount/$maxRetries)")
+                notePredictions.clear()
+                state = TunerState.TUNING
+                onProgress(confirmedCount, total, "Retrying ${mismatches.size} mismatched blocks...")
+            }
         }
     }
 
