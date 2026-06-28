@@ -1,10 +1,8 @@
 package kyrielie.blockbard.client.input
 
 import kyrielie.blockbard.client.config.ConfigManager
-import kyrielie.blockbard.client.gui.MainScreen
 import kyrielie.blockbard.organ.ArpeggioScheduler
 import kyrielie.blockbard.organ.NoteRequest
-import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents
 import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper
 import net.minecraft.client.KeyMapping
 import net.minecraft.client.Minecraft
@@ -25,9 +23,14 @@ import org.slf4j.LoggerFactory
  *   Key 8 → MIDI 61 (C#4, noteIndex 7)
  *   Key 9 → MIDI 62 (D4,  noteIndex 8)
  *
- * IMPORTANT: Keys only fire while the BlockBard GUI (MainScreen) is open.
- * They are suppressed entirely when no screen is open or a different screen
- * is showing — this prevents interference with vanilla number-key hotbar.
+ * IMPORTANT: Keys only fire while the BlockBard GUI (MainScreen) is open. The
+ * KeyMapping objects registered in [register] exist so the bindings are visible
+ * and rebindable in the vanilla Controls menu (and so ConfigManager.config.keyMappings
+ * stays meaningful) — but dispatch itself happens via [tryDispatch], called directly
+ * from MainScreen.keyPressed(). Polling via KeyMapping.consumeClick() on END_CLIENT_TICK
+ * (the previous approach) never fires while a Screen owns input focus, since raw key
+ * events are consumed by Screen's input pipeline before they reach the KeyMapping
+ * click-counter — see MainScreen.keyPressed() for where this is actually wired.
  */
 object KeyboardInputHandler {
 
@@ -46,31 +49,26 @@ object KeyboardInputHandler {
             keyBindings.add(key)
         }
         logger.info("KeyboardInputHandler: registered 9 note keys (1–9), active only when BlockBard GUI is open")
-
-        ClientTickEvents.END_CLIENT_TICK.register { _ -> onTick() }
     }
 
-    private fun onTick() {
+    /**
+     * Attempts to dispatch [keyCode] as a note-key press. Returns true if [keyCode]
+     * matched one of the 9 note keys (1–9) and the note was enqueued — callers should
+     * treat a true return as "consumed" so the key doesn't also fall through to
+     * vanilla hotbar-slot switching.
+     */
+    fun tryDispatch(keyCode: Int): Boolean {
+        val i = keyCode - GLFW.GLFW_KEY_1
+        if (i < 0 || i > 8) return false
+
         val mc = Minecraft.getInstance()
-
-        // Only fire when BlockBard's own screen is open
-        val screen = mc.gui.screen()
-        if (screen !is MainScreen) {
-            // Drain any queued clicks silently so they don't fire later when the screen opens
-            keyBindings.forEach { kb -> while (kb.consumeClick()) { /* discard */ } }
-            return
-        }
-
         val mappings = ConfigManager.config.keyMappings
-        keyBindings.forEachIndexed { i, kb ->
-            while (kb.consumeClick()) {
-                val midiNote = mappings.getOrElse(i) { 54 + i }
-                logger.info("KeyboardInputHandler: key ${i + 1} → MIDI $midiNote")
-                mc.player?.sendSystemMessage(
-                    net.minecraft.network.chat.Component.literal("§b[BlockBard] §fKey ${i + 1} → MIDI $midiNote")
-                )
-                ArpeggioScheduler.enqueue(NoteRequest(midiNote))
-            }
-        }
+        val midiNote = mappings.getOrElse(i) { 54 + i }
+        logger.info("KeyboardInputHandler: key ${i + 1} → MIDI $midiNote")
+        mc.player?.sendSystemMessage(
+            net.minecraft.network.chat.Component.literal("§b[BlockBard] §fKey ${i + 1} → MIDI $midiNote")
+        )
+        ArpeggioScheduler.enqueue(NoteRequest(midiNote))
+        return true
     }
 }

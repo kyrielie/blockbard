@@ -2,6 +2,7 @@ package kyrielie.blockbard.client.playback
 
 import kyrielie.blockbard.organ.ArpeggioScheduler
 import kyrielie.blockbard.organ.NoteRequest
+import kyrielie.blockbard.util.readByteChecked
 import kyrielie.blockbard.util.readLEInt
 import kyrielie.blockbard.util.readLEShort
 import kyrielie.blockbard.util.readNBSString
@@ -70,62 +71,62 @@ object NbsFileLoader {
     fun load(file: File): NbsFile {
         DataInputStream(file.inputStream().buffered()).use { stream ->
             // Header
-            val firstShort = stream.readLEShort()
+            val firstShort = stream.readLEShort("format marker")
             val version: Byte
             val instrumentCount: Int
 
             if (firstShort.toInt() == 0) {
                 // New NBS format (version >= 1)
-                version = stream.read().toByte()
-                instrumentCount = stream.read()
+                version = stream.readByteChecked("version byte").toByte()
+                instrumentCount = stream.readByteChecked("instrument count byte")
             } else {
                 // Classic NBS format
                 version = 0
                 instrumentCount = 0
             }
 
-            val songLength = stream.readLEShort().toInt()
-            val layerCount = stream.readLEShort().toInt()
-            val title = stream.readNBSString()
-            stream.readNBSString() // author
-            stream.readNBSString() // original author
-            stream.readNBSString() // description
-            val tempoRaw = stream.readLEShort().toInt() // ticks per second × 100
+            val songLength = stream.readLEShort("song length").toInt()
+            val layerCount = stream.readLEShort("layer count").toInt()
+            val title = stream.readNBSString("title")
+            stream.readNBSString("author")
+            stream.readNBSString("original author")
+            stream.readNBSString("description")
+            val tempoRaw = stream.readLEShort("tempo").toInt() // ticks per second × 100
             val tempo = tempoRaw / 100f
 
             // Skip remaining header fields
-            stream.read() // auto-save enabled
-            stream.read() // auto-save duration
-            stream.read() // time signature
-            stream.readLEInt() // minutes spent
-            stream.readLEInt() // left-clicks
-            stream.readLEInt() // right-clicks
-            stream.readLEInt() // blocks added
-            stream.readLEInt() // blocks removed
-            stream.readNBSString() // MIDI/schematic filename
+            stream.readByteChecked("auto-save enabled flag")
+            stream.readByteChecked("auto-save duration")
+            stream.readByteChecked("time signature")
+            stream.readLEInt("minutes spent")
+            stream.readLEInt("left-clicks")
+            stream.readLEInt("right-clicks")
+            stream.readLEInt("blocks added")
+            stream.readLEInt("blocks removed")
+            stream.readNBSString("MIDI/schematic filename")
             if (version >= 4) {
-                stream.read() // loop on/off
-                stream.read() // max loop count
-                stream.readLEShort() // loop start tick
+                stream.readByteChecked("loop on/off flag")
+                stream.readByteChecked("max loop count")
+                stream.readLEShort("loop start tick")
             }
 
             // Parse notes using jump encoding
             val notes = mutableListOf<NbsNote>()
             var currentTick = -1
             while (true) {
-                val tickJump = stream.readLEShort().toInt()
+                val tickJump = stream.readLEShort("tick jump").toInt()
                 if (tickJump == 0) break
                 currentTick += tickJump
                 var currentLayer = -1
                 while (true) {
-                    val layerJump = stream.readLEShort().toInt()
+                    val layerJump = stream.readLEShort("layer jump").toInt()
                     if (layerJump == 0) break
                     currentLayer += layerJump
-                    val instrument = stream.read()
-                    val key = stream.read()      // 0–87
-                    val velocity = if (version >= 4) stream.read().toByte() else 100
-                    val panning = if (version >= 4) stream.read() else 100
-                    val pitch = if (version >= 4) stream.readLEShort() else 0
+                    val instrument = stream.readByteChecked("instrument byte")
+                    val key = stream.readByteChecked("key byte")      // 0–87
+                    val velocity = if (version >= 4) stream.readByteChecked("velocity byte").toByte() else 100
+                    val panning = if (version >= 4) stream.readByteChecked("panning byte") else 100
+                    val pitch = if (version >= 4) stream.readLEShort("fine pitch") else 0
                     notes.add(NbsNote(currentTick, currentLayer, instrument, key, velocity))
                 }
             }
@@ -144,15 +145,33 @@ object NbsPlayer {
     private var pausedAtMs: Long = 0L
     private var startWallMs: Long = 0L
 
+    // Mirrors MidiFilePlayer.getCurrentTick()/getTotalTicks() — updated inside the
+    // playback loop each time a tick's notes are dispatched, plus public getters
+    // so PlaybackHud/MainScreen can show NBS progress the same way they show MIDI
+    // progress. totalTick is computed once per play() call from notes.last().tick —
+    // safe because NbsFileLoader.load() appends notes in non-decreasing tick order
+    // (currentTick only increases during jump-decoding for a well-formed file); a
+    // malformed file could violate that, but that case is guarded separately by
+    // LittleEndianReader's EOF handling rather than re-sorting here on every play().
+    private var currentTick: Long = 0L
+    private var totalTick: Long = 0L
+
     var onFinished: (() -> Unit)? = null
 
-    fun play(nbs: NbsFile, tempoMultiplier: Float = 1.0f) {
+    /**
+     * Starts NBS playback. Tempo scaling reads MidiFilePlayer.tempoMultiplier live
+     * each tick (see the loop below) rather than taking a tempoMultiplier parameter —
+     * there is only one tempo control in the GUI (MainScreen's +/- buttons mutate
+     * MidiFilePlayer.tempoMultiplier directly) and it should apply identically to
+     * whichever format is currently playing.
+     */
+    fun play(nbs: NbsFile) {
         stop()
         isPlaying = true
         isPaused = false
         startWallMs = System.currentTimeMillis()
-
-        val tickDurationMs = (1000.0 / nbs.tempo / tempoMultiplier).toLong()
+        currentTick = 0L
+        totalTick = nbs.notes.lastOrNull()?.tick?.toLong() ?: 0L
 
         playbackThread = Thread({
             try {
@@ -161,7 +180,21 @@ object NbsPlayer {
 
                 for (tick in sortedTicks) {
                     if (!isPlaying) break
-                    val targetMs = startWallMs + tick * tickDurationMs
+
+                    // Recompute the scaled target time fresh from the live tempo
+                    // multiplier each tick, the same way MidiFilePlayer.play() calls
+                    // tickToScaledMs(..., tempoMultiplier) inside its loop, rather than
+                    // baking a fixed tickDurationMs once at play() start — that older
+                    // approach meant the tempo slider had no live effect on NBS playback
+                    // once started, unlike MIDI. MidiFilePlayer.tempoMultiplier is the
+                    // single shared value MainScreen's tempo +/- buttons mutate; reading
+                    // it here each tick (rather than the captured tempoMultiplier
+                    // parameter) means an in-progress NBS song picks up tempo changes
+                    // immediately, matching MIDI's behavior.
+                    val realMs = (tick / nbs.tempo * 1000.0).toLong()
+                    val scaledMs = (realMs / MidiFilePlayer.tempoMultiplier).toLong()
+                    val targetMs = startWallMs + scaledMs
+
                     while (System.currentTimeMillis() < targetMs) {
                         if (!isPlaying) return@Thread
                         while (isPaused) {
@@ -171,6 +204,7 @@ object NbsPlayer {
                         Thread.sleep(5)
                     }
                     if (!isPlaying) return@Thread
+                    currentTick = tick.toLong()
                     notesByTick[tick]?.forEach { note ->
                         val midiNote = note.key + 21  // NBS key → MIDI note
                         // Resolve the NBS instrument byte so playback targets a block
@@ -211,5 +245,9 @@ object NbsPlayer {
         playbackThread?.interrupt()
         playbackThread = null
         ArpeggioScheduler.clear()
+        currentTick = 0L
     }
+
+    fun getCurrentTick(): Long = currentTick
+    fun getTotalTicks(): Long = totalTick
 }

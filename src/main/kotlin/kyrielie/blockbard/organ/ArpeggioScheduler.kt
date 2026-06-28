@@ -1,4 +1,3 @@
-
 package kyrielie.blockbard.organ
 
 import net.minecraft.core.BlockPos
@@ -74,6 +73,15 @@ object ArpeggioScheduler {
     private val queue: ArrayDeque<NoteRequest> = ArrayDeque()
 
     /**
+     * Guards [queue]. enqueue() is called from a javax.sound.midi device thread
+     * (see MidiInputHandler.connect()'s Receiver.send()) while onTick()/peekNextPos()
+     * run on the Minecraft client thread via START_CLIENT_TICK/END_CLIENT_TICK — without
+     * this, queue is a kotlin.collections.ArrayDeque (not thread-safe) shared across
+     * threads with no synchronization.
+     */
+    private val lock = Any()
+
+    /**
      * Resolves a request to a target BlockPos, trying in order:
      * 1. resolvedPos, if the caller already knows the exact block (scale test).
      * 2. assignment for the exact (midiNote, instrument) pair, if instrument is known.
@@ -100,11 +108,11 @@ object ArpeggioScheduler {
      * that successfully converges should still play even if it took a while — it was
      * never idle, the player was visibly turning toward it the whole time.
      */
-    fun onTick() {
+    fun onTick(): Unit = synchronized(lock) {
         // Catch misconfiguration early — interactDelegate should be wired at init
         if (queue.isNotEmpty() && interactDelegate == null) {
             logger.warn("onTick: interactDelegate is null — notes will never be dispatched (check BlockBardClient init)")
-            return
+            return@synchronized
         }
 
         // Prune stale backlog sitting behind the head first — these notes haven't started
@@ -132,7 +140,7 @@ object ArpeggioScheduler {
             if (pos == null) {
                 queue.removeFirst()
                 logger.warn("no block found for MIDI ${request.midiNote} — skipping (assignment has ${assignment.size} entries, resolvedPos=${request.resolvedPos})")
-                return
+                return@synchronized
             }
 
             val converged = rotationConvergedDelegate?.invoke(pos) ?: true
@@ -147,7 +155,7 @@ object ArpeggioScheduler {
                 // and try again next tick. staleTimeoutMs does not apply to the head
                 // note once convergence waiting has begun — see kdoc above.
                 logger.debug("waiting for rotation convergence on $pos (MIDI ${request.midiNote}, age ${age}ms)")
-                return
+                return@synchronized
             }
 
             // Converged — consume and dispatch regardless of age. A note that took
@@ -160,7 +168,7 @@ object ArpeggioScheduler {
             if (!dispatched) {
                 logger.warn("interactDelegate returned false for $pos (MIDI ${request.midiNote}) — check PlayerController logs above")
             }
-            return
+            return@synchronized
         }
     }
 
@@ -178,23 +186,23 @@ object ArpeggioScheduler {
      * staleTimeoutMs is still enforced in onTick() for notes that haven't started
      * converging.
      */
-    fun peekNextPos(): BlockPos? {
-        val request = queue.firstOrNull() ?: return null
+    fun peekNextPos(): BlockPos? = synchronized(lock) {
+        val request = queue.firstOrNull() ?: return@synchronized null
         val pos = resolvePos(request)
         logger.debug("peekNextPos: MIDI ${request.midiNote} instrument=${request.instrument?.name ?: "any"} -> $pos")
-        return pos
+        pos
     }
 
-    fun enqueue(request: NoteRequest) {
+    fun enqueue(request: NoteRequest) = synchronized(lock) {
         logger.info("enqueue MIDI ${request.midiNote} instrument=${request.instrument?.name ?: "any"} resolvedPos=${request.resolvedPos} queueSize=${queue.size + 1}")
         queue.addLast(request)
     }
 
-    fun clear() {
+    fun clear() = synchronized(lock) {
         logger.info("queue cleared (had ${queue.size} items)")
         queue.clear()
     }
 
-    fun isEmpty(): Boolean = queue.isEmpty()
-    val queueSize: Int get() = queue.size
+    fun isEmpty(): Boolean = synchronized(lock) { queue.isEmpty() }
+    val queueSize: Int get() = synchronized(lock) { queue.size }
 }

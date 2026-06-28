@@ -1,4 +1,3 @@
-
 package kyrielie.blockbard.client.gui
 
 import kyrielie.blockbard.client.config.ConfigManager
@@ -7,6 +6,9 @@ import kyrielie.blockbard.client.playback.NbsFile
 import kyrielie.blockbard.client.playback.NbsFileLoader
 import kyrielie.blockbard.client.playback.NbsPlayer
 import kyrielie.blockbard.client.playback.nbsInstrumentToBlock
+import kyrielie.blockbard.client.input.KeyboardInputHandler
+import kyrielie.blockbard.midi.MidiChannelResolver
+import kyrielie.blockbard.midi.OrganReadinessChecker
 import kyrielie.blockbard.organ.*
 import kyrielie.blockbard.client.organ.OrganScanner
 import kyrielie.blockbard.client.player.CenterResult
@@ -16,9 +18,11 @@ import net.fabricmc.loader.api.FabricLoader
 import net.minecraft.client.gui.GuiGraphicsExtractor
 import net.minecraft.client.gui.components.Button
 import net.minecraft.client.gui.screens.Screen
+import net.minecraft.client.input.KeyEvent
 import net.minecraft.client.input.MouseButtonEvent
 import net.minecraft.network.chat.Component
 import net.minecraft.world.level.GameType
+import org.lwjgl.glfw.GLFW
 import org.slf4j.LoggerFactory
 import java.io.File
 
@@ -57,6 +61,10 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
     // General status
     private var organScanMessage: String = "Press Scan to detect noteblocks"
     private var coverageMessage: String = ""
+    // Pre-flight readiness check (OrganReadinessChecker), set on MIDI file selection —
+    // distinct from coverageMessage, which reports the actual assignment outcome after
+    // Tune is clicked. This lets coverage gaps surface before the user commits to tuning.
+    private var readinessMessage: String = ""
     private var scanTicker = 0
 
     // Scale playback state
@@ -411,16 +419,24 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
     private fun startPlayback() {
         val file = selectedFile ?: run { chatWarn("No file selected"); return }
         logger.info("startPlayback: ${file.name}")
-        chat("Playing: ${file.name}")
         if (file.extension.lowercase() == "nbs") {
-            val nbs = loadedNbs?.takeIf { it.file == file } ?: NbsFileLoader.load(file).also { loadedNbs = it }
+            val cached = loadedNbs?.takeIf { it.file == file }
+            val nbs = cached ?: try {
+                NbsFileLoader.load(file).also { loadedNbs = it }
+            } catch (e: Exception) {
+                logger.warn("startPlayback: failed to load NBS file ${file.name}: ${e.message}", e)
+                chatWarn("Failed to load ${file.name}: ${e.message}")
+                return
+            }
+            chat("Playing: ${file.name}")
             logger.info("startPlayback: NBS '${nbs.title}' ${nbs.notes.size} notes at ${nbs.tempo} tps")
-            NbsPlayer.play(nbs, MidiFilePlayer.tempoMultiplier)
+            NbsPlayer.play(nbs)
         } else {
             if (MidiFilePlayer.loadedMidi?.file != file) {
                 val midi = MidiFilePlayer.load(file)
                 logger.info("startPlayback: MIDI ${midi.events.size} events, ${midi.distinctNotes.size} distinct notes")
             }
+            chat("Playing: ${file.name}")
             MidiFilePlayer.play()
         }
     }
@@ -436,21 +452,53 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
         selectedIndex = midiFiles.indexOf(file)
         MidiFilePlayer.stop()
         NbsPlayer.stop()
+        readinessMessage = ""
+        var loadFailed = false
         if (file.extension.lowercase() in listOf("mid", "midi")) {
             loadedNbs = null
             val midi = MidiFilePlayer.load(file)
             logger.info("selectFile: ${file.name} — ${midi.events.size} events, tempo=${midi.baseTempoUsPerBeat}µs/beat")
             chat("Loaded: ${file.name} (${midi.distinctNotes.size} distinct notes)")
+
+            // Pre-flight coverage check — surfaces instrument/note gaps immediately on
+            // file selection rather than only after the user clicks Tune and reads the
+            // unplayable list produced after the fact. Built as a single line (matching
+            // coverageMessage's convention below) rather than report.summary(), which is
+            // multi-line and not meant for a single graphics.text() call.
+            val requirements = MidiChannelResolver.resolveRequirements(file)
+            val report = OrganReadinessChecker.check(requirements)
+            readinessMessage = if (report.isFullyCovered) {
+                "Readiness: organ fully covers this file (${report.totalRequired} notes)"
+            } else {
+                "Readiness: ${report.coveragePercent}% (${report.coveredNotes.size}/${report.totalRequired})" +
+                    if (report.missingInstruments.isNotEmpty())
+                        ". Missing instruments: ${report.missingInstruments.take(4).joinToString { it.name }}"
+                    else ""
+            }
+            if (!report.isFullyCovered) {
+                chatWarn("Coverage: ${report.coveragePercent}% (${report.coveredNotes.size}/${report.totalRequired} notes) — see organ panel")
+            }
         } else if (file.extension.lowercase() == "nbs") {
-            val nbs = NbsFileLoader.load(file)
-            loadedNbs = nbs
-            logger.info("selectFile: ${file.name} — ${nbs.notes.size} notes, tempo=${nbs.tempo} tps")
-            chat("Loaded: ${file.name} (${nbs.notes.size} notes)")
+            try {
+                val nbs = NbsFileLoader.load(file)
+                loadedNbs = nbs
+                logger.info("selectFile: ${file.name} — ${nbs.notes.size} notes, tempo=${nbs.tempo} tps")
+                chat("Loaded: ${file.name} (${nbs.notes.size} notes)")
+            } catch (e: Exception) {
+                logger.warn("selectFile: failed to load NBS file ${file.name}: ${e.message}", e)
+                chatWarn("Failed to load ${file.name}: ${e.message}")
+                loadedNbs = null
+                loadFailed = true
+            }
         } else {
             loadedNbs = null
         }
         ConfigManager.config.lastPlayedTrack = file.name
-        organScanMessage = "Loaded: ${file.name}. Run Scan → Center → Tune → Play."
+        organScanMessage = if (loadFailed) {
+            "Failed to load ${file.name} — see chat for details."
+        } else {
+            "Loaded: ${file.name}. Run Scan → Center → Tune → Play."
+        }
         coverageMessage = ""
     }
 
@@ -459,12 +507,18 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
     override fun tick() {
         super.tick()
 
-        // Auto-rescan
+        // Auto-rescan — skipped while a song is actively playing or the tuner is
+        // running. Re-scanning while playing/tuning serves no purpose (the organ
+        // layout isn't expected to change mid-song) and is the worst time to spend
+        // O(r^3) client-thread budget on OrganScanner.scan().
+        val playbackOrTuningActive = MidiFilePlayer.isActive() || NbsPlayer.isPlaying || tuner?.isActive == true
         scanTicker++
         if (scanTicker >= 20 * ConfigManager.config.autoRescanIntervalSeconds) {
             scanTicker = 0
-            OrganScanner.scan()
-            updateOrganInfo()
+            if (!playbackOrTuningActive) {
+                OrganScanner.scan()
+                updateOrganInfo()
+            }
         }
 
         // Tuner tick
@@ -523,6 +577,11 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
         counts.entries.take(5).forEach { (inst, count) ->
             graphics.text(font, "${inst.name}: $count", 10, cy, 0xDDDDDD)
             cy += 10
+        }
+
+        if (readinessMessage.isNotEmpty()) {
+            graphics.text(font, readinessMessage, 10, cy + 2, 0xFF8844)
+            cy += 12
         }
 
         if (coverageMessage.isNotEmpty()) {
@@ -586,6 +645,20 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
             }
         }
         return super.mouseClicked(event, doubleClick)
+    }
+
+    // Number keys 1-9 are consumed by Screen's input pipeline before they ever reach
+    // KeyMapping.consumeClick() while this screen owns input focus — that polling-based
+    // path (see KeyboardInputHandler) never fires here. Overriding keyPressed directly
+    // is the only way for these keys to register while MainScreen is open.
+    override fun keyPressed(event: KeyEvent): Boolean {
+        val keyCode = event.key()
+        if (keyCode in GLFW.GLFW_KEY_1..GLFW.GLFW_KEY_9) {
+            if (KeyboardInputHandler.tryDispatch(keyCode)) {
+                return true
+            }
+        }
+        return super.keyPressed(event)
     }
 
     override fun onClose() {

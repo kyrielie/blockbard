@@ -1,4 +1,3 @@
-
 package kyrielie.blockbard.client.organ
 
 import kyrielie.blockbard.organ.MOB_HEAD_BLOCKS

@@ -1,6 +1,7 @@
 package kyrielie.blockbard.client.gui
 
 import kyrielie.blockbard.client.playback.MidiFilePlayer
+import kyrielie.blockbard.client.playback.NbsPlayer
 import kyrielie.blockbard.organ.NoteBlockRegistry
 // HudRenderCallback is gone in 26.x. Use the new HudElement / HudElementRegistry API.
 import net.fabricmc.fabric.api.client.rendering.v1.hud.HudElement
@@ -41,13 +42,22 @@ object PlaybackHud {
         val font = mc.font
 
         val playable = NoteBlockRegistry.allPlayable().size
+        // Checks both players, the same way MainScreen's in-GUI status bar does —
+        // either MidiFilePlayer or NbsPlayer may be the one actively playing depending
+        // on the loaded file type, and this HUD previously only ever checked
+        // MidiFilePlayer, so NBS playback always fell through to the idle branch here.
         val status = when {
             MidiFilePlayer.isActive() && !MidiFilePlayer.isPaused -> {
                 val currentTick = MidiFilePlayer.getCurrentTick()
                 val totalTicks = MidiFilePlayer.getTotalTicks()
                 "▶ PLAYING  tick $currentTick/$totalTicks"
             }
-            MidiFilePlayer.isPaused -> "⏸ PAUSED"
+            NbsPlayer.isPlaying && !NbsPlayer.isPaused -> {
+                val currentTick = NbsPlayer.getCurrentTick()
+                val totalTicks = NbsPlayer.getTotalTicks()
+                "▶ PLAYING  tick $currentTick/$totalTicks"
+            }
+            MidiFilePlayer.isPaused || NbsPlayer.isPaused -> "⏸ PAUSED"
             else -> "♪ BlockBard  [B to open]"
         }
 
