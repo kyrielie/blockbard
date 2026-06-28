@@ -4,6 +4,7 @@ import kyrielie.blockbard.organ.ShiftMode
 import com.google.gson.Gson
 import com.google.gson.GsonBuilder
 import net.fabricmc.loader.api.FabricLoader
+import org.slf4j.LoggerFactory
 import java.io.File
 
 data class BlockBardConfig(
@@ -20,7 +21,13 @@ data class BlockBardConfig(
     var shuffleHistory: MutableList<String> = mutableListOf(),
     var defaultOctave: Int = 4,
     var midiDeviceName: String? = null,
-    var keyMappings: List<Int> = listOf(54, 55, 56, 57, 58, 59, 60, 61, 62)
+    var keyMappings: List<Int> = listOf(54, 55, 56, 57, 58, 59, 60, 61, 62),
+    // Anticheat-compatibility tunables — same category as arpeggioStaleTimeoutMs above,
+    // and equally in need of per-server tuning, but previously hardcoded as const val
+    // in PlayerController.kt / var in ArpeggioScheduler.kt with no config wiring.
+    var maxRotationDegreesPerTick: Float = 35f,
+    var rotationConvergenceThresholdDegrees: Float = 2f,
+    var rotationInProgressTimeoutMs: Long = 1500L
 ) {
     fun shiftModeEnum(): ShiftMode = try {
         ShiftMode.valueOf(shiftMode)
@@ -30,6 +37,7 @@ data class BlockBardConfig(
 }
 
 object ConfigManager {
+    private val logger = LoggerFactory.getLogger("BlockBard/Config")
     private val gson: Gson = GsonBuilder().setPrettyPrinting().create()
     private val configFile: File by lazy {
         FabricLoader.getInstance().configDir.resolve("blockbard/config.json").toFile()
@@ -47,7 +55,8 @@ object ConfigManager {
         try {
             config = gson.fromJson(configFile.readText(), BlockBardConfig::class.java)
                 ?: BlockBardConfig()
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            logger.warn("Config parse failed, resetting to defaults: ${e.message}", e)
             config = BlockBardConfig()
             save()
         }

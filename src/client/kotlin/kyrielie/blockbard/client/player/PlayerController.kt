@@ -1,4 +1,3 @@
-
 package kyrielie.blockbard.client.player
 
 import kyrielie.blockbard.organ.NoteBlockEntry
@@ -31,11 +30,20 @@ const val REACH_DISTANCE = 4.5
  * were on opposite sides of the player. Easing toward the target at a capped rate
  * removes the signature without slowing down playback overall, since interactWith()
  * is only invoked once the eased rotation has converged (see rotationConverged()).
+ *
+ * var, not const val — set from BlockBardConfig.maxRotationDegreesPerTick at init
+ * (see BlockBardClient.onInitializeClient()), since this is exactly the kind of
+ * anticheat-compatibility tunable that needs per-server adjustment, like
+ * ArpeggioScheduler.staleTimeoutMs already is.
  */
-const val MAX_ROTATION_DEGREES_PER_TICK = 35f
+var MAX_ROTATION_DEGREES_PER_TICK = 35f
 
-/** How close yaw/pitch must be to the target (degrees) before a note is considered aimed. */
-const val ROTATION_CONVERGENCE_THRESHOLD_DEGREES = 2f
+/**
+ * How close yaw/pitch must be to the target (degrees) before a note is considered
+ * aimed. var, not const val — see MAX_ROTATION_DEGREES_PER_TICK kdoc; set from
+ * BlockBardConfig.rotationConvergenceThresholdDegrees at init.
+ */
+var ROTATION_CONVERGENCE_THRESHOLD_DEGREES = 2f
 
 sealed class CenterResult {
     object NoPlayer : CenterResult()
