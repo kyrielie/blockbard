@@ -8,6 +8,7 @@ import kyrielie.blockbard.client.input.MidiInputHandler
 import kyrielie.blockbard.client.player.MAX_ROTATION_DEGREES_PER_TICK
 import kyrielie.blockbard.client.player.PlayerController
 import kyrielie.blockbard.client.player.ROTATION_CONVERGENCE_THRESHOLD_DEGREES
+import kyrielie.blockbard.client.player.SoundVerifier
 import kyrielie.blockbard.organ.ArpeggioScheduler
 import kyrielie.blockbard.organ.InstrumentShifter
 import kyrielie.blockbard.client.organ.OrganScanner
@@ -25,6 +26,7 @@ object BlockBardClient : ClientModInitializer {
 
     private lateinit var openGuiKey: KeyMapping
     private lateinit var toggleHudKey: KeyMapping
+    private var soundVerifierRegistered = false
 
     override fun onInitializeClient() {
         logger.info("BlockBard initializing...")
@@ -40,9 +42,9 @@ object BlockBardClient : ClientModInitializer {
         MAX_ROTATION_DEGREES_PER_TICK = cfg.maxRotationDegreesPerTick
         ROTATION_CONVERGENCE_THRESHOLD_DEGREES = cfg.rotationConvergenceThresholdDegrees
 
-        ArpeggioScheduler.interactDelegate = { pos ->
-            logger.debug("interactDelegate: → $pos")
-            PlayerController.interactWith(pos)
+        ArpeggioScheduler.interactDelegate = { pos, request ->
+            logger.debug("interactDelegate: → $pos (MIDI ${request.midiNote})")
+            PlayerController.interactWith(pos, request)
         }
         ArpeggioScheduler.rotationConvergedDelegate = { pos ->
             PlayerController.rotationConverged(pos)
@@ -72,6 +74,19 @@ object BlockBardClient : ClientModInitializer {
         }
 
         ClientTickEvents.END_CLIENT_TICK.register { mc ->
+            // Minecraft.getInstance() (and therefore mc.soundManager) does not exist yet
+            // during onInitializeClient() — Fabric Loader calls all ClientModInitializers
+            // before the Minecraft instance is constructed (confirmed against Minecraft.java:
+            // soundManager is a constructor-assigned field, and the constructor runs after
+            // entrypoint dispatch). Registering here, on the first tick the callback fires,
+            // is the standard deferred-init pattern: by END_CLIENT_TICK the client is fully
+            // up. A one-shot flag avoids calling addListener repeatedly every tick.
+            if (!soundVerifierRegistered) {
+                mc.soundManager.addListener(SoundVerifier)
+                soundVerifierRegistered = true
+                logger.info("SoundVerifier registered as a SoundEventListener")
+            }
+
             while (openGuiKey.consumeClick()) {
                 logger.info("B pressed — opening MainScreen")
                 if (mc.gui.screen() == null) mc.gui.setScreen(MainScreen())
