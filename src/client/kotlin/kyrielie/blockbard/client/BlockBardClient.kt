@@ -44,7 +44,7 @@ object BlockBardClient : ClientModInitializer {
 
         ArpeggioScheduler.interactDelegate = { pos, request ->
             logger.debug("interactDelegate: → $pos (MIDI ${request.midiNote})")
-            PlayerController.interactWith(pos, request)
+            PlayerController.playNoteAt(pos, request)
         }
         ArpeggioScheduler.rotationConvergedDelegate = { pos ->
             PlayerController.rotationConverged(pos)
