@@ -74,18 +74,28 @@ object NbsFileLoader {
             val firstShort = stream.readLEShort("format marker")
             val version: Byte
             val instrumentCount: Int
+            val songLength: Int
 
             if (firstShort.toInt() == 0) {
-                // New NBS format (version >= 1)
+                // New NBS format (version >= 1): the leading 0 is a literal format
+                // marker with no data of its own, distinct from the classic format
+                // below where the very first short read IS the song length value.
                 version = stream.readByteChecked("version byte").toByte()
                 instrumentCount = stream.readByteChecked("instrument count byte")
+                songLength = stream.readLEShort("song length").toInt()
             } else {
-                // Classic NBS format
+                // Classic NBS format: there is no separate format-marker short — the
+                // value already consumed into firstShort above is itself songLength.
+                // Re-reading a second short here (the original bug) shifts every
+                // subsequent field read by 2 bytes, which is why a classic-format file
+                // eventually misreads a header string's length as a huge garbage value
+                // and throws EOFException deep into the description field instead of
+                // failing immediately where the misalignment actually starts.
                 version = 0
                 instrumentCount = 0
+                songLength = firstShort.toInt()
             }
 
-            val songLength = stream.readLEShort("song length").toInt()
             val layerCount = stream.readLEShort("layer count").toInt()
             val title = stream.readNBSString("title")
             stream.readNBSString("author")
