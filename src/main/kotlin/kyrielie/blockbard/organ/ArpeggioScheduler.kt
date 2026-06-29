@@ -58,8 +58,15 @@ object ArpeggioScheduler {
      */
     var rotationInProgressTimeoutMs: Long = 1500L
 
-    /** Wired to PlayerController.interactWith() by the client entrypoint. */
-    var interactDelegate: ((BlockPos) -> Boolean)? = null
+    /**
+     * Wired to PlayerController.interactWith() by the client entrypoint. Takes the
+     * target BlockPos plus the NoteRequest being dispatched — the request (not just
+     * its midiNote) is threaded through so PlayerController can hand the full intended
+     * (midiNote, instrument) pair to SoundVerifier for ground-truth comparison against
+     * the actual SoundInstance the client plays, without SoundVerifier needing to
+     * duplicate ArpeggioScheduler's own bookkeeping.
+     */
+    var interactDelegate: ((BlockPos, NoteRequest) -> Boolean)? = null
 
     /**
      * Wired to PlayerController.rotationConverged() by the client entrypoint. Gates
@@ -163,7 +170,7 @@ object ArpeggioScheduler {
             // idle. staleTimeoutMs prunes idle backlog elsewhere (see kdoc above), not
             // a note that just finished a legitimate in-progress turn.
             queue.removeFirst()
-            val dispatched = interactDelegate?.invoke(pos) ?: false
+            val dispatched = interactDelegate?.invoke(pos, request) ?: false
             logger.info("dispatch MIDI ${request.midiNote} -> $pos result=$dispatched age=${age}ms queueRemaining=${queue.size}")
             if (!dispatched) {
                 logger.warn("interactDelegate returned false for $pos (MIDI ${request.midiNote}) — check PlayerController logs above")

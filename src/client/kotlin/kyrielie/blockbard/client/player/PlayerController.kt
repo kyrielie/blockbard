@@ -2,6 +2,7 @@ package kyrielie.blockbard.client.player
 
 import kyrielie.blockbard.organ.NoteBlockEntry
 import kyrielie.blockbard.organ.NoteBlockRegistry
+import kyrielie.blockbard.organ.NoteRequest
 import kyrielie.blockbard.organ.OrganMap
 import kyrielie.blockbard.organ.ReachInfo
 import kyrielie.blockbard.util.vecToYawPitch
@@ -337,6 +338,34 @@ object PlayerController {
     }
 
     fun interactWith(entry: NoteBlockEntry): Boolean = interactWith(entry.pos)
+
+    /**
+     * NoteRequest-aware overload used by ArpeggioScheduler.interactDelegate during
+     * playback. Registers the intended (midiNote, instrument) with SoundVerifier
+     * immediately before firing the interaction, so the next note_block SoundInstance
+     * the client plays can be compared against what we meant to play — see
+     * SoundVerifier kdoc for why this has to happen here rather than after
+     * interactWith() returns: the server (same process in singleplayer) can dispatch
+     * the resulting sound packet before this function returns, so registering after
+     * the call risks missing it.
+     *
+     * The tuner's interactBlock lambda (MainScreen.startTuning()) intentionally keeps
+     * using the request-less interactWith(pos) overload defined earlier in this file —
+     * a tuning click isn't "playing" any particular note, it's incrementing pitch by
+     * one semitone, so there is no intended (midiNote, instrument) to register.
+     */
+    fun interactWith(pos: BlockPos, request: NoteRequest): Boolean {
+        // request.instrument is null for callers with no instrument source (scale test,
+        // direct keyboard 1-9 presses — see NoteRequest kdoc). Falling back to "any
+        // instrument is fine" there would make SoundVerifier a no-op for exactly the
+        // chromatic-scale test BlockBard's debugging plan calls for running first, since
+        // every sound would trivially "match". Resolve the real instrument from the
+        // registry at pos when we have one, so the scale test still gets a concrete
+        // expected (instrument, noteIndex) to check against.
+        val expectedInstrument = request.instrument ?: NoteBlockRegistry.get(pos)?.instrument
+        SoundVerifier.expectNote(pos, request.midiNote, expectedInstrument)
+        return interactWith(pos)
+    }
 
     fun clearOrganMap() {
         logger.info("clearOrganMap: organ map cleared")

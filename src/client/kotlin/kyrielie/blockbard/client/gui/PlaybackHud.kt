@@ -68,13 +68,16 @@ object PlaybackHud {
         // guiHeight() in 26.x (was mc.window.guiScaledHeight)
         var y = graphics.guiHeight() - 48
 
-        // fill() signature unchanged
+        // fill() signature unchanged — 0x88000000 already has a non-zero alpha byte
+        // (0x88), so this one call was unaffected by the bug fixed below.
         graphics.fill(x - 2, y - 2, x + 180, y + 40, 0x88000000.toInt())
-        // drawString() → text() in GuiGraphicsExtractor
-        graphics.text(font, status, x, y, 0xAAFFAA); y += 10
-        graphics.text(font, "Tempo: $tempo  |  $coverage", x, y, 0xCCCCCC); y += 10
+        // drawString() → text() in GuiGraphicsExtractor. text() silently drops the draw
+        // entirely when the color's alpha byte is 0 — see opaque() in MainScreen.kt
+        // (same package, no import needed) for why a bare 0xRRGGBB literal does that.
+        graphics.text(font, status, x, y, opaque(0xAAFFAA)); y += 10
+        graphics.text(font, "Tempo: $tempo  |  $coverage", x, y, opaque(0xCCCCCC)); y += 10
         if (lastShiftMessage.isNotEmpty()) {
-            graphics.text(font, lastShiftMessage, x, y, 0xFFCC44)
+            graphics.text(font, lastShiftMessage, x, y, opaque(0xFFCC44))
         }
     }
 }

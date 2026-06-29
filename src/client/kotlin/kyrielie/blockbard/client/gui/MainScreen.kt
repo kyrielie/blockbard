@@ -13,6 +13,7 @@ import kyrielie.blockbard.organ.*
 import kyrielie.blockbard.client.organ.OrganScanner
 import kyrielie.blockbard.client.player.CenterResult
 import kyrielie.blockbard.client.player.PlayerController
+import kyrielie.blockbard.client.player.SoundVerifier
 import kyrielie.blockbard.util.midiNoteToName
 import net.fabricmc.loader.api.FabricLoader
 import net.minecraft.client.gui.GuiGraphicsExtractor
@@ -25,6 +26,22 @@ import net.minecraft.world.level.GameType
 import org.lwjgl.glfw.GLFW
 import org.slf4j.LoggerFactory
 import java.io.File
+
+/**
+ * Returns [rgb] (a plain 0xRRGGBB literal) with a fully-opaque alpha byte set.
+ *
+ * GuiGraphicsExtractor.text() (this MC version's replacement for the old immediate-mode
+ * GuiGraphics.drawString()) silently drops the entire text draw call when
+ * ARGB.alpha(color) == 0 — confirmed directly against GuiGraphicsExtractor.java's
+ * text(Font, FormattedCharSequence, ...) overload: `if (ARGB.alpha(color) != 0) { ... }`,
+ * with no else branch, no log, no exception. A bare 0xRRGGBB Kotlin Int literal has its
+ * top byte (bits 24-31, the alpha channel) equal to 0x00 — there is no implicit "assume
+ * opaque" behavior in this API, unlike some older Minecraft text-drawing methods. Every
+ * graphics.text(...) color in this file (and in PlaybackHud.kt) needs to route through
+ * this function; passing a bare 6-digit literal renders nothing, with no error to point
+ * at the cause — exactly what made this bug hard to spot.
+ */
+fun opaque(rgb: Int): Int = rgb or (0xFF shl 24)
 
 class MainScreen(private val parent: Screen? = null) : Screen(Component.literal("BlockBard")) {
 
@@ -376,6 +393,7 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
         scaleNotes = playable.sortedBy { it.midiNote }
         scaleIndex = 0
         scaleTicker = 0
+        SoundVerifier.reset()
 
         val noteNames = scaleNotes.map { "${it.instrument.name.take(4)}:${kyrielie.blockbard.util.midiNoteToName(it.midiNote)}" }
         logger.info("playScale: ${scaleNotes.size} notes in pitch order: $noteNames")
@@ -419,6 +437,7 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
     private fun startPlayback() {
         val file = selectedFile ?: run { chatWarn("No file selected"); return }
         logger.info("startPlayback: ${file.name}")
+        SoundVerifier.reset()
         if (file.extension.lowercase() == "nbs") {
             val cached = loadedNbs?.takeIf { it.file == file }
             val nbs = cached ?: try {
@@ -551,41 +570,41 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
         super.extractRenderState(graphics, mouseX, mouseY, partialTick)
         val font = minecraft.font
 
-        graphics.text(font, "♪ BlockBard", 10, 10, 0xFFFFAA)
-        graphics.text(font, "MIDI / NBS Files:", 10, 26, 0xCCCCCC)
+        graphics.text(font, "♪ BlockBard", 10, 10, opaque(0xFFFFAA))
+        graphics.text(font, "MIDI / NBS Files:", 10, 26, opaque(0xCCCCCC))
 
         // File list
         val visibleFiles = midiFiles.drop(scrollOffset).take(maxVisible)
         visibleFiles.forEachIndexed { i, file ->
             val y = 36 + i * 14
             val realIdx = scrollOffset + i
-            val color = if (realIdx == selectedIndex) 0x55FF55 else 0xDDDDDD
+            val color = if (realIdx == selectedIndex) opaque(0x55FF55) else opaque(0xDDDDDD)
             val prefix = if (realIdx == selectedIndex) "▶ " else "  "
             graphics.text(font, prefix + file.name.take(30), 34, y, color)
         }
         if (midiFiles.isEmpty()) {
-            graphics.text(font, "(no files — drop .mid/.nbs into config/blockbard/midis/)", 10, 36, 0xAAAAAA)
+            graphics.text(font, "(no files — drop .mid/.nbs into config/blockbard/midis/)", 10, 36, opaque(0xAAAAAA))
         }
 
         // Organ status section
         val organY = 175
-        graphics.text(font, "─── Organ ───", 10, organY, 0x88AAFF)
-        graphics.text(font, organScanMessage, 10, organY + 12, 0xFFFFFF)
+        graphics.text(font, "─── Organ ───", 10, organY, opaque(0x88AAFF))
+        graphics.text(font, organScanMessage, 10, organY + 12, opaque(0xFFFFFF))
 
         val counts = NoteBlockRegistry.countPerInstrument()
         var cy = organY + 24
         counts.entries.take(5).forEach { (inst, count) ->
-            graphics.text(font, "${inst.name}: $count", 10, cy, 0xDDDDDD)
+            graphics.text(font, "${inst.name}: $count", 10, cy, opaque(0xDDDDDD))
             cy += 10
         }
 
         if (readinessMessage.isNotEmpty()) {
-            graphics.text(font, readinessMessage, 10, cy + 2, 0xFF8844)
+            graphics.text(font, readinessMessage, 10, cy + 2, opaque(0xFF8844))
             cy += 12
         }
 
         if (coverageMessage.isNotEmpty()) {
-            graphics.text(font, coverageMessage, 10, cy + 2, 0xFFCC44)
+            graphics.text(font, coverageMessage, 10, cy + 2, opaque(0xFFCC44))
             cy += 12
         }
 
@@ -597,10 +616,10 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
                 TunerState.VERIFYING -> "§aVerifying..."
                 else                 -> ""
             }
-            graphics.text(font, "$stateLabel ${t.confirmedBlocks}/${t.total}", 10, cy + 2, 0x44FF88)
+            graphics.text(font, "$stateLabel ${t.confirmedBlocks}/${t.total}", 10, cy + 2, opaque(0x44FF88))
             cy += 12
             if (tuneStatusMsg.isNotEmpty()) {
-                graphics.text(font, tuneStatusMsg.take(45), 10, cy, 0xCCFFCC)
+                graphics.text(font, tuneStatusMsg.take(45), 10, cy, opaque(0xCCFFCC))
                 cy += 10
             }
         }
@@ -608,7 +627,7 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
         // Scale progress
         if (scaleIndex >= 0 && scaleIndex < scaleNotes.size) {
             val entry = scaleNotes[scaleIndex]
-            graphics.text(font, "♪ Scale: ${midiNoteToName(entry.midiNote)} ($scaleIndex/${scaleNotes.size})", 10, cy + 2, 0xAAFF44)
+            graphics.text(font, "♪ Scale: ${midiNoteToName(entry.midiNote)} ($scaleIndex/${scaleNotes.size})", 10, cy + 2, opaque(0xAAFF44))
         }
 
         // Playback status bar — checks both players since either MidiFilePlayer or
@@ -622,12 +641,12 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
             MidiFilePlayer.isPaused || NbsPlayer.isPaused -> "⏸ PAUSED"
             else -> "⏹ IDLE"
         }
-        graphics.text(font, status, 10, pbY, 0xAAFFAA)
-        graphics.text(font, "Tempo: ${"%.1f".format(MidiFilePlayer.tempoMultiplier)}x", 200, pbY, 0xCCCCCC)
+        graphics.text(font, status, 10, pbY, opaque(0xAAFFAA))
+        graphics.text(font, "Tempo: ${"%.1f".format(MidiFilePlayer.tempoMultiplier)}x", 200, pbY, opaque(0xCCCCCC))
 
         // Ping display (useful when tuning on a server)
         val ping = PlayerController.currentPingMs()
-        if (ping > 0) graphics.text(font, "Ping: ${ping}ms", 200, pbY + 10, 0xAAAAAA)
+        if (ping > 0) graphics.text(font, "Ping: ${ping}ms", 200, pbY + 10, opaque(0xAAAAAA))
     }
 
     override fun mouseClicked(event: MouseButtonEvent, doubleClick: Boolean): Boolean {
