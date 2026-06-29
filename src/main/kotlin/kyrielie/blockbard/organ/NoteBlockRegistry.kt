@@ -37,7 +37,7 @@ object NoteBlockRegistry {
     /**
      * Direct lookup by position, or null if no entry is registered there (stale
      * scan, block broken/moved since the last scan, or never scanned). Used by
-     * SoundVerifier (via PlayerController.interactWith) to resolve the expected
+     * SoundVerifier (via PlayerController.playNoteAt) to resolve the expected
      * instrument for a request whose NoteRequest.instrument is null but whose
      * resolvedPos is known (e.g. the chromatic scale test) — falling back to "any
      * instrument is fine" in that case would make verification a no-op for exactly
