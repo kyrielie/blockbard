@@ -232,7 +232,105 @@ object PlayerController {
     }
 
     /**
-     * Sends a right-click interact to a noteblock.
+     * Aims at [pos] (rotation + hit-face/hitResult computation) — shared by both
+     * interactWith(pos) (tuning, right-click/useItemOn) and playNoteAt(pos) (playback,
+     * left-click/attack). Returns the BlockHitResult to interact with, or null if the
+     * block is out of reach. Does not perform the interaction itself — callers choose
+     * useItemOn vs startDestroyBlock/stopDestroyBlock depending on intent.
+     */
+    private fun aimAt(pos: BlockPos, caller: String): BlockHitResult? {
+        val mc = Minecraft.getInstance()
+        val player = mc.player ?: run {
+            logger.warn("$caller $pos: no player")
+            return null
+        }
+
+        if (organMap == null) {
+            logger.warn("$caller $pos: organMap is null — Center not pressed yet")
+        }
+
+        val eyePos = player.eyePosition
+        val target = Vec3(pos.x + 0.5, pos.y + 1.0, pos.z + 0.5)
+        val delta = target.subtract(eyePos)
+        val distance = delta.length()
+        val reach = organMap?.getReachInfo(pos)
+        val mapDistStr = reach?.distance?.let { "%.2f".format(it) } ?: "n/a"
+
+        if (distance > REACH_DISTANCE) {
+            logger.warn(
+                "$caller $pos: too far liveDist=${"%.2f".format(distance)} mapDist=$mapDistStr " +
+                    "clientPos=${player.position()} ping=${currentPingMs()}"
+            )
+            return null
+        }
+
+        // Determine target rotation — prefer primed value (set one tick earlier in START_CLIENT_TICK),
+        // fall back to map precompute, fall back to live computation.
+        val (yaw, pitch) = primedRotation?.takeIf { it.first == pos }
+            ?.let { Pair(it.second, it.third) }
+            ?: (reach?.let { Pair(it.yaw, it.pitch) } ?: vecToYawPitch(delta))
+        primedRotation = null
+
+        // Re-apply rotation immediately before firing the interaction — same approach as
+        // the old working version. The primeRotation in START_CLIENT_TICK gets the
+        // rotation into the movement packet; re-applying here ensures the rotation is
+        // correct for the interaction packet regardless of whether anything overwrote it
+        // between START and END tick.
+        val yRotBefore = player.yRot
+        val xRotBefore = player.xRot
+        player.setYRot(yaw)
+        player.setXRot(pitch)
+        val yRotAfter = player.yRot
+        val xRotAfter = player.xRot
+        if (yRotAfter != yaw || xRotAfter != pitch) {
+            logger.warn(
+                "$caller $pos: rotation override detected — wanted yaw=${"%.2f".format(yaw)} pitch=${"%.2f".format(pitch)}" +
+                    " got yaw=${"%.2f".format(yRotAfter)} pitch=${"%.2f".format(xRotAfter)}"
+            )
+        }
+        logger.info(
+            "$caller $pos: rot ${"%.2f".format(yRotBefore)},${"%.2f".format(xRotBefore)}" +
+                " -> ${"%.2f".format(yRotAfter)},${"%.2f".format(xRotAfter)}" +
+                " liveDist=${"%.2f".format(distance)} mapDist=$mapDistStr ping=${currentPingMs()}"
+        )
+
+        // Derive hit face from approach direction — same as old working version.
+        // Direction.UP is wrong for blocks approached horizontally.
+        val hitFace = when {
+            Math.abs(delta.x) > Math.abs(delta.y) && Math.abs(delta.x) > Math.abs(delta.z) ->
+                if (delta.x > 0) Direction.WEST else Direction.EAST
+            Math.abs(delta.y) > Math.abs(delta.z) ->
+                if (delta.y > 0) Direction.DOWN else Direction.UP
+            else ->
+                if (delta.z > 0) Direction.NORTH else Direction.SOUTH
+        }
+
+        // Use mc.hitResult when it's pointing at our block — the server-side validation
+        // may check that the hit position is consistent with the player's facing.
+        val liveHit = mc.hitResult
+        return if (
+            liveHit is BlockHitResult &&
+            liveHit.blockPos == pos &&
+            liveHit.type == HitResult.Type.BLOCK
+        ) {
+            logger.debug("$caller $pos: using live hitResult face=${liveHit.direction}")
+            liveHit
+        } else {
+            val liveDesc = when (liveHit) {
+                is BlockHitResult -> "BlockHit(${liveHit.blockPos},${liveHit.direction})"
+                null -> "null"
+                else -> liveHit.type.name
+            }
+            logger.debug("$caller $pos: hitResult not on target ($liveDesc) — using synthetic face=$hitFace")
+            BlockHitResult(target, hitFace, pos, false)
+        }
+    }
+
+    /**
+     * Sends a right-click interact to a noteblock. Used by tuning only — see
+     * NoteBlock.useWithoutItem in vanilla source: a right-click cycles the block's NOTE
+     * property by one (state.cycle(NOTE)), which is exactly the tuning gesture and
+     * exactly why this must never be called during playback (see playNoteAt below).
      *
      * IMPORTANT: The player must have empty hands for useWithoutItem to be reached.
      * If the player holds any item, performUseItemOn() may short-circuit before
@@ -254,107 +352,79 @@ object PlayerController {
             return false
         }
 
-        if (organMap == null) {
-            logger.warn("interactWith $pos: organMap is null — Center not pressed yet")
-        }
+        val hitResult = aimAt(pos, "interactWith") ?: return false
+        mc.gameMode?.useItemOn(player, InteractionHand.MAIN_HAND, hitResult)
+        return true
+    }
 
-        val eyePos = player.eyePosition
-        val target = Vec3(pos.x + 0.5, pos.y + 1.0, pos.z + 0.5)
-        val delta = target.subtract(eyePos)
-        val distance = delta.length()
-        val reach = organMap?.getReachInfo(pos)
-        val mapDistStr = reach?.distance?.let { "%.2f".format(it) } ?: "n/a"
-
-        if (distance > REACH_DISTANCE) {
-            logger.warn(
-                "interactWith $pos: too far liveDist=${"%.2f".format(distance)} mapDist=$mapDistStr " +
-                    "clientPos=${player.position()} ping=${currentPingMs()}"
-            )
+    /**
+     * Plays a noteblock without changing its pitch — the playback counterpart to
+     * interactWith() above. Uses the left-click/attack interaction instead of
+     * right-click/useItemOn: NoteBlock.attack() in vanilla source calls playNote()
+     * directly with no state.cycle(NOTE) call at all, unlike useWithoutItem(). This is
+     * the fix for the bug where every played note also advanced that block's tuning by
+     * one semitone, since the original implementation used useItemOn (right-click) for
+     * both tuning and playback indiscriminately.
+     *
+     * The client has no way to invoke NoteBlock.attack()'s effect directly — it only
+     * runs server-side (guarded by `if (!level.isClientSide())` in vanilla source), so
+     * the client's role is limited to notifying the server via the same packet path
+     * normal left-click mining uses: MultiPlayerGameMode.startDestroyBlock(pos, dir)
+     * triggers the server-side attack() call on its first invocation per target
+     * (destroyProgress == 0f), but it also unconditionally begins a mining-progress
+     * sequence (isDestroying = true) — left unchecked, repeatedly hitting the same
+     * block would accumulate destroy progress across calls and eventually break it.
+     * stopDestroyBlock() is called immediately after, every time, with no exceptions,
+     * to abort that sequence before any progress can persist between notes — a single
+     * call's progress fraction is always well under 1.0 for a noteblock's normal
+     * hardness, so this is safe even at the queue's max dispatch rate of one note/tick.
+     */
+    fun playNoteAt(pos: BlockPos): Boolean {
+        val mc = Minecraft.getInstance()
+        val player = mc.player ?: run {
+            logger.warn("playNoteAt $pos: no player")
             return false
         }
 
-        // Determine target rotation — prefer primed value (set one tick earlier in START_CLIENT_TICK),
-        // fall back to map precompute, fall back to live computation.
-        val (yaw, pitch) = primedRotation?.takeIf { it.first == pos }
-            ?.let { Pair(it.second, it.third) }
-            ?: (reach?.let { Pair(it.yaw, it.pitch) } ?: vecToYawPitch(delta))
-        primedRotation = null
-
-        // Re-apply rotation immediately before firing useItemOn — same approach as the old
-        // working version. The primeRotation in START_CLIENT_TICK gets the rotation into the
-        // movement packet; re-applying here ensures the rotation is correct for the use packet
-        // regardless of whether anything overwrote it between START and END tick.
-        val yRotBefore = player.yRot
-        val xRotBefore = player.xRot
-        player.setYRot(yaw)
-        player.setXRot(pitch)
-        val yRotAfter = player.yRot
-        val xRotAfter = player.xRot
-        if (yRotAfter != yaw || xRotAfter != pitch) {
-            logger.warn(
-                "interactWith $pos: rotation override detected — wanted yaw=${"%.2f".format(yaw)} pitch=${"%.2f".format(pitch)}" +
-                    " got yaw=${"%.2f".format(yRotAfter)} pitch=${"%.2f".format(xRotAfter)}"
-            )
-        }
-        logger.info(
-            "interactWith $pos: rot ${"%.2f".format(yRotBefore)},${"%.2f".format(xRotBefore)}" +
-                " -> ${"%.2f".format(yRotAfter)},${"%.2f".format(xRotAfter)}" +
-                " liveDist=${"%.2f".format(distance)} mapDist=$mapDistStr ping=${currentPingMs()}"
-        )
-
-        // Derive hit face from approach direction — same as old working version.
-        // Direction.UP is wrong for blocks approached horizontally.
-        val hitFace = when {
-            Math.abs(delta.x) > Math.abs(delta.y) && Math.abs(delta.x) > Math.abs(delta.z) ->
-                if (delta.x > 0) Direction.WEST else Direction.EAST
-            Math.abs(delta.y) > Math.abs(delta.z) ->
-                if (delta.y > 0) Direction.DOWN else Direction.UP
-            else ->
-                if (delta.z > 0) Direction.NORTH else Direction.SOUTH
+        // ── Creative / Spectator guard — same rationale as interactWith ──
+        val gameMode = mc.gameMode?.playerMode
+        if (gameMode == GameType.CREATIVE || gameMode == GameType.SPECTATOR) {
+            val msg = "§e[BlockBard] §cCannot interact in ${gameMode.getName()} mode"
+            player.sendSystemMessage(net.minecraft.network.chat.Component.literal(msg))
+            logger.warn("playNoteAt $pos: blocked — player is in $gameMode mode")
+            return false
         }
 
-        // Use mc.hitResult when it's pointing at our block — the server-side validation
-        // may check that the hit position is consistent with the player's facing.
-        val liveHit = mc.hitResult
-        val hitResult: BlockHitResult = if (
-            liveHit is BlockHitResult &&
-            liveHit.blockPos == pos &&
-            liveHit.type == HitResult.Type.BLOCK
-        ) {
-            logger.debug("interactWith $pos: using live hitResult face=${liveHit.direction}")
-            liveHit
-        } else {
-            val liveDesc = when (liveHit) {
-                is BlockHitResult -> "BlockHit(${liveHit.blockPos},${liveHit.direction})"
-                null -> "null"
-                else -> liveHit.type.name
-            }
-            logger.debug("interactWith $pos: hitResult not on target ($liveDesc) — using synthetic face=$hitFace")
-            BlockHitResult(target, hitFace, pos, false)
-        }
-
-        mc.gameMode?.useItemOn(player, InteractionHand.MAIN_HAND, hitResult)
-        return true
+        val hitResult = aimAt(pos, "playNoteAt") ?: return false
+        val dispatched = mc.gameMode?.startDestroyBlock(pos, hitResult.direction) ?: false
+        mc.gameMode?.stopDestroyBlock()
+        return dispatched
     }
 
     fun interactWith(entry: NoteBlockEntry): Boolean = interactWith(entry.pos)
 
     /**
-     * NoteRequest-aware overload used by ArpeggioScheduler.interactDelegate during
-     * playback. Registers the intended (midiNote, instrument) with SoundVerifier
-     * immediately before firing the interaction, so the next note_block SoundInstance
-     * the client plays can be compared against what we meant to play — see
-     * SoundVerifier kdoc for why this has to happen here rather than after
-     * interactWith() returns: the server (same process in singleplayer) can dispatch
-     * the resulting sound packet before this function returns, so registering after
-     * the call risks missing it.
+     * NoteRequest-aware playback entry point, wired to ArpeggioScheduler.interactDelegate
+     * by the client entrypoint. Registers the intended (midiNote, instrument) with
+     * SoundVerifier immediately before firing the interaction, so the next note_block
+     * SoundInstance the client plays can be compared against what we meant to play —
+     * see SoundVerifier kdoc for why this has to happen here rather than after the call
+     * returns: the server (same process in singleplayer) can dispatch the resulting
+     * sound packet before this function returns, so registering after the call risks
+     * missing it.
+     *
+     * Calls playNoteAt(pos), not interactWith(pos) — see playNoteAt's kdoc. This was
+     * previously interactWith(pos), which meant every played note also advanced that
+     * block's tuning by one semitone (right-click cycles NOTE; this needs the
+     * left-click/attack interaction that does not).
      *
      * The tuner's interactBlock lambda (MainScreen.startTuning()) intentionally keeps
-     * using the request-less interactWith(pos) overload defined earlier in this file —
-     * a tuning click isn't "playing" any particular note, it's incrementing pitch by
-     * one semitone, so there is no intended (midiNote, instrument) to register.
+     * using the request-less interactWith(pos) overload above — a tuning click isn't
+     * "playing" any particular note, it's incrementing pitch by one semitone, so there
+     * is no intended (midiNote, instrument) to register, and it needs the right-click
+     * behavior, not playNoteAt's left-click behavior.
      */
-    fun interactWith(pos: BlockPos, request: NoteRequest): Boolean {
+    fun playNoteAt(pos: BlockPos, request: NoteRequest): Boolean {
         // request.instrument is null for callers with no instrument source (scale test,
         // direct keyboard 1-9 presses — see NoteRequest kdoc). Falling back to "any
         // instrument is fine" there would make SoundVerifier a no-op for exactly the
@@ -364,7 +434,7 @@ object PlayerController {
         // expected (instrument, noteIndex) to check against.
         val expectedInstrument = request.instrument ?: NoteBlockRegistry.get(pos)?.instrument
         SoundVerifier.expectNote(pos, request.midiNote, expectedInstrument)
-        return interactWith(pos)
+        return playNoteAt(pos)
     }
 
     fun clearOrganMap() {

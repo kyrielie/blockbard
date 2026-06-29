@@ -115,11 +115,15 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
         }.pos(10, 100).size(60, 16).build())
 
         // ── Organ controls ──
+        // y=260, not the old y=200 — the organ status panel above (extractRenderState)
+        // is variable-height (instrument count + status messages + tuner state), and at
+        // y=200 it reliably grew tall enough to draw underneath this row. y=260 clears
+        // the panel's new bounded worst-case height (~254, see extractRenderState).
         addRenderableWidget(Button.builder(Component.literal("Scan")) {
             logger.info("Scan clicked")
             OrganScanner.scan()
             updateOrganInfo()
-        }.pos(10, 200).size(50, 16).build())
+        }.pos(10, 260).size(50, 16).build())
 
         addRenderableWidget(Button.builder(Component.literal("Center")) {
             logger.info("Center clicked")
@@ -132,17 +136,17 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
             }
             chat(organScanMessage)
             logger.info("Center result: $organScanMessage")
-        }.pos(65, 200).size(60, 16).build())
+        }.pos(65, 260).size(60, 16).build())
 
         addRenderableWidget(Button.builder(Component.literal("Tune")) {
             logger.info("Tune clicked")
             startTuning()
-        }.pos(130, 200).size(50, 16).build())
+        }.pos(130, 260).size(50, 16).build())
 
         addRenderableWidget(Button.builder(Component.literal("▶ Scale")) {
             logger.info("Play Scale clicked")
             playScale()
-        }.pos(185, 200).size(60, 16).build())
+        }.pos(185, 260).size(60, 16).build())
 
         // ── Playback controls ──
         addRenderableWidget(Button.builder(Component.literal("▶ Play")) {
@@ -152,7 +156,7 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
                 NbsPlayer.isPaused -> { NbsPlayer.resume(); chat("Resumed") }
                 else -> startPlayback()
             }
-        }.pos(10, 222).size(55, 16).build())
+        }.pos(10, 282).size(55, 16).build())
 
         addRenderableWidget(Button.builder(Component.literal("⏸ Pause")) {
             logger.info("Pause clicked")
@@ -163,7 +167,7 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
                 NbsPlayer.isPlaying -> { NbsPlayer.pause(); chat("Paused") }
                 else -> chat("Nothing playing")
             }
-        }.pos(70, 222).size(60, 16).build())
+        }.pos(70, 282).size(60, 16).build())
 
         addRenderableWidget(Button.builder(Component.literal("⏹ Stop")) {
             logger.info("Stop clicked")
@@ -172,24 +176,24 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
             stopScale()
             abortTuning()
             chat("Stopped")
-        }.pos(135, 222).size(50, 16).build())
+        }.pos(135, 282).size(50, 16).build())
 
         addRenderableWidget(Button.builder(Component.literal("⇀ Shuffle")) {
             logger.info("Shuffle clicked")
             shuffle()
-        }.pos(190, 222).size(60, 16).build())
+        }.pos(190, 282).size(60, 16).build())
 
         addRenderableWidget(Button.builder(Component.literal("Tempo -")) {
             MidiFilePlayer.tempoMultiplier = (MidiFilePlayer.tempoMultiplier - 0.1f).coerceAtLeast(0.5f)
             logger.info("Tempo − → ${MidiFilePlayer.tempoMultiplier}")
             chat("Tempo: ${"%.1f".format(MidiFilePlayer.tempoMultiplier)}x")
-        }.pos(10, 242).size(55, 16).build())
+        }.pos(10, 302).size(55, 16).build())
 
         addRenderableWidget(Button.builder(Component.literal("Tempo +")) {
             MidiFilePlayer.tempoMultiplier = (MidiFilePlayer.tempoMultiplier + 0.1f).coerceAtMost(2.0f)
             logger.info("Tempo + → ${MidiFilePlayer.tempoMultiplier}")
             chat("Tempo: ${"%.1f".format(MidiFilePlayer.tempoMultiplier)}x")
-        }.pos(70, 242).size(55, 16).build())
+        }.pos(70, 302).size(55, 16).build())
 
         addRenderableWidget(Button.builder(Component.literal("Close")) {
             logger.info("Close clicked")
@@ -362,9 +366,29 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
     private fun updateCoverageMessage(result: OrganAssignment) {
         val covered   = result.assignment.size
         val total     = covered + result.unplayable.size
-        val unplayable = result.unplayable.map { it.displayName() }
-        coverageMessage = "$covered/$total notes covered" +
-                if (unplayable.isNotEmpty()) ". Missing: ${unplayable.take(4).joinToString()}" else ""
+        // Notes with a specific instrument requirement that still ended up unplayable
+        // already went through InstrumentShifter's octave/instrument-shift fallback
+        // inside buildAssignment and failed there too (see buildAssignment kdoc) — so
+        // "add N more of instrument X" is accurate here: no amount of retuning existing
+        // blocks would have helped, only adding more blocks of that instrument can.
+        // Null-instrument notes (no instrument was specified at all — see NotePitch)
+        // searched every instrument and still failed, so they can't be attributed to
+        // one instrument's shortfall; reported as a separate flat count instead.
+        val byInstrument = result.unplayable.filter { it.instrument != null }
+            .groupBy { it.instrument!! }
+            .mapValues { (_, notes) -> notes.map { it.midiNote }.distinct().size }
+        val anyInstrumentCount = result.unplayable.count { it.instrument == null }
+
+        coverageMessage = buildString {
+            append("$covered/$total notes covered")
+            if (byInstrument.isNotEmpty()) {
+                append(". Add: ")
+                append(byInstrument.entries.take(4).joinToString { (inst, count) -> "$count ${inst.name}" })
+            }
+            if (anyInstrumentCount > 0) {
+                append(". $anyInstrumentCount note(s) unplayable on any instrument")
+            }
+        }
         logger.info("coverage: $coverageMessage")
     }
 
@@ -489,13 +513,18 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
             readinessMessage = if (report.isFullyCovered) {
                 "Readiness: organ fully covers this file (${report.totalRequired} notes)"
             } else {
+                val shortfall = report.shortfallByInstrument()
                 "Readiness: ${report.coveragePercent}% (${report.coveredNotes.size}/${report.totalRequired})" +
-                    if (report.missingInstruments.isNotEmpty())
-                        ". Missing instruments: ${report.missingInstruments.take(4).joinToString { it.name }}"
+                    if (shortfall.isNotEmpty())
+                        ". Need: " + shortfall.entries.take(4).joinToString { (inst, count) -> "$count ${inst.name}" }
                     else ""
             }
             if (!report.isFullyCovered) {
-                chatWarn("Coverage: ${report.coveragePercent}% (${report.coveredNotes.size}/${report.totalRequired} notes) — see organ panel")
+                val shortfall = report.shortfallByInstrument()
+                val needMsg = if (shortfall.isNotEmpty())
+                    " — need " + shortfall.entries.joinToString { (inst, count) -> "$count ${inst.name}" }
+                else ""
+                chatWarn("Coverage: ${report.coveragePercent}% (${report.coveredNotes.size}/${report.totalRequired} notes)$needMsg")
             }
         } else if (file.extension.lowercase() == "nbs") {
             try {
@@ -586,26 +615,43 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
             graphics.text(font, "(no files — drop .mid/.nbs into config/blockbard/midis/)", 10, 36, opaque(0xAAAAAA))
         }
 
-        // Organ status section
+        // Organ status section. Capped to a bounded number of lines (unlike the
+        // uncapped version this replaced) because this panel's height used to grow
+        // with how many distinct instruments were scanned plus however many of
+        // readiness/coverage/tuner-status lines happened to be showing at once — with
+        // enough instruments or messages active simultaneously, the content reliably
+        // grew past y=200 and drew underneath the Scan/Center/Tune/Scale button row
+        // (and, in worse cases, the rows below that too). Buttons are rendered first
+        // (super.extractRenderState() runs before any of this), so the overlapping
+        // text was drawn on top of the buttons rather than hidden behind them — visible
+        // but illegible where the two collided.
         val organY = 175
         graphics.text(font, "─── Organ ───", 10, organY, opaque(0x88AAFF))
-        graphics.text(font, organScanMessage, 10, organY + 12, opaque(0xFFFFFF))
+        graphics.text(font, organScanMessage.take(50), 10, organY + 11, opaque(0xFFFFFF))
 
         val counts = NoteBlockRegistry.countPerInstrument()
-        var cy = organY + 24
-        counts.entries.take(5).forEach { (inst, count) ->
+        var cy = organY + 22
+        val maxInstrumentLines = 3
+        counts.entries.take(maxInstrumentLines).forEach { (inst, count) ->
             graphics.text(font, "${inst.name}: $count", 10, cy, opaque(0xDDDDDD))
+            cy += 9
+        }
+        if (counts.size > maxInstrumentLines) {
+            graphics.text(font, "+${counts.size - maxInstrumentLines} more instrument(s)", 10, cy, opaque(0x999999))
+            cy += 9
+        }
+
+        // Readiness (pre-Tune) and coverage (post-Tune) are never both the most
+        // current/relevant status at once — coverage only exists after a Tune attempt,
+        // at which point it supersedes the readiness estimate for the same file. Showing
+        // only one of the two (preferring coverage once it exists) instead of stacking
+        // both keeps this section's height bounded regardless of how many gap-fix
+        // messages either one happens to produce.
+        val statusLine = coverageMessage.takeIf { it.isNotEmpty() } ?: readinessMessage
+        if (statusLine.isNotEmpty()) {
+            val color = if (coverageMessage.isNotEmpty()) opaque(0xFFCC44) else opaque(0xFF8844)
+            graphics.text(font, statusLine.take(50), 10, cy + 1, color)
             cy += 10
-        }
-
-        if (readinessMessage.isNotEmpty()) {
-            graphics.text(font, readinessMessage, 10, cy + 2, opaque(0xFF8844))
-            cy += 12
-        }
-
-        if (coverageMessage.isNotEmpty()) {
-            graphics.text(font, coverageMessage, 10, cy + 2, opaque(0xFFCC44))
-            cy += 12
         }
 
         // Tuner status

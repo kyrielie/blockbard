@@ -29,7 +29,7 @@ data class NoteRequest(
  * Tick-based queue that serialises simultaneous note requests into sequential
  * block interactions. One note is dispatched per tick via [onTick].
  *
- * [interactDelegate] is wired by BlockBardClient to PlayerController.interactWith().
+ * [interactDelegate] is wired by BlockBardClient to PlayerController.playNoteAt().
  */
 object ArpeggioScheduler {
 
@@ -59,12 +59,15 @@ object ArpeggioScheduler {
     var rotationInProgressTimeoutMs: Long = 1500L
 
     /**
-     * Wired to PlayerController.interactWith() by the client entrypoint. Takes the
-     * target BlockPos plus the NoteRequest being dispatched — the request (not just
-     * its midiNote) is threaded through so PlayerController can hand the full intended
-     * (midiNote, instrument) pair to SoundVerifier for ground-truth comparison against
-     * the actual SoundInstance the client plays, without SoundVerifier needing to
-     * duplicate ArpeggioScheduler's own bookkeeping.
+     * Wired to PlayerController.playNoteAt(pos, request) by the client entrypoint — a
+     * left-click/attack interaction, deliberately not interactWith()'s right-click
+     * (which cycles the block's tuning by one semitone; see PlayerController.playNoteAt
+     * kdoc for why playback must never use that path). Takes the target BlockPos plus
+     * the NoteRequest being dispatched — the request (not just its midiNote) is
+     * threaded through so PlayerController can hand the full intended (midiNote,
+     * instrument) pair to SoundVerifier for ground-truth comparison against the actual
+     * SoundInstance the client plays, without SoundVerifier needing to duplicate
+     * ArpeggioScheduler's own bookkeeping.
      */
     var interactDelegate: ((BlockPos, NoteRequest) -> Boolean)? = null
 

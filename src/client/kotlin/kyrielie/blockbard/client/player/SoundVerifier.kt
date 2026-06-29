@@ -41,9 +41,9 @@ import kotlin.math.roundToInt
  *     NoteBlock.getPitchFromNote(note) = 2^((note-12)/12). This runs server-side in
  *     NoteBlock.triggerEvent() and is inverted below in pitchToNoteIndex().
  *
- * Usage: PlayerController.interactWith(pos, request) calls [expectNote] immediately
+ * Usage: PlayerController.playNoteAt(pos, request) calls [expectNote] immediately
  * before firing the interaction (not after — the resulting sound can arrive before
- * interactWith() returns, especially in singleplayer where client and server share a
+ * playNoteAt() returns, especially in singleplayer where client and server share a
  * thread/tick). [onPlaySound] then matches the next note_block sound against the
  * oldest pending expectation within [matchWindowMs], logs one line, and updates the
  * rolling tally that [logSummary] reports every [summaryEvery] notes — see kdoc on
@@ -82,7 +82,7 @@ object SoundVerifier : SoundEventListener {
     /**
      * Registers an expectation: "the next note_block sound near [pos] should be
      * [instrument] (or any, if null) playing MIDI note [midiNote]." Called by
-     * PlayerController.interactWith(pos, request) immediately before useItemOn.
+     * PlayerController.playNoteAt(pos, request) immediately before the attack interaction.
      */
     fun expectNote(pos: BlockPos, midiNote: Int, instrument: NoteBlockInstrument?) = synchronized(lock) {
         pruneExpired(System.currentTimeMillis())
