@@ -2,6 +2,8 @@ package kyrielie.blockbard.client.playback
 
 import kyrielie.blockbard.organ.ArpeggioScheduler
 import kyrielie.blockbard.organ.NoteRequest
+import kyrielie.blockbard.util.isPitched
+import kyrielie.blockbard.util.midiBase
 import kyrielie.blockbard.util.readByteChecked
 import kyrielie.blockbard.util.readLEInt
 import kyrielie.blockbard.util.readLEShort
@@ -216,13 +218,19 @@ object NbsPlayer {
                     if (!isPlaying) return@Thread
                     currentTick = tick.toLong()
                     notesByTick[tick]?.forEach { note ->
-                        val midiNote = note.key + 21  // NBS key → MIDI note
+                        val rawMidi = note.key + 21  // NBS key → MIDI note
                         // Resolve the NBS instrument byte so playback targets a block
                         // tuned for the right instrument, not just any block at this
                         // pitch — see nbsInstrumentToBlock kdoc. null for custom
                         // (non-vanilla) instruments, which falls back to pitch-only
                         // matching in ArpeggioScheduler.resolvePos.
                         val instrument = nbsInstrumentToBlock(note.instrument)
+                        // Unpitched instruments (SNARE, HAT, BASEDRUM) are assigned to a
+                        // single canonical block at midiBase. Use that same midiNote here
+                        // so the lookup in ArpeggioScheduler matches the assignment entry.
+                        val midiNote = if (instrument != null && !instrument.isPitched)
+                            instrument.midiBase
+                        else rawMidi
                         ArpeggioScheduler.enqueue(NoteRequest(midiNote, instrument = instrument))
                     }
                 }

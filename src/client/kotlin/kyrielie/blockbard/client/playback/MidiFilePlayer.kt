@@ -4,6 +4,8 @@ import kyrielie.blockbard.midi.MidiChannelResolver
 import kyrielie.blockbard.organ.ArpeggioScheduler
 import kyrielie.blockbard.organ.NotePitch
 import kyrielie.blockbard.organ.NoteRequest
+import kyrielie.blockbard.util.isPitched
+import kyrielie.blockbard.util.midiBase
 import net.minecraft.world.level.block.state.properties.NoteBlockInstrument
 import javax.sound.midi.MetaMessage
 import javax.sound.midi.MidiSystem
@@ -96,7 +98,17 @@ object MidiFilePlayer {
         val sortedEvents = resolvedEvents
             .map { TimedNoteEvent(it.tick, it.midiNote, it.instrument) }
             .sortedBy { it.tick }
-        val usageCounts = sortedEvents
+
+        // Unpitched instruments (SNARE, HAT, BASEDRUM) produce the same sound regardless
+        // of noteIndex, so all MIDI notes for them are equivalent. Collapse them to the
+        // instrument's midiBase before counting so the mapper requests exactly one block
+        // per unpitched instrument instead of one per distinct drum MIDI note.
+        val normalizedForCounting = sortedEvents.map { event ->
+            if (!event.instrument.isPitched)
+                event.copy(midiNote = event.instrument.midiBase)
+            else event
+        }
+        val usageCounts = normalizedForCounting
             .groupBy { NotePitch(it.midiNote, it.instrument) }
             .mapValues { it.value.size }
 

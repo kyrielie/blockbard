@@ -64,8 +64,24 @@ val NoteBlockInstrument.midiBase: Int
         else -> 54
     }
 
-/** Returns whether a MIDI note falls within this instrument's native range (0–24 semitones from midiBase). */
+/**
+ * Whether this instrument responds to noteIndex tuning at all.
+ * SNARE, HAT, and BASEDRUM play a fixed sound regardless of noteIndex — right-clicking
+ * changes the block state value but has no audible effect. All other vanilla instruments
+ * are fully pitched across noteIndex 0–24.
+ */
+val NoteBlockInstrument.isPitched: Boolean
+    get() = this != NoteBlockInstrument.SNARE &&
+            this != NoteBlockInstrument.HAT &&
+            this != NoteBlockInstrument.BASEDRUM
+
+/**
+ * Returns whether a MIDI note falls within this instrument's native range (0–24 semitones
+ * from midiBase). Always false for unpitched instruments — they cannot be tuned to any
+ * specific pitch, so no MIDI note should be "covered" by them in the assignment sense.
+ */
 fun NoteBlockInstrument.coversNatively(midiNote: Int): Boolean {
+    if (!isPitched) return false
     val min = midiBase
     val max = midiBase + 24
     return midiNote in min..max
