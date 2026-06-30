@@ -12,6 +12,7 @@ import kyrielie.blockbard.client.player.SoundVerifier
 import kyrielie.blockbard.organ.ArpeggioScheduler
 import kyrielie.blockbard.organ.InstrumentShifter
 import kyrielie.blockbard.client.organ.OrganScanner
+import kyrielie.blockbard.util.DebugLog
 import net.fabricmc.api.ClientModInitializer
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents
 import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper
@@ -32,18 +33,28 @@ object BlockBardClient : ClientModInitializer {
         logger.info("BlockBard initializing...")
         ConfigManager.load()
         val cfg = ConfigManager.config
-        logger.info("Config loaded: scanRadius=${cfg.scanRadius}, shiftMode=${cfg.shiftMode}, arpeggioStaleTimeoutMs=${cfg.arpeggioStaleTimeoutMs}")
+        logger.info(
+            "Config loaded: scanRadius=${cfg.scanRadius}, shiftMode=${cfg.shiftMode}, " +
+            "arpeggioStaleTimeoutMs=${cfg.arpeggioStaleTimeoutMs}, " +
+            "debugLogging=${cfg.debugLogging}, maxNotesPerTick=${cfg.maxNotesPerTick}, " +
+            "loopMode=${cfg.loopMode}"
+        )
+
+        // Tier 1: apply debug logging flag to DebugLog before anything else logs
+        DebugLog.enabled = cfg.debugLogging
 
         OrganScanner.scanRadius = cfg.scanRadius
         InstrumentShifter.mode = cfg.shiftModeEnum()
         InstrumentShifter.maxOctaveShift = cfg.maxOctaveShift
         ArpeggioScheduler.staleTimeoutMs = cfg.arpeggioStaleTimeoutMs
         ArpeggioScheduler.rotationInProgressTimeoutMs = cfg.rotationInProgressTimeoutMs
+        // Tier 2: max notes per tick
+        ArpeggioScheduler.maxNotesPerTick = cfg.maxNotesPerTick.coerceIn(1, 8)
         MAX_ROTATION_DEGREES_PER_TICK = cfg.maxRotationDegreesPerTick
         ROTATION_CONVERGENCE_THRESHOLD_DEGREES = cfg.rotationConvergenceThresholdDegrees
 
         ArpeggioScheduler.interactDelegate = { pos, request ->
-            logger.debug("interactDelegate: → $pos (MIDI ${request.midiNote})")
+            logger.debug("interactDelegate: -> $pos (MIDI ${request.midiNote})")
             PlayerController.playNoteAt(pos, request)
         }
         ArpeggioScheduler.rotationConvergedDelegate = { pos ->
@@ -61,26 +72,17 @@ object BlockBardClient : ClientModInitializer {
         KeyboardInputHandler.register()
         PlaybackHud.register()
 
-        // Prime rotation in START_CLIENT_TICK — this fires before LocalPlayer.tick(),
-        // which calls sendPosition(), so each tick's eased rotation step is in that
-        // tick's movement packet before END_CLIENT_TICK runs. primeRotation() now eases
-        // toward the target at a capped degrees/tick rate (see PlayerController.
-        // MAX_ROTATION_DEGREES_PER_TICK) rather than snapping instantly — large turns
-        // take several ticks to converge. ArpeggioScheduler.onTick() (END_CLIENT_TICK,
-        // below) only fires the actual interact once PlayerController.rotationConverged()
-        // confirms the turn has finished, so the use packet never arrives mid-turn.
+        // Prime rotation in START_CLIENT_TICK -- fires before LocalPlayer.tick() calls
+        // sendPosition(), so each tick's eased rotation step is included in that tick's
+        // movement packet. Drives playback rotation only; tuning does not use rotation
+        // gating (see NoteBlockTuner for rationale).
         ClientTickEvents.START_CLIENT_TICK.register { _ ->
             ArpeggioScheduler.peekNextPos()?.let { PlayerController.primeRotation(it) }
         }
 
         ClientTickEvents.END_CLIENT_TICK.register { mc ->
-            // Minecraft.getInstance() (and therefore mc.soundManager) does not exist yet
-            // during onInitializeClient() — Fabric Loader calls all ClientModInitializers
-            // before the Minecraft instance is constructed (confirmed against Minecraft.java:
-            // soundManager is a constructor-assigned field, and the constructor runs after
-            // entrypoint dispatch). Registering here, on the first tick the callback fires,
-            // is the standard deferred-init pattern: by END_CLIENT_TICK the client is fully
-            // up. A one-shot flag avoids calling addListener repeatedly every tick.
+            // SoundVerifier needs mc.soundManager, which is not available during
+            // onInitializeClient() -- deferred to first tick via a one-shot flag.
             if (!soundVerifierRegistered) {
                 mc.soundManager.addListener(SoundVerifier)
                 soundVerifierRegistered = true
@@ -88,12 +90,12 @@ object BlockBardClient : ClientModInitializer {
             }
 
             while (openGuiKey.consumeClick()) {
-                logger.info("B pressed — opening MainScreen")
+                logger.info("B pressed -- opening MainScreen")
                 if (mc.gui.screen() == null) mc.gui.setScreen(MainScreen())
             }
             while (toggleHudKey.consumeClick()) {
                 PlaybackHud.isVisible = !PlaybackHud.isVisible
-                logger.info("H pressed — HUD visible=${PlaybackHud.isVisible}")
+                logger.info("H pressed -- HUD visible=${PlaybackHud.isVisible}")
             }
             ArpeggioScheduler.onTick()
         }

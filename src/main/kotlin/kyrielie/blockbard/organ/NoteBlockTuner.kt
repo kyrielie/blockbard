@@ -9,8 +9,8 @@ import org.slf4j.LoggerFactory
 
 data class TuneTarget(
     val pos: BlockPos,
-    val snapshotNote: Int,  // noteIndex at scan time — used only for initial click estimate
-    val targetNote: Int,    // 0–24, required noteIndex after tuning
+    val snapshotNote: Int,  // noteIndex at scan time -- used only for initial click estimate
+    val targetNote: Int,    // 0-24, required noteIndex after tuning
     val instrument: NoteBlockInstrument
 ) {
     /** Estimated clicks from snapshot. Actual clicks are driven by live world reads. */
@@ -21,16 +21,18 @@ data class TuneTarget(
 enum class TunerState { IDLE, TUNING, VERIFYING, DONE, FAILED }
 
 /**
- * Stateful noteblock tuner modelled on DiscJockey's approach:
+ * Stateful noteblock tuner.
  *
  * - Re-reads the actual world blockstate every tick for every target.
- *   The snapshot note in TuneTarget is only used for the initial click estimate;
- *   the live world read is always authoritative for deciding whether to click.
  * - Skips blocks that are already at their target note (live world read).
  * - Maintains [notePredictions] for optimistic in-flight tracking (TTL = ping*2 + 150ms).
  * - Token-bucket rate limiter: 8 tokens / 310ms (matches Paper's server-side limit).
  * - Verification phase: waits ping*2 + 100ms then re-reads all blocks before declaring done.
  * - On mismatch during verification, clears predictions and retries only the failed blocks.
+ * - Rotation gate: if [primeRotation] and [rotationConverged] are provided, each click
+ *   waits for the player to be facing the target block before firing. This prevents the
+ *   instant-rotation-then-click signature that anticheat plugins flag. Without these
+ *   delegates the tuner fires clicks immediately (back-compat, singleplayer use).
  */
 class NoteBlockTuner(
     private val targets: List<TuneTarget>,
@@ -38,6 +40,19 @@ class NoteBlockTuner(
     private val interactBlock: (BlockPos) -> Boolean,
     private val pingMs: () -> Int = { 0 },
     private val maxRetries: Int = 3,
+    /**
+     * Called before each click to start easing the player's view toward the target
+     * block. Must be called every tick while waiting, not just once -- same contract
+     * as PlayerController.primeRotation(). If null, no rotation priming is performed
+     * and clicks fire without any facing check.
+     */
+    private val primeRotation: ((BlockPos) -> Unit)? = null,
+    /**
+     * Returns true when the player's rotation is within the convergence threshold of
+     * the target block. If null, the tuner fires clicks without any convergence wait
+     * (back-compat -- existing callers that don't pass this get the old behavior).
+     */
+    private val rotationConverged: ((BlockPos) -> Boolean)? = null,
     val onProgress: (done: Int, total: Int, msg: String) -> Unit = { _, _, _ -> }
 ) {
     private val logger = LoggerFactory.getLogger("BlockBard/NoteBlockTuner")
@@ -45,7 +60,7 @@ class NoteBlockTuner(
     var state: TunerState = TunerState.IDLE
         private set
 
-    // Optimistic predictions: pos → (predicted note index, expires at ms)
+    // Optimistic predictions: pos -> (predicted note index, expires at ms)
     private val notePredictions = mutableMapOf<BlockPos, Pair<Int, Long>>()
 
     // Token bucket (Paper limit: 8 interacts per 310ms)
@@ -57,28 +72,34 @@ class NoteBlockTuner(
 
     val total: Int = targets.size
     private var confirmedCount: Int = 0
-
-    // How many targets were already at their target note when tuning started
     private var alreadyTunedAtStart: Int = 0
-
-    // Number of TUNING<->VERIFYING retry cycles caused by a verification mismatch.
-    // Without this cap, a block that can never converge (anticheat dropping packets
-    // server-side, a block destroyed mid-tune and respawned elsewhere, persistent lag)
-    // would cycle TUNING <-> VERIFYING forever.
     private var retryCount: Int = 0
+
+    /**
+     * Rotation gate state for the current tick's pending click.
+     *
+     * When the tuner selects a block to click, it sets this to that block's pos and
+     * calls primeRotation(pos). The click does not fire until rotationConverged(pos)
+     * returns true. Once the click fires, this is cleared.
+     *
+     * Public so BlockBardClient's START_CLIENT_TICK handler (src/client module) can
+     * read it and call PlayerController.primeRotation() every tick while a rotation is
+     * pending -- the same pattern used for ArpeggioScheduler.peekNextPos().
+     * NoteBlockTuner lives in src/main; with splitEnvironmentSourceSets the client
+     * module can read main's public members but not internal ones.
+     */
+    var pendingRotationPos: BlockPos? = null
+        private set
 
     fun start() {
         if (targets.isEmpty()) {
-            logger.info("NoteBlockTuner: no targets — already done")
+            logger.info("NoteBlockTuner: no targets -- already done")
             state = TunerState.DONE
             onProgress(0, 0, "Nothing to tune.")
             return
         }
 
-        // Count blocks already at target using LIVE world reads, not snapshot
-        alreadyTunedAtStart = targets.count { t ->
-            worldNoteReader(t.pos) == t.targetNote
-        }
+        alreadyTunedAtStart = targets.count { t -> worldNoteReader(t.pos) == t.targetNote }
 
         state = TunerState.TUNING
         availableInteracts = 8f
@@ -87,15 +108,16 @@ class NoteBlockTuner(
         verifyStartedAt = -1L
         confirmedCount = 0
         retryCount = 0
+        pendingRotationPos = null
 
         val needClicks = total - alreadyTunedAtStart
-        logger.info("NoteBlockTuner: starting — $total targets, $alreadyTunedAtStart already correct, $needClicks need clicks")
+        logger.info("NoteBlockTuner: starting -- $total targets, $alreadyTunedAtStart already correct, $needClicks need clicks")
         targets.forEach { t ->
             val liveNote = worldNoteReader(t.pos) ?: t.snapshotNote
             val clicks = clicksNeeded(liveNote, t.targetNote)
             val targetMidi = noteIndexToMidi(t.instrument, t.targetNote)
             if (clicks > 0) {
-                logger.debug("  NEEDS TUNE: ${t.pos} ${t.instrument.name} liveNote=$liveNote → target=${t.targetNote} (${midiNoteToName(targetMidi)}) = $clicks clicks")
+                logger.debug("  NEEDS TUNE: ${t.pos} ${t.instrument.name} liveNote=$liveNote -> target=${t.targetNote} (${midiNoteToName(targetMidi)}) = $clicks clicks")
             } else {
                 logger.debug("  SKIP (already correct): ${t.pos} ${t.instrument.name} note=$liveNote")
             }
@@ -120,6 +142,20 @@ class NoteBlockTuner(
             availableInteracts = 8f
         }
 
+        // If rotation gate delegates are set and a rotation is pending, keep priming
+        // and wait for convergence before doing any tuning work this tick.
+        val pending = pendingRotationPos
+        if (pending != null && primeRotation != null && rotationConverged != null) {
+            primeRotation.invoke(pending)
+            if (!rotationConverged.invoke(pending)) {
+                // Still turning -- check TUNING or VERIFYING state handling
+                // will resume next tick once converged.
+                return
+            }
+            // Converged -- the actual click dispatch happens in tickTuning() below.
+            // pendingRotationPos is cleared there after the click fires.
+        }
+
         when (state) {
             TunerState.TUNING    -> tickTuning(now)
             TunerState.VERIFYING -> tickVerifying(now)
@@ -128,11 +164,10 @@ class NoteBlockTuner(
     }
 
     private fun tickTuning(now: Long) {
-        val untuned = mutableListOf<Pair<BlockPos, Int>>() // pos → effective current note
+        val untuned = mutableListOf<Pair<BlockPos, Int>>() // pos -> effective current note
         confirmedCount = 0
 
         for (target in targets) {
-            // Always read live world state
             val worldNote = worldNoteReader(target.pos)
             if (worldNote == null) {
                 logger.warn("NoteBlockTuner: ${target.pos} is no longer a noteblock!")
@@ -141,15 +176,11 @@ class NoteBlockTuner(
                 return
             }
 
-            // Use in-flight prediction if fresher than world (prediction not yet expired)
             val effectiveNote = notePredictions[target.pos]?.first ?: worldNote
 
             when {
-                // Both world and effective agree it's correct → confirmed
                 effectiveNote == target.targetNote && worldNote == target.targetNote -> confirmedCount++
-                // Prediction says it's on the way, world hasn't caught up → wait (don't click again)
-                effectiveNote == target.targetNote && worldNote != target.targetNote -> { /* wait */ }
-                // Not at target → needs a click
+                effectiveNote == target.targetNote && worldNote != target.targetNote -> { /* wait for server */ }
                 else -> untuned.add(target.pos to effectiveNote)
             }
         }
@@ -162,30 +193,48 @@ class NoteBlockTuner(
             val pingWait = pingMs() * 2 + 100L
             verifyStartedAt = now
             state = TunerState.VERIFYING
-            logger.info("NoteBlockTuner: all confirmed — verifying (waiting ${pingWait}ms for server round-trip)")
+            logger.info("NoteBlockTuner: all confirmed -- verifying (waiting ${pingWait}ms for server round-trip)")
             onProgress(confirmedCount, total, "Verifying...")
             return
         }
 
-        // Dispatch clicks within rate limit
+        // Dispatch clicks within rate limit, with rotation gate.
         for ((pos, effectiveNote) in untuned) {
             if (availableInteracts < 1f) {
-                logger.debug("NoteBlockTuner: rate limited — ${untuned.size} blocks deferred")
+                logger.debug("NoteBlockTuner: rate limited -- ${untuned.size} blocks deferred")
                 break
             }
+
+            // Rotation gate: if delegates are set and we don't have a pending rotation
+            // for this block yet, start priming and defer the click to a future tick.
+            if (primeRotation != null && rotationConverged != null) {
+                if (pendingRotationPos != pos) {
+                    // Start rotating toward this block. The click will fire once
+                    // convergence is reached (handled at the top of onTick()).
+                    pendingRotationPos = pos
+                    primeRotation.invoke(pos)
+                    logger.debug("NoteBlockTuner: priming rotation toward $pos")
+                    return  // wait for convergence next tick
+                }
+                // pendingRotationPos == pos and we already passed the convergence check
+                // at the top of onTick() -- safe to click now.
+            }
+
             val dispatched = interactBlock(pos)
             if (!dispatched) {
-                logger.warn("NoteBlockTuner: interactBlock false for $pos — aborting")
+                logger.warn("NoteBlockTuner: interactBlock false for $pos -- aborting")
                 state = TunerState.FAILED
+                pendingRotationPos = null
                 onProgress(confirmedCount, total, "FAILED: could not interact with $pos")
                 return
             }
             val predicted = (effectiveNote + 1) % 25
             val expires = now + pingMs() * 2 + 150L
             notePredictions[pos] = Pair(predicted, expires)
-            logger.debug("NoteBlockTuner: clicked $pos note $effectiveNote → predicted $predicted")
+            logger.debug("NoteBlockTuner: clicked $pos note $effectiveNote -> predicted $predicted")
             availableInteracts -= 1f
             lastInteractMs = now
+            pendingRotationPos = null  // click fired, rotation no longer pending
         }
     }
 
@@ -218,17 +267,18 @@ class NoteBlockTuner(
         if (allGood) {
             state = TunerState.DONE
             val skipped = alreadyTunedAtStart
-            logger.info("NoteBlockTuner: DONE — $total verified ($skipped were already correct)")
+            logger.info("NoteBlockTuner: DONE -- $total verified ($skipped were already correct)")
             onProgress(confirmedCount, total, "Complete! ($skipped already correct, ${total - skipped} tuned)")
         } else {
             retryCount++
             if (retryCount > maxRetries) {
                 state = TunerState.FAILED
-                logger.warn("NoteBlockTuner: ${mismatches.size} mismatches after $retryCount retries — giving up")
+                logger.warn("NoteBlockTuner: ${mismatches.size} mismatches after $retryCount retries -- giving up")
                 onProgress(confirmedCount, total, "FAILED: ${mismatches.size} blocks never converged: ${mismatches.joinToString("; ")}")
             } else {
-                logger.warn("NoteBlockTuner: ${mismatches.size} mismatches — retrying (attempt $retryCount/$maxRetries)")
+                logger.warn("NoteBlockTuner: ${mismatches.size} mismatches -- retrying (attempt $retryCount/$maxRetries)")
                 notePredictions.clear()
+                pendingRotationPos = null
                 state = TunerState.TUNING
                 onProgress(confirmedCount, total, "Retrying ${mismatches.size} mismatched blocks...")
             }
