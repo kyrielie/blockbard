@@ -69,7 +69,7 @@ object InstrumentShifter {
             )
             ?.let { ShiftResult(it, 0) }
 
-    /** Octave shift: try ±12 then ±24 semitones until a match is found. */
+    /** Octave shift: try ±12 then ±24 semitones until a block whose instrument covers the shifted note is found. */
     private fun findOctaveShift(midiNote: Int, candidates: List<NoteBlockEntry>): ShiftResult? {
         val shifts = buildList {
             add(0)
@@ -78,9 +78,16 @@ object InstrumentShifter {
         }
         for (shift in shifts) {
             val shifted = midiNote + shift
+            // Use coversNatively (range check) rather than comparing current midiNote
+            // (current-tuning check). The block will be re-tuned to the shifted target,
+            // so what matters is whether the instrument's range includes the shifted note,
+            // not whether the block happens to already be tuned there. Prefer fewest clicks.
             val entry = candidates
-                .filter { it.midiNote == shifted }
-                .minByOrNull { it.distanceFromPlayer }
+                .filter { it.instrument.coversNatively(shifted) }
+                .minWithOrNull(compareBy(
+                    { clicksNeeded(it.noteIndex, shifted - it.instrument.midiBase) },
+                    { it.distanceFromPlayer }
+                ))
             if (entry != null) return ShiftResult(entry, shift)
         }
         return null

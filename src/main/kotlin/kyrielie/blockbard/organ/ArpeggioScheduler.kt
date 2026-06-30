@@ -1,5 +1,6 @@
 package kyrielie.blockbard.organ
 
+import kyrielie.blockbard.util.DebugLog
 import net.minecraft.core.BlockPos
 import net.minecraft.world.level.block.state.properties.NoteBlockInstrument
 import org.slf4j.LoggerFactory
@@ -9,7 +10,7 @@ data class NoteRequest(
     /**
      * The instrument this note was authored for (NBS instrument byte, or MIDI channel
      * program resolved via MidiChannelResolver), if known. Null means "any instrument
-     * at this pitch is fine" — used by callers with no instrument source, like
+     * at this pitch is fine" -- used by callers with no instrument source, like
      * KeyboardInputHandler's direct 1-9 key presses or the chromatic-scale test.
      * Without this, two notes at the same pitch but different instruments (e.g. a
      * harp middle-C and a bell middle-C) would be indistinguishable and could each
@@ -27,7 +28,7 @@ data class NoteRequest(
 
 /**
  * Tick-based queue that serialises simultaneous note requests into sequential
- * block interactions. One note is dispatched per tick via [onTick].
+ * block interactions governed by a token-bucket rate limiter.
  *
  * [interactDelegate] is wired by BlockBardClient to PlayerController.playNoteAt().
  */
@@ -36,13 +37,9 @@ object ArpeggioScheduler {
     private val logger = LoggerFactory.getLogger("BlockBard/ArpeggioScheduler")
 
     /**
-     * Populated by MidiToOrganMapper: NotePitch (midiNote, instrument) → assigned BlockPos.
+     * Populated by MidiToOrganMapper: NotePitch (midiNote, instrument) -> assigned BlockPos.
      * Keyed by instrument as well as pitch so two notes at the same pitch but
-     * different instruments don't collide on one assignment slot — see NoteRequest
-     * kdoc. A null instrument in the key means "any instrument" and is only ever
-     * looked up as a fallback when no instrument-specific entry exists (see resolvePos).
-     * Must match OrganAssignment.assignment's key type (NotePitch) exactly, since
-     * MainScreen assigns ArpeggioScheduler.assignment = result.assignment directly.
+     * different instruments don't collide on one assignment slot.
      */
     var assignment: Map<NotePitch, BlockPos> = emptyMap()
 
@@ -50,54 +47,71 @@ object ArpeggioScheduler {
     var staleTimeoutMs: Long = 200L
 
     /**
-     * Safety cap for a note that is actively converging rotation (see onTick kdoc).
-     * Sized generously above the worst-case turn time at MAX_ROTATION_DEGREES_PER_TICK
-     * (a full 180 deg yaw turn takes ~6 ticks / 300ms at the default 35 deg/tick cap)
-     * so it only fires if rotation genuinely got stuck (e.g. overridden by something
-     * else, or organMap stale for this pos), not on a normal large turn.
+     * Safety cap for a note that is actively converging rotation.
+     * Sized above worst-case turn time at MAX_ROTATION_DEGREES_PER_TICK so it only
+     * fires if rotation genuinely got stuck.
      */
     var rotationInProgressTimeoutMs: Long = 1500L
 
     /**
-     * Wired to PlayerController.playNoteAt(pos, request) by the client entrypoint — a
-     * left-click/attack interaction, deliberately not interactWith()'s right-click
-     * (which cycles the block's tuning by one semitone; see PlayerController.playNoteAt
-     * kdoc for why playback must never use that path). Takes the target BlockPos plus
-     * the NoteRequest being dispatched — the request (not just its midiNote) is
-     * threaded through so PlayerController can hand the full intended (midiNote,
-     * instrument) pair to SoundVerifier for ground-truth comparison against the actual
-     * SoundInstance the client plays, without SoundVerifier needing to duplicate
-     * ArpeggioScheduler's own bookkeeping.
+     * Burst cap for the token bucket: the maximum number of interact packets that
+     * may be sent within a single onTick() call.
+     *
+     * The bucket refills at the same rate as NoteBlockTuner's limiter (8 tokens per
+     * 310 ms, matching Paper's documented server-side interact limit). This cap bounds
+     * how many of those accumulated tokens may be spent in one tick.
+     *
+     * 1 (recommended for strict servers): at most one interact per tick. Every note
+     *   waits for rotation convergence before firing, so the server always sees a
+     *   rotation packet between successive interacts. Chord notes spill across
+     *   consecutive ticks (50 ms apart) -- musically transparent at any realistic tempo.
+     *
+     * 2-8 (lenient servers / testing): allows a short burst within one tick when the
+     *   bucket has accrued enough tokens. Every note still goes through the rotation
+     *   convergence gate, unlike the old "notes 2-N skip the gate" behaviour.
+     *
+     * Set from BlockBardConfig.maxNotesPerTick at init in BlockBardClient.
+     */
+    var maxNotesPerTick: Int = 1
+
+    /**
+     * Wired to PlayerController.playNoteAt(pos, request) by the client entrypoint.
+     * Takes the target BlockPos plus the NoteRequest being dispatched so
+     * PlayerController can hand the full (midiNote, instrument) pair to SoundVerifier.
      */
     var interactDelegate: ((BlockPos, NoteRequest) -> Boolean)? = null
 
     /**
      * Wired to PlayerController.rotationConverged() by the client entrypoint. Gates
-     * dispatch so interactWith() never fires while the eased rotation (see
-     * PlayerController.MAX_ROTATION_DEGREES_PER_TICK) is still mid-turn — firing early
-     * would reproduce the same instant-rotation-plus-click signature the easing was
-     * added to avoid. If unset, dispatch proceeds unconditionally (back-compat / tests).
+     * dispatch so interactWith() never fires while the eased rotation is still mid-turn.
+     * If unset, dispatch proceeds unconditionally (back-compat / tests).
      */
     var rotationConvergedDelegate: ((BlockPos) -> Boolean)? = null
 
     private val queue: ArrayDeque<NoteRequest> = ArrayDeque()
 
     /**
-     * Guards [queue]. enqueue() is called from a javax.sound.midi device thread
-     * (see MidiInputHandler.connect()'s Receiver.send()) while onTick()/peekNextPos()
-     * run on the Minecraft client thread via START_CLIENT_TICK/END_CLIENT_TICK — without
-     * this, queue is a kotlin.collections.ArrayDeque (not thread-safe) shared across
-     * threads with no synchronization.
+     * Guards [queue], [interactBudget], and [lastTickMs].
+     * enqueue() is called from a javax.sound.midi device thread while
+     * onTick()/peekNextPos() run on the Minecraft client thread.
      */
     private val lock = Any()
 
+    // ── Token bucket ──────────────────────────────────────────────────────────
+    // Mirrors NoteBlockTuner's rate limiter: Paper allows 8 block-interact packets
+    // per 310 ms. The bucket refills continuously based on wall-clock elapsed time
+    // and is capped at maxNotesPerTick so the user can dial it down for strict servers.
+    // Budget is consumed one token per dispatched note; the loop stops when the bucket
+    // is empty even if maxNotesPerTick hasn't been reached yet.
+    private var interactBudget: Float = 1f
+    private var lastTickMs: Long = -1L
+
     /**
      * Resolves a request to a target BlockPos, trying in order:
-     * 1. resolvedPos, if the caller already knows the exact block (scale test).
-     * 2. assignment for the exact (midiNote, instrument) pair, if instrument is known.
-     * 3. assignment for (midiNote, null) — an instrument-agnostic assignment entry.
-     * 4. NoteBlockRegistry.findBestFor(midiNote, instrument) — live lookup, preferring
-     *    an exact instrument match but falling back to any instrument at that pitch.
+     * 1. resolvedPos, if the caller already knows the exact block.
+     * 2. assignment for the exact (midiNote, instrument) pair.
+     * 3. assignment for (midiNote, null) -- instrument-agnostic fallback.
+     * 4. NoteBlockRegistry.findBestFor(midiNote, instrument) -- live lookup.
      */
     private fun resolvePos(request: NoteRequest): BlockPos? =
         request.resolvedPos
@@ -106,79 +120,89 @@ object ArpeggioScheduler {
             ?: NoteBlockRegistry.findBestFor(request.midiNote, request.instrument)?.pos
 
     /**
-     * Called every client tick. Dispatches one queued note once rotation has converged
-     * on its target. The head of the queue blocks until converged (deliberately serial
-     * — see class doc) and is re-checked next tick; staleTimeoutMs prunes backlog
-     * sitting behind the head so a burst of enqueued notes can't build up unboundedly
-     * while the head note is turning, but does NOT retroactively cancel the head note
-     * itself once its convergence wait has begun — see rotationInProgressTimeoutMs for
-     * the cap that applies to the head note instead. Large-angle turns (observed up to
-     * ~180 deg yaw in practice) can legitimately take several ticks longer than
-     * staleTimeoutMs to converge under MAX_ROTATION_DEGREES_PER_TICK easing, and a turn
-     * that successfully converges should still play even if it took a while — it was
-     * never idle, the player was visibly turning toward it the whole time.
+     * Called every client tick. Dispatches queued notes subject to two constraints:
+     *
+     * 1. Token bucket: at most [maxNotesPerTick] interacts may be sent per tick, and
+     *    only while the bucket (refilling at 8/310 ms) has tokens. This mirrors the
+     *    server-side Paper limit and prevents packet-rate kicks even at high chord density.
+     *
+     * 2. Rotation convergence gate: applied to EVERY note, not just the first.
+     *    Each note waits until the player is facing its target block before the interact
+     *    packet fires, ensuring the server always sees a rotation packet between
+     *    successive interacts. The loop exits when the head note is not yet converged
+     *    and resumes next tick.
+     *
+     * Stale backlog pruning runs once at the start (not once per dispatched note).
      */
     fun onTick(): Unit = synchronized(lock) {
-        // Catch misconfiguration early — interactDelegate should be wired at init
         if (queue.isNotEmpty() && interactDelegate == null) {
-            logger.warn("onTick: interactDelegate is null — notes will never be dispatched (check BlockBardClient init)")
+            logger.warn("onTick: interactDelegate is null -- notes will never be dispatched (check BlockBardClient init)")
             return@synchronized
         }
 
-        // Prune stale backlog sitting behind the head first — these notes haven't started
-        // converging yet and may have been waiting the entire time the head note was
-        // turning. The head note itself is handled separately below and is exempt from
-        // staleTimeoutMs once its convergence wait has begun (see kdoc above).
+        // Refill token bucket based on time elapsed since last tick.
+        val now = System.currentTimeMillis()
+        if (lastTickMs >= 0L) {
+            val elapsed = now - lastTickMs
+            interactBudget += elapsed / (310f / 8f)   // 8 tokens per 310 ms
+            interactBudget = interactBudget.coerceIn(0f, maxNotesPerTick.toFloat())
+        } else {
+            interactBudget = maxNotesPerTick.toFloat()
+        }
+        lastTickMs = now
+
+        // Prune stale backlog sitting behind the head. The head note itself is exempt
+        // from staleTimeoutMs once convergence waiting has begun -- see rotationInProgressTimeoutMs.
         while (queue.size > 1) {
             val behindHead = queue[1]
-            val behindAge = System.currentTimeMillis() - behindHead.enqueuedAtMs
+            val behindAge = now - behindHead.enqueuedAtMs
             if (behindAge > staleTimeoutMs) {
                 queue.removeAt(1)
-                logger.warn("dropping stale backlogged MIDI ${behindHead.midiNote} (age ${behindAge}ms > ${staleTimeoutMs}ms) — queue building up faster than notes can be dispatched")
+                logger.warn("dropping stale backlogged MIDI ${behindHead.midiNote} (age ${behindAge}ms > ${staleTimeoutMs}ms)")
             } else {
                 break
             }
         }
 
-        // Iterative stale-skip — never recursive
-        while (queue.isNotEmpty()) {
+        var dispatched = 0
+        while (dispatched < maxNotesPerTick && interactBudget >= 1f && queue.isNotEmpty()) {
             val request = queue.first()
-            val age = System.currentTimeMillis() - request.enqueuedAtMs
+            val age = now - request.enqueuedAtMs
 
             val pos = resolvePos(request)
-
             if (pos == null) {
                 queue.removeFirst()
-                logger.warn("no block found for MIDI ${request.midiNote} — skipping (assignment has ${assignment.size} entries, resolvedPos=${request.resolvedPos})")
-                return@synchronized
+                logger.warn("no block found for MIDI ${request.midiNote} -- skipping (assignment has ${assignment.size} entries, resolvedPos=${request.resolvedPos})")
+                // Count as a dispatch slot consumed so we don't spin through the entire
+                // queue in one tick if many consecutive notes are unresolvable.
+                dispatched++
+                continue
             }
 
+            // Rotation convergence gate applies to every note. If the player is not yet
+            // facing this block, stop dispatching for this tick and wait. The next tick
+            // the loop resumes from the same head note once rotation has caught up.
+            // (Previously notes 2-N skipped this gate, which caused rapid-fire interacts
+            // without intervening rotation packets -- the pattern that triggers anticheat.)
             val converged = rotationConvergedDelegate?.invoke(pos) ?: true
-
             if (!converged) {
                 if (age > rotationInProgressTimeoutMs) {
                     queue.removeFirst()
-                    logger.warn("dropping MIDI ${request.midiNote} at $pos — rotation did not converge within ${rotationInProgressTimeoutMs}ms (age ${age}ms); check for a stuck/overridden rotation")
+                    logger.warn("dropping MIDI ${request.midiNote} at $pos -- rotation did not converge within ${rotationInProgressTimeoutMs}ms (age ${age}ms)")
                     continue
                 }
-                // Still turning toward this note — leave it at the head of the queue
-                // and try again next tick. staleTimeoutMs does not apply to the head
-                // note once convergence waiting has begun — see kdoc above.
-                logger.debug("waiting for rotation convergence on $pos (MIDI ${request.midiNote}, age ${age}ms)")
+                DebugLog.info(logger) { "waiting for rotation convergence on $pos (MIDI ${request.midiNote}, age ${age}ms)" }
                 return@synchronized
             }
 
-            // Converged — consume and dispatch regardless of age. A note that took
-            // a while to converge because of a large turn is not stale; it was never
-            // idle. staleTimeoutMs prunes idle backlog elsewhere (see kdoc above), not
-            // a note that just finished a legitimate in-progress turn.
             queue.removeFirst()
-            val dispatched = interactDelegate?.invoke(pos, request) ?: false
-            logger.info("dispatch MIDI ${request.midiNote} -> $pos result=$dispatched age=${age}ms queueRemaining=${queue.size}")
-            if (!dispatched) {
-                logger.warn("interactDelegate returned false for $pos (MIDI ${request.midiNote}) — check PlayerController logs above")
+            val ok = interactDelegate?.invoke(pos, request) ?: false
+            interactBudget -= 1f
+            DebugLog.info(logger) { "dispatch MIDI ${request.midiNote} -> $pos result=$ok age=${age}ms dispatched=${dispatched + 1}/${maxNotesPerTick} budget=${"%.2f".format(interactBudget)} queueRemaining=${queue.size}" }
+            if (!ok) {
+                logger.warn("interactDelegate returned false for $pos (MIDI ${request.midiNote})")
             }
-            return@synchronized
+            dispatched++
         }
     }
 
@@ -187,30 +211,26 @@ object ArpeggioScheduler {
      * consuming it. Used by BlockBardClient to drive PlayerController.primeRotation()
      * every tick a note is pending.
      *
-     * Deliberately does NOT apply staleTimeoutMs here. onTick() exempts a note from the
-     * staleness drop once rotation convergence is in progress for it (see onTick kdoc);
-     * if this method instead started returning null for that same note once it crossed
-     * staleTimeoutMs, primeRotation() would stop being called and the rotation would
-     * freeze mid-turn — convergence would then never complete and the note would sit
-     * forever, since onTick() is waiting on a convergence that's no longer advancing.
-     * staleTimeoutMs is still enforced in onTick() for notes that haven't started
-     * converging.
+     * Does NOT apply staleTimeoutMs -- see the onTick kdoc for why primeRotation must
+     * continue for a note that has started converging even if it crosses staleTimeoutMs.
      */
     fun peekNextPos(): BlockPos? = synchronized(lock) {
         val request = queue.firstOrNull() ?: return@synchronized null
         val pos = resolvePos(request)
-        logger.debug("peekNextPos: MIDI ${request.midiNote} instrument=${request.instrument?.name ?: "any"} -> $pos")
+        DebugLog.info(logger) { "peekNextPos: MIDI ${request.midiNote} instrument=${request.instrument?.name ?: "any"} -> $pos" }
         pos
     }
 
     fun enqueue(request: NoteRequest) = synchronized(lock) {
-        logger.info("enqueue MIDI ${request.midiNote} instrument=${request.instrument?.name ?: "any"} resolvedPos=${request.resolvedPos} queueSize=${queue.size + 1}")
+        DebugLog.info(logger) { "enqueue MIDI ${request.midiNote} instrument=${request.instrument?.name ?: "any"} resolvedPos=${request.resolvedPos} queueSize=${queue.size + 1}" }
         queue.addLast(request)
     }
 
     fun clear() = synchronized(lock) {
         logger.info("queue cleared (had ${queue.size} items)")
         queue.clear()
+        interactBudget = 1f
+        lastTickMs = -1L
     }
 
     fun isEmpty(): Boolean = synchronized(lock) { queue.isEmpty() }
