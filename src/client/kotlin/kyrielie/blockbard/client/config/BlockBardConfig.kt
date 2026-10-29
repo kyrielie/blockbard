@@ -27,6 +27,8 @@ data class BlockBardConfig(
     var midiDeviceName: String? = null,
     var keyMappings: List<Int> = listOf(54, 55, 56, 57, 58, 59, 60, 61, 62),
     // Anticheat-compatibility tunables
+    var smoothCameraRotation: Boolean = false,
+    var fastTuning: Boolean = true,
     var maxRotationDegreesPerTick: Float = 35f,
     var rotationConvergenceThresholdDegrees: Float = 2f,
     var rotationInProgressTimeoutMs: Long = 1500L,

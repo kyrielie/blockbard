@@ -63,11 +63,12 @@ object BlockBardClient : ClientModInitializer {
             PlayerController.rotationConverged(pos)
         }
 
+        val blockbardCategory = KeyMapping.Category.register(net.minecraft.resources.Identifier.fromNamespaceAndPath("blockbard", "general"))
         openGuiKey = KeyMappingHelper.registerKeyMapping(
-            KeyMapping("key.blockbard.open_gui", GLFW.GLFW_KEY_B, KeyMapping.Category.MISC)
+            KeyMapping("key.blockbard.open_gui", GLFW.GLFW_KEY_B, blockbardCategory)
         )
         toggleHudKey = KeyMappingHelper.registerKeyMapping(
-            KeyMapping("key.blockbard.toggle_hud", GLFW.GLFW_KEY_H, KeyMapping.Category.MISC)
+            KeyMapping("key.blockbard.toggle_hud", GLFW.GLFW_KEY_H, blockbardCategory)
         )
         logger.info("Keybindings registered: B=open GUI, H=toggle HUD")
 

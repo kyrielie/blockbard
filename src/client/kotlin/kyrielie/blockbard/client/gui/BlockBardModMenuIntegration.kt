@@ -5,5 +5,5 @@ import com.terraformersmc.modmenu.api.ModMenuApi
 
 class BlockBardModMenuIntegration : ModMenuApi {
     override fun getModConfigScreenFactory(): ConfigScreenFactory<*> =
-        ConfigScreenFactory { parent -> MainScreen(parent) }
+        ConfigScreenFactory { parent -> MainScreen(parent, initialTab = 2) }
 }
