@@ -110,3 +110,4 @@ replay_*.log
 repomix-output.xml
 blockbard.xml
 blockbard.xml
+*.xml
