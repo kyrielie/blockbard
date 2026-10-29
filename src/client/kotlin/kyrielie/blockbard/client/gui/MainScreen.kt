@@ -36,6 +36,8 @@ import net.minecraft.world.level.GameType
 import org.lwjgl.glfw.GLFW
 import org.slf4j.LoggerFactory
 import java.io.File
+import java.nio.file.Path
+import kyrielie.blockbard.client.playback.SongMetadataCache
 
 /**
  * Returns [rgb] (a plain 0xRRGGBB literal) with a fully-opaque alpha byte set.
@@ -79,8 +81,27 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
 
     private var midiFiles: List<File> = emptyList()
     private var searchQuery: String = ""
+    private var activeFilter: String = ConfigManager.config.activeFilter
+    private var isScrubbing: Boolean = false
+    private var filterButtons: MutableMap<String, Button> = mutableMapOf()
+
     private val displayedFiles: List<File>
-        get() = if (searchQuery.isBlank()) midiFiles else midiFiles.filter { it.name.contains(searchQuery, ignoreCase = true) }
+        get() {
+            var list = midiFiles
+            list = when (activeFilter) {
+                "FAV" -> list.filter { ConfigManager.config.isFavorite(it.name) }
+                "MID" -> list.filter { it.extension.lowercase() in listOf("mid", "midi") }
+                "NBS" -> list.filter { it.extension.lowercase() == "nbs" }
+                else  -> list
+            }
+            if (searchQuery.isNotBlank()) {
+                list = list.filter { it.name.contains(searchQuery, ignoreCase = true) }
+            }
+            return list.sortedWith(
+                compareByDescending<File> { ConfigManager.config.isFavorite(it.name) }
+                    .thenBy { it.name.lowercase() }
+            )
+        }
     private var selectedFile: File? = null
     private var selectedIndex: Int = -1
 
@@ -139,7 +160,7 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
         // ── Tab 0: Files ──────────────────────────────────────────────────────
         fun <T : AbstractWidget> tab0(w: T): T { tabContent[0]!!.add(w); return w }
 
-        val searchBox = EditBox(font, 10, 26, width - 20, 16, Component.literal("Search"))
+        val searchBox = EditBox(font, 10, 26, width - 150, 16, Component.literal("Search"))
         searchBox.setHint(Component.literal("Search tracks..."))
         searchBox.value = searchQuery
         searchBox.setResponder { text ->
@@ -150,28 +171,56 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
         }
         tab0(addRenderableWidget(searchBox))
 
+        val pillY = 26
+        val allBtn = tab0(addRenderableWidget(Button.builder(Component.literal(if (activeFilter == "ALL") "[All]" else "All")) {
+            setFilter("ALL")
+        }.pos(width - 136, pillY).size(28, 16).build()))
+
+        val favBtn = tab0(addRenderableWidget(Button.builder(Component.literal(if (activeFilter == "FAV") "[★]" else "★")) {
+            setFilter("FAV")
+        }.pos(width - 106, pillY).size(22, 16).build()))
+
+        val midBtn = tab0(addRenderableWidget(Button.builder(Component.literal(if (activeFilter == "MID") "[MID]" else "MID")) {
+            setFilter("MID")
+        }.pos(width - 82, pillY).size(34, 16).build()))
+
+        val nbsBtn = tab0(addRenderableWidget(Button.builder(Component.literal(if (activeFilter == "NBS") "[NBS]" else "NBS")) {
+            setFilter("NBS")
+        }.pos(width - 46, pillY).size(36, 16).build()))
+
+        filterButtons.clear()
+        filterButtons["ALL"] = allBtn
+        filterButtons["FAV"] = favBtn
+        filterButtons["MID"] = midBtn
+        filterButtons["NBS"] = nbsBtn
+
         val listTop = 46
-        val listBottom = height - 52
+        val listBottom = height - 96
         val listHeight = (listBottom - listTop).coerceAtLeast(30)
         songListWidget = SongListWidget(
             minecraft = minecraft,
             width = width,
             height = listHeight,
             y = listTop,
-            itemHeight = 20,
+            itemHeight = 26,
             onSelect = { file ->
                 selectFile(file)
             },
             onDoubleClick = { file ->
                 selectFile(file)
                 startPlayback()
+            },
+            onToggleFavorite = { file ->
+                ConfigManager.config.toggleFavorite(file.name)
+                ConfigManager.save()
+                songListWidget.setFiles(displayedFiles, selectedFile)
             }
         )
         tab0(addRenderableWidget(songListWidget))
         songListWidget.setFiles(displayedFiles, selectedFile)
 
-        // Playback row 1 (height - 48)
-        val row1Y = height - 48
+        // Playback row 1 (height - 44)
+        val row1Y = height - 44
         tab0(addRenderableWidget(Button.builder(Component.literal("Play")) {
             logger.info("Play clicked")
             when {
@@ -179,18 +228,34 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
                 NbsPlayer.isPaused      -> { NbsPlayer.resume();      chat("Resumed") }
                 else                    -> startPlayback()
             }
-        }.pos(10, row1Y).size(44, 16).build()))
+        }.pos(10, row1Y).size(40, 16).build()))
+
+        tab0(addRenderableWidget(Button.builder(Component.literal("Tune & Play")) {
+            logger.info("Tune & Play clicked")
+            val file = selectedFile ?: run { chatWarn("Select a song first"); return@builder }
+            val map = PlayerController.organMap ?: run {
+                chatWarn("Run Center on Organ first!")
+                return@builder
+            }
+            val reachable = NoteBlockRegistry.allPlayable().filter { map.isReachable(it.pos) }
+            if (reachable.isEmpty()) {
+                chatWarn("No reachable noteblocks -- run Center first")
+                return@builder
+            }
+            chat("Preparing organ & playing ${file.name}...")
+            startTuning(thenPlay = true)
+        }.pos(52, row1Y).size(74, 16).build()))
 
         tab0(addRenderableWidget(Button.builder(Component.literal("Pause")) {
             logger.info("Pause clicked")
             when {
-                MidiFilePlayer.isPaused -> { MidiFilePlayer.resume(); chat("Resumed") }
-                NbsPlayer.isPaused      -> { NbsPlayer.resume();      chat("Resumed") }
-                MidiFilePlayer.isActive() -> { MidiFilePlayer.pause(); chat("Paused") }
-                NbsPlayer.isPlaying       -> { NbsPlayer.pause();      chat("Paused") }
-                else -> chat("Nothing playing")
+                MidiFilePlayer.isPaused   -> { MidiFilePlayer.resume(); chat("Resumed") }
+                NbsPlayer.isPaused        -> { NbsPlayer.resume();      chat("Resumed") }
+                MidiFilePlayer.isActive() -> { MidiFilePlayer.pause();  chat("Paused") }
+                NbsPlayer.isPlaying       -> { NbsPlayer.pause();       chat("Paused") }
+                else                      -> chat("Nothing playing")
             }
-        }.pos(58, row1Y).size(44, 16).build()))
+        }.pos(128, row1Y).size(42, 16).build()))
 
         tab0(addRenderableWidget(Button.builder(Component.literal("Stop")) {
             logger.info("Stop clicked")
@@ -201,12 +266,12 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
             pendingAutoPlay = false
             pendingNextFile = null
             chat("Stopped")
-        }.pos(106, row1Y).size(44, 16).build()))
+        }.pos(172, row1Y).size(40, 16).build()))
 
         tab0(addRenderableWidget(Button.builder(Component.literal("Shuffle")) {
             logger.info("Shuffle clicked")
             shuffle()
-        }.pos(154, row1Y).size(52, 16).build()))
+        }.pos(214, row1Y).size(50, 16).build()))
 
         tab0(addRenderableWidget(Button.builder(Component.literal(if (SongAudioPreviewer.isPlaying) "Stop Prev" else "Preview")) { btn ->
             if (SongAudioPreviewer.isPlaying) {
@@ -222,16 +287,10 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
                     chat("Auditioning: ${file.name}")
                 } ?: chatWarn("Select a song first")
             }
-        }.pos(210, row1Y).size(62, 16).build()))
+        }.pos(266, row1Y).size(56, 16).build()))
 
-        tab0(addRenderableWidget(Button.builder(Component.literal("Refresh")) {
-            logger.info("Refresh clicked")
-            refreshFiles()
-            chat("Refreshed -- ${midiFiles.size} files found")
-        }.pos(276, row1Y).size(50, 16).build()))
-
-        // Playback row 2 (height - 28)
-        val row2Y = height - 28
+        // Playback row 2 (height - 24)
+        val row2Y = height - 24
         tab0(addRenderableWidget(Button.builder(Component.literal("Tempo -")) {
             MidiFilePlayer.tempoMultiplier = (MidiFilePlayer.tempoMultiplier - 0.1f).coerceAtLeast(0.5f)
             chat("Tempo: ${"%.1f".format(MidiFilePlayer.tempoMultiplier)}x")
@@ -250,6 +309,12 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
             chat("Loop: ${loopModeLabel()}")
             logger.info("loopMode -> $next")
         }.pos(118, row2Y).size(94, 16).build()))
+
+        tab0(addRenderableWidget(Button.builder(Component.literal("Refresh")) {
+            logger.info("Refresh clicked")
+            refreshFiles()
+            chat("Refreshed -- ${midiFiles.size} files found")
+        }.pos(216, row2Y).size(52, 16).build()))
 
         // ── Tab 1: Organ ──────────────────────────────────────────────────────
         fun <T : AbstractWidget> tab1(w: T): T { tabContent[1]!!.add(w); return w }
@@ -324,7 +389,7 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
             chat("Notes/tick: ${cfg.maxNotesPerTick}")
         }.pos(col2X, sy).size(20, 16).build()))
         tab2(addRenderableWidget(Button.builder(Component.literal("+")) {
-            cfg.maxNotesPerTick = (cfg.maxNotesPerTick + 1).coerceAtMost(8)
+            cfg.maxNotesPerTick = (cfg.maxNotesPerTick + 1).coerceAtMost(64)
             ArpeggioScheduler.maxNotesPerTick = cfg.maxNotesPerTick
             ConfigManager.save()
             chat("Notes/tick: ${cfg.maxNotesPerTick}")
@@ -432,6 +497,14 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
         midiFiles = (midisDir.listFiles { f ->
             f.extension.lowercase() in listOf("mid", "midi", "nbs")
         } ?: emptyArray()).toList().sortedBy { it.name }
+
+        // Automatically select the last played track or the first available file
+        if (selectedFile == null && midiFiles.isNotEmpty()) {
+            val last = ConfigManager.config.lastPlayedTrack
+            val match = midiFiles.firstOrNull { it.name.equals(last, ignoreCase = true) } ?: midiFiles.first()
+            selectFile(match)
+        }
+
         if (::songListWidget.isInitialized) {
             songListWidget.setFiles(displayedFiles, selectedFile)
         }
@@ -922,61 +995,85 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
     private fun renderFilesTab(graphics: GuiGraphicsExtractor, font: net.minecraft.client.gui.Font) {
         if (displayedFiles.isEmpty()) {
             val emptyMsg = if (midiFiles.isEmpty()) "(no files found in config/blockbard/midis/)"
-                           else "(no matches for \"$searchQuery\")"
+                           else "(no matches for filter/search)"
             graphics.text(font, emptyMsg, 14, 54, opaque(0xAAAAAA))
         }
 
-        // Coverage / readiness summary -- 1 line above row 1
+        // Item 9: Live Piano Roll / Note Visualizer strip (y = height - 92, h = 14)
+        val visY = height - 92
+        val visW = (width - 20).coerceAtMost(320)
+        val visX = 10
+        val keyCount = 25
+        val keyW = visW.toFloat() / keyCount
+        graphics.fill(visX - 1, visY - 1, visX + visW + 1, visY + 15, opaque(0x181818))
+        for (i in 0 until keyCount) {
+            val kx1 = (visX + i * keyW).toInt()
+            val kx2 = (visX + (i + 1) * keyW - 1).toInt()
+            val isAccidental = (i % 12) in listOf(0, 2, 4, 7, 9)
+            val baseColor = if (isAccidental) opaque(0x2A2A2A) else opaque(0x555555)
+
+            val state = VisualizerState.getPitchState(i)
+            val fillColor = if (state != null) {
+                blendColor(baseColor, state.second, state.first)
+            } else baseColor
+
+            graphics.fill(kx1, visY, kx2, visY + 14, fillColor)
+        }
+
+        // Item 1: Track title, status, and mm:ss timestamps (y = height - 74)
+        val trackName = selectedFile?.nameWithoutExtension?.take(32) ?: "No Track Selected"
+        val statusLabel = when {
+            MidiFilePlayer.isActive() && !MidiFilePlayer.isPaused -> "▶ PLAYING: $trackName"
+            NbsPlayer.isPlaying && !NbsPlayer.isPaused            -> "▶ PLAYING: $trackName"
+            MidiFilePlayer.isPaused || NbsPlayer.isPaused         -> "❚❚ PAUSED: $trackName"
+            SongAudioPreviewer.isPlaying                          -> "♪ PREVIEW: $trackName"
+            else                                                  -> "■ READY: $trackName"
+        }
+        val statusColor = when {
+            MidiFilePlayer.isActive() && !MidiFilePlayer.isPaused -> opaque(0x55FF55)
+            NbsPlayer.isPlaying && !NbsPlayer.isPaused            -> opaque(0x55FF55)
+            MidiFilePlayer.isPaused || NbsPlayer.isPaused         -> opaque(0xFFFF55)
+            SongAudioPreviewer.isPlaying                          -> opaque(0x55FFFF)
+            else                                                  -> opaque(0xAAAAAA)
+        }
+        graphics.text(font, statusLabel, 10, height - 74, statusColor)
+
+        val (elapsedSecs, totalSecs) = getPlaybackTimes()
+        val timeText = "${formatTime(elapsedSecs)} / ${formatTime(totalSecs)}"
+        val timeW = font.width(timeText)
+        graphics.text(font, timeText, width - 10 - timeW, height - 74, opaque(0xFFFFFF))
+
+        // Item 1: Interactive Seek Bar (y = height - 62, h = 4)
+        val barY = height - 62
+        val barX = 10
+        val barW = width - 20
+        val fraction = if (totalSecs > 0.0) (elapsedSecs / totalSecs).coerceIn(0.0, 1.0) else 0.0
+        val progressW = (barW * fraction).toInt()
+
+        graphics.fill(barX, barY, barX + barW, barY + 4, opaque(0x333333))
+        if (progressW > 0) {
+            graphics.fill(barX, barY, barX + progressW, barY + 4, opaque(0x55FF55))
+        }
+        val thumbX = barX + progressW
+        graphics.fill(thumbX - 2, barY - 2, thumbX + 2, barY + 6, opaque(0xFFFFFF))
+
+        // Row 2 extra diagnostics (ping and coverage warning)
+        val ping = PlayerController.currentPingMs()
+        val pingStr = if (ping > 0) "Ping: ${ping}ms" else ""
         val statusLine = coverageMessage.takeIf { it.isNotEmpty() } ?: readinessMessage
-        if (statusLine.isNotEmpty()) {
-            val color = if (coverageMessage.isNotEmpty()) opaque(0xFFCC44) else opaque(0xFF8844)
-            val disp = if (font.width(statusLine) > width - 20) {
-                var cut = statusLine
-                while (cut.isNotEmpty() && font.width("$cut...") > width - 20) {
+        val row2Status = if (statusLine.isNotEmpty()) statusLine else pingStr
+        if (row2Status.isNotEmpty()) {
+            val color = if (coverageMessage.isNotEmpty()) opaque(0xFFCC44) else opaque(0x888888)
+            val maxW = (width - 275).coerceAtLeast(50)
+            val disp = if (font.width(row2Status) > maxW) {
+                var cut = row2Status
+                while (cut.isNotEmpty() && font.width("$cut...") > maxW) {
                     cut = cut.dropLast(1)
                 }
                 "$cut..."
-            } else statusLine
-            graphics.text(font, disp, 10, height - 64, color)
+            } else row2Status
+            graphics.text(font, disp, 274, height - 20, color)
         }
-
-        // Playback status and progress on Row 2 right of Loop mode (x = 218)
-        val status = when {
-            MidiFilePlayer.isActive() && !MidiFilePlayer.isPaused -> "PLAYING"
-            NbsPlayer.isPlaying && !NbsPlayer.isPaused            -> "PLAYING"
-            MidiFilePlayer.isPaused || NbsPlayer.isPaused         -> "PAUSED"
-            else                                                  -> "IDLE"
-        }
-        val curTick: Long
-        val totTick: Long
-        if (MidiFilePlayer.isActive()) {
-            curTick = MidiFilePlayer.getCurrentTick()
-            totTick = MidiFilePlayer.getTotalTicks()
-        } else if (NbsPlayer.isPlaying) {
-            curTick = NbsPlayer.getCurrentTick()
-            totTick = NbsPlayer.getTotalTicks()
-        } else {
-            curTick = 0L
-            totTick = 0L
-        }
-
-        val statusText = buildString {
-            append(status)
-            if (totTick > 0) {
-                val pct = (curTick * 100 / totTick).toInt()
-                append(" $pct%")
-            }
-            val ping = PlayerController.currentPingMs()
-            if (ping > 0) {
-                append(" (${ping}ms)")
-            }
-        }
-        val color = when (status) {
-            "PLAYING" -> opaque(0x55FF55)
-            "PAUSED"  -> opaque(0xFFFF55)
-            else      -> opaque(0x888888)
-        }
-        graphics.text(font, statusText, 218, height - 24, color)
     }
 
     private fun renderOrganTab(graphics: GuiGraphicsExtractor, font: net.minecraft.client.gui.Font) {
@@ -1115,10 +1212,141 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
         return y
     }
 
-    // ── Input ──────────────────────────────────────────────────────────────────
+    // ── Input & Drag/Drop ──────────────────────────────────────────────────────
+
+    override fun onFilesDrop(files: List<Path>) {
+        var imported = 0
+        var lastFile: File? = null
+        for (path in files) {
+            val file = path.toFile()
+            val ext = file.extension.lowercase()
+            if (ext in listOf("mid", "midi", "nbs")) {
+                try {
+                    val dest = midisDir.resolve(file.name)
+                    file.copyTo(dest, overwrite = true)
+                    imported++
+                    lastFile = dest
+                } catch (e: Exception) {
+                    logger.warn("Failed to copy dropped file ${file.name}: ${e.message}")
+                }
+            }
+        }
+        if (imported > 0) {
+            refreshFiles()
+            lastFile?.let { selectFile(it) }
+            chat("Imported $imported track(s) from drag-and-drop")
+            logger.info("onFilesDrop: imported $imported files, selected ${lastFile?.name}")
+        } else {
+            chatWarn("Dropped files must be .mid or .nbs")
+        }
+    }
 
     override fun mouseClicked(event: MouseButtonEvent, doubleClick: Boolean): Boolean {
+        if (activeTab == 0 && event.button() == 0) {
+            val barY = height - 62
+            if (event.y() >= barY - 4 && event.y() <= barY + 8 && event.x() >= 10 && event.x() <= width - 10) {
+                isScrubbing = true
+                handleScrub(event.x())
+                return true
+            }
+        }
+        if (activeTab == 0 && ::songListWidget.isInitialized && songListWidget.visible) {
+            if (songListWidget.mouseClicked(event, doubleClick)) {
+                return true
+            }
+        }
         return super.mouseClicked(event, doubleClick)
+    }
+
+    override fun mouseDragged(event: MouseButtonEvent, dx: Double, dy: Double): Boolean {
+        if (activeTab == 0 && isScrubbing) {
+            handleScrub(event.x())
+            return true
+        }
+        return super.mouseDragged(event, dx, dy)
+    }
+
+    override fun mouseReleased(event: MouseButtonEvent): Boolean {
+        if (isScrubbing) {
+            isScrubbing = false
+            return true
+        }
+        return super.mouseReleased(event)
+    }
+
+    private fun handleScrub(mouseX: Double) {
+        val barX = 10
+        val barW = (width - 20).coerceAtLeast(1)
+        val fraction = ((mouseX - barX) / barW.toDouble()).coerceIn(0.0, 1.0)
+
+        if (MidiFilePlayer.isActive() || MidiFilePlayer.isPaused || (MidiFilePlayer.loadedMidi?.file == selectedFile && MidiFilePlayer.loadedMidi != null)) {
+            val totalTicks = MidiFilePlayer.getTotalTicks()
+            if (totalTicks > 0) {
+                val targetTick = (fraction * totalTicks).toLong()
+                MidiFilePlayer.seekToTick(targetTick)
+            }
+        } else if (NbsPlayer.isPlaying || NbsPlayer.isPaused || NbsPlayer.currentNbs != null) {
+            val totalTicks = NbsPlayer.getTotalTicks()
+            if (totalTicks > 0) {
+                val targetTick = (fraction * totalTicks).toLong()
+                NbsPlayer.seekToTick(targetTick)
+            }
+        }
+    }
+
+    private fun getPlaybackTimes(): Pair<Double, Double> {
+        return when {
+            MidiFilePlayer.isActive() || MidiFilePlayer.isPaused -> {
+                Pair(MidiFilePlayer.getElapsedSeconds(), MidiFilePlayer.getDurationSeconds())
+            }
+            NbsPlayer.isPlaying || NbsPlayer.isPaused -> {
+                Pair(NbsPlayer.getElapsedSeconds(), NbsPlayer.getDurationSeconds())
+            }
+            selectedFile != null -> {
+                val meta = SongMetadataCache.get(selectedFile!!)
+                val dur = meta?.durationSeconds?.toDouble() ?: 0.0
+                Pair(0.0, dur)
+            }
+            else -> Pair(0.0, 0.0)
+        }
+    }
+
+    private fun formatTime(seconds: Double): String {
+        val s = seconds.toInt().coerceAtLeast(0)
+        val mins = s / 60
+        val secs = s % 60
+        return "%02d:%02d".format(mins, secs)
+    }
+
+    private fun blendColor(base: Int, overlay: Int, factor: Float): Int {
+        val f = factor.coerceIn(0.0f, 1.0f)
+        val r1 = (base shr 16) and 0xFF
+        val g1 = (base shr 8) and 0xFF
+        val b1 = base and 0xFF
+        val r2 = (overlay shr 16) and 0xFF
+        val g2 = (overlay shr 8) and 0xFF
+        val b2 = overlay and 0xFF
+        val r = (r1 + (r2 - r1) * f).toInt()
+        val g = (g1 + (g2 - g1) * f).toInt()
+        val b = (b1 + (b2 - b1) * f).toInt()
+        return opaque((r shl 16) or (g shl 8) or b)
+    }
+
+    private fun updateFilterButtons() {
+        filterButtons["ALL"]?.message = Component.literal(if (activeFilter == "ALL") "[All]" else "All")
+        filterButtons["FAV"]?.message = Component.literal(if (activeFilter == "FAV") "[★]" else "★")
+        filterButtons["MID"]?.message = Component.literal(if (activeFilter == "MID") "[MID]" else "MID")
+        filterButtons["NBS"]?.message = Component.literal(if (activeFilter == "NBS") "[NBS]" else "NBS")
+    }
+
+    private fun setFilter(filter: String) {
+        activeFilter = filter
+        ConfigManager.config.activeFilter = filter
+        ConfigManager.save()
+        updateFilterButtons()
+        if (::songListWidget.isInitialized) {
+            songListWidget.setFiles(displayedFiles, selectedFile)
+        }
     }
 
     override fun keyPressed(event: KeyEvent): Boolean {
