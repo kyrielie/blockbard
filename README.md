@@ -1,6 +1,6 @@
 # BlockBard
 
-> **Automated NoteBlock Organ Performer & Live Synthesizer for Minecraft Fabric 26.2**
+> **Automated NoteBlock Organ Performer & Live Synthesizer for Minecraft Fabric 26.x (26.1, 26.2, 26.3+)**
 
 BlockBard is an advanced client-side Minecraft mod designed to turn physical noteblock arrangements into fully automated, concert-ready musical organs. Load standard MIDI (`.mid`/`.midi`) or Note Block Studio (`.nbs`) files, and BlockBard will scan your surrounding blocks, calculate optimal pitch assignments, automatically tune each block to the required pitch, and execute high-precision musical playback without altering block tunings.
 
@@ -23,9 +23,15 @@ BlockBard is an advanced client-side Minecraft mod designed to turn physical not
   - **Keyboard Play**: Trigger notes in real time using number keys `1`–`9` while in the BlockBard GUI.
   - **USB MIDI Keyboard Input**: Connect physical MIDI instruments via `javax.sound.midi` with thread-safe queue synchronization.
 - 🔁 **Playback Modes & HUD**:
+  - **Client-Side Audio Preview**: Audition tracks client-side with Minecraft's sound engine without placing blocks or sending packets.
+  - **Survival Materials Shopping Overlay**: In-game HUD overlay displaying item icons and fractional counts (`inInventory/needed`) for required blocks.
   - **Loop Modes**: Support for `NONE`, `LOOP_ONE`, `LOOP_ALL`, and `SHUFFLE_ALL` (with duplicate avoidance history).
   - **HUD Overlay**: On-screen overlay rendered via Fabric's `HudElementRegistry` (`H` to toggle) showing song progress, ticks, tempo, and organ coverage.
   - **Dynamic Tempo Scaling**: Live `0.5×`–`2.0×` tempo slider affecting both MIDI and NBS playback in real time.
+- ⚡ **Client Commands & Web Downloads**:
+  - **Fabric Client Commands**: Full `/blockbard` and `/bb` command suite with tab completions for playback, previews, tuning, and scanning.
+  - **URL Song Downloader**: Download `.mid` or `.nbs` files directly in-game with auto-magic byte detection via `/bb download <url>`.
+  - **Instrument Remapping Engine**: Dynamically remap or mute instruments on the fly via `/bb remap`.
 
 ---
 
@@ -38,6 +44,24 @@ BlockBard is an advanced client-side Minecraft mod designed to turn physical not
 | <kbd>1</kbd>–<kbd>9</kbd> | Play mapped notes live (active when GUI is open) |
 
 *Keybindings can be customized in Minecraft's standard **Options → Controls → Key Binds** menu.*
+
+### In-Game Client Commands
+
+BlockBard provides full Fabric client commands registered under `/blockbard` (or alias `/bb`):
+
+| Command | Description |
+|:---|:---|
+| `/bb play <song>` | Starts playing the specified song (supports tab-completion). |
+| `/bb preview <song>` | Auditions the song locally using client sound without placing blocks. |
+| `/bb stop` | Halts world playback, tuning, and previews. |
+| `/bb scan` | Scans surrounding blocks and reports playable noteblocks. |
+| `/bb center` | Centers standing position on organ and reports reachability. |
+| `/bb tempo <0.1–5.0>` | Sets live playback tempo scale. |
+| `/bb loop <none\|loop_one\|loop_all\|shuffle_all>` | Sets loop playback mode. |
+| `/bb download <url> [name]` | Downloads a `.mid` or `.nbs` file from the web asynchronously. |
+| `/bb materials` | Toggles the Survival Materials shopping list HUD overlay. |
+| `/bb remap <source> <target\|mute\|reset>` | Remaps or mutes note block instruments. |
+| `/bb remap list` / `clear` | Views or resets active instrument remap rules. |
 
 ---
 
@@ -82,16 +106,20 @@ src/
 │       └── VecMath.kt              # Vector to yaw/pitch angular math
 └── client/kotlin/kyrielie/blockbard/client/
     ├── BlockBardClient.kt          # Mod initializer, tick listeners & keybind registration
+    ├── command/
+    │   └── BlockBardCommands.kt    # Fabric client commands (/blockbard and /bb)
     ├── config/
     │   └── BlockBardConfig.kt      # Configuration data model & JSON manager
     ├── gui/
     │   ├── BlockBardModMenuIntegration.kt # ModMenu entrypoint
     │   ├── MainScreen.kt           # Primary tabbed GUI (Files, Organ, Settings)
+    │   ├── MaterialsShoppingOverlay.kt # Survival materials item-stack HUD overlay
     │   └── PlaybackHud.kt          # On-screen HUD overlay via HudElementRegistry
     ├── input/
     │   ├── KeyboardInputHandler.kt # 1-9 note trigger dispatcher
     │   └── MidiInputHandler.kt     # USB/Hardware MIDI receiver
     ├── midi/
+    │   ├── InstrumentRemapper.kt   # Runtime instrument substitution and muting
     │   ├── MidiChannelResolver.kt  # GM program to NoteBlockInstrument resolution
     │   ├── MidiInstrumentMap.kt    # Instrument mapping & percussion tables
     │   └── OrganReadinessChecker.kt# Song coverage vs organ analysis
@@ -99,22 +127,27 @@ src/
     │   └── OrganScanner.kt         # Client-side world block scanner
     ├── playback/
     │   ├── MidiFilePlayer.kt       # Sequence loader & scheduler driver
-    │   └── NbsFileLoader.kt        # NBS parser & synchronized NbsPlayer
-    └── player/
-        ├── KickDiagnostics.kt      # Post-disconnect analysis & send history dumping
-        ├── PlayerController.kt     # Rotation interpolation, left-click & right-click actions
-        └── SoundVerifier.kt        # Game sound listener for runtime playback verification
+    │   ├── MidiTempoMap.kt         # Dynamic tempo event mapping (accelerandos/ritardandos)
+    │   ├── NbsFileLoader.kt        # NBS parser & synchronized NbsPlayer
+    │   └── SongAudioPreviewer.kt   # Client-side sound engine audio auditioning
+    ├── player/
+    │   ├── KickDiagnostics.kt      # Post-disconnect analysis & send history dumping
+    │   ├── PlayerController.kt     # Rotation interpolation, left-click & right-click actions
+    │   └── SoundVerifier.kt        # Game sound listener for runtime playback verification
+    └── util/
+        └── SongDownloader.kt       # Asynchronous HTTP/HTTPS song download utility
 ```
 
 ---
 
-## Technical Specifications (Minecraft 26.2)
+## Technical Specifications (Minecraft 26.x Series)
 
-- **Mapping Layer**: None. Minecraft 26.2 ships deobfuscated with official Mojang names directly in runtime and development environments.
+- **Supported Minecraft Versions**: Minecraft 26.x (`>=26.1 <27.0`, including 26.1, 26.2, and 26.3).
+- **Mapping Layer**: None. Starting with 26.1, Minecraft ships deobfuscated with official Mojang names directly in runtime and development environments.
 - **Java Version**: Java 25 (`JavaCompile.options.release = 25`, `jvmTarget = JVM_25`).
 - **Dependencies**:
   - Fabric Loader ≥ `0.19.3`
-  - Fabric API ≥ `0.153.0+26.2`
+  - Fabric API (wildcard `*`, tested on `0.153.0+26.2`)
   - Fabric Language Kotlin ≥ `1.13.12+kotlin.2.4.0`
   - ModMenu (optional soft dependency) ≥ `20.0.0-beta.4`
   - Gson `2.10.1`

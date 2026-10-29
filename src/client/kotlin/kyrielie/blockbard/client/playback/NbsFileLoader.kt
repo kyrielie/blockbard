@@ -224,7 +224,9 @@ object NbsPlayer {
                         // pitch — see nbsInstrumentToBlock kdoc. null for custom
                         // (non-vanilla) instruments, which falls back to pitch-only
                         // matching in ArpeggioScheduler.resolvePos.
-                        val instrument = nbsInstrumentToBlock(note.instrument)
+                        val rawInstrument = nbsInstrumentToBlock(note.instrument)
+                        val instrument = rawInstrument?.let { kyrielie.blockbard.client.midi.InstrumentRemapper.remap(it) }
+                        if (rawInstrument != null && instrument == null) return@forEach // Muted by InstrumentRemapper
                         // Unpitched instruments (SNARE, HAT, BASEDRUM) are assigned to a
                         // single canonical block at midiBase. Use that same midiNote here
                         // so the lookup in ArpeggioScheduler matches the assignment entry.

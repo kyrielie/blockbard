@@ -48,7 +48,9 @@ data class BlockBardConfig(
     // LOOP_ALL    = advance through all songs in sorted order, retuning between tracks
     // SHUFFLE_ALL = advance randomly, avoiding recent repeats (see shuffleHistory),
     //               retuning between tracks
-    var loopMode: String = LoopMode.NONE.name
+    var loopMode: String = LoopMode.NONE.name,
+    // Instrument remapping: source instrument name -> target instrument name (or null/"MUTE" to silence)
+    var instrumentRemap: MutableMap<String, String?> = mutableMapOf()
 ) {
     fun shiftModeEnum(): ShiftMode = try {
         ShiftMode.valueOf(shiftMode)
@@ -95,6 +97,8 @@ object ConfigManager {
             if (config.maxNotesPerTick > 8) config.maxNotesPerTick = 8
             @Suppress("SENSELESS_COMPARISON")
             if ((config.shuffleHistory as MutableList<String>?) == null) config.shuffleHistory = mutableListOf()
+            @Suppress("SENSELESS_COMPARISON")
+            if ((config.instrumentRemap as MutableMap<String, String?>?) == null) config.instrumentRemap = mutableMapOf()
         } catch (e: Exception) {
             logger.warn("Config parse failed, resetting to defaults: ${e.message}", e)
             config = BlockBardConfig()

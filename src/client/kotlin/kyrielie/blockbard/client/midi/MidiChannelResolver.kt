@@ -62,11 +62,12 @@ object MidiChannelResolver {
                 }
                 ShortMessage.NOTE_ON -> {
                     if (msg.data2 == 0) continue // velocity-0 note-on = note-off
-                    val instrument = if (msg.channel == 9) {
+                    val rawInstrument = if (msg.channel == 9) {
                         MidiInstrumentMap.percussionInstrument(msg.data1)
                     } else {
                         MidiInstrumentMap.primaryFor(channelProgram[msg.channel])
                     }
+                    val instrument = InstrumentRemapper.remap(rawInstrument) ?: continue
                     resolved.add(ResolvedNoteEvent(tick, msg.data1, instrument))
                 }
             }

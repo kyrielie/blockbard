@@ -74,6 +74,8 @@ object BlockBardClient : ClientModInitializer {
         KeyboardInputHandler.register()
         PlaybackHud.register()
         KickDiagnostics.register()
+        kyrielie.blockbard.client.gui.MaterialsShoppingOverlay.register()
+        kyrielie.blockbard.client.command.BlockBardCommands.register()
 
         // Prime rotation in START_CLIENT_TICK -- fires before LocalPlayer.tick() calls
         // sendPosition(), so each tick's eased rotation step is included in that tick's
