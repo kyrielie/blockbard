@@ -3,6 +3,7 @@ package kyrielie.blockbard.client.config
 import kyrielie.blockbard.organ.ShiftMode
 import com.google.gson.Gson
 import com.google.gson.GsonBuilder
+import com.google.gson.InstanceCreator
 import net.fabricmc.loader.api.FabricLoader
 import org.slf4j.LoggerFactory
 import java.io.File
@@ -11,6 +12,7 @@ enum class LoopMode { NONE, LOOP_ONE, LOOP_ALL, SHUFFLE_ALL }
 
 data class BlockBardConfig(
     var scanRadius: Int = 5,
+    var sphericalScan: Boolean = true,
     var shiftMode: String = ShiftMode.BEST_EFFORT.name,
     var maxOctaveShift: Int = 1,
     var reportShiftsInHud: Boolean = true,
@@ -63,7 +65,10 @@ data class BlockBardConfig(
 
 object ConfigManager {
     private val logger = LoggerFactory.getLogger("BlockBard/Config")
-    private val gson: Gson = GsonBuilder().setPrettyPrinting().create()
+    private val gson: Gson = GsonBuilder()
+        .registerTypeAdapter(BlockBardConfig::class.java, InstanceCreator { BlockBardConfig() })
+        .setPrettyPrinting()
+        .create()
     private val configFile: File by lazy {
         FabricLoader.getInstance().configDir.resolve("blockbard/config.json").toFile()
     }
@@ -80,10 +85,7 @@ object ConfigManager {
         try {
             config = gson.fromJson(configFile.readText(), BlockBardConfig::class.java)
                 ?: BlockBardConfig()
-            // Gson + Kotlin data class caveat: fields absent from an older config.json
-            // (e.g. saved before these fields were added) are set to JVM zero-defaults
-            // (0, 0L, 0.0f, null) rather than the Kotlin-declared default expressions.
-            // Coalesce any zero/null that would break functionality back to a safe value.
+            // Coalesce any zero/null that would break functionality back to a safe value
             if (config.scanRadius <= 0) config.scanRadius = 5
             if (config.arpeggioStaleTimeoutMs <= 0L) config.arpeggioStaleTimeoutMs = 200L
             if (config.maxRotationDegreesPerTick <= 0f) config.maxRotationDegreesPerTick = 35f
@@ -91,7 +93,8 @@ object ConfigManager {
             if (config.rotationInProgressTimeoutMs <= 0L) config.rotationInProgressTimeoutMs = 1500L
             if (config.maxNotesPerTick <= 0) config.maxNotesPerTick = 1
             if (config.maxNotesPerTick > 8) config.maxNotesPerTick = 8
-            if (config.shuffleHistory == null) config.shuffleHistory = mutableListOf()
+            @Suppress("SENSELESS_COMPARISON")
+            if ((config.shuffleHistory as MutableList<String>?) == null) config.shuffleHistory = mutableListOf()
         } catch (e: Exception) {
             logger.warn("Config parse failed, resetting to defaults: ${e.message}", e)
             config = BlockBardConfig()

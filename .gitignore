@@ -107,3 +107,6 @@ hs_err_*.log
 replay_*.log
 *.hprof
 *.jfr
+repomix-output.xml
+blockbard.xml
+blockbard.xml

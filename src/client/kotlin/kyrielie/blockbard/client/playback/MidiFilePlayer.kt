@@ -1,6 +1,6 @@
 package kyrielie.blockbard.client.playback
 
-import kyrielie.blockbard.midi.MidiChannelResolver
+import kyrielie.blockbard.client.midi.MidiChannelResolver
 import kyrielie.blockbard.organ.ArpeggioScheduler
 import kyrielie.blockbard.organ.NotePitch
 import kyrielie.blockbard.organ.NoteRequest
@@ -28,14 +28,15 @@ data class LoadedMidi(
      * so two channels playing the same pitch on different instruments are counted
      * and later assigned separately rather than collapsed into one pitch bucket.
      */
-    val noteUsageCounts: Map<NotePitch, Int>
+    val noteUsageCounts: Map<NotePitch, Int>,
+    val tempoMap: MidiTempoMap = MidiTempoMap.build(emptyList(), ticksPerBeat)
 )
 
 /** Duration of the sequence in milliseconds at 1x tempo. */
 val LoadedMidi.durationMs: Long get() {
     if (events.isEmpty()) return 0L
     val lastTick = events.last().tick
-    return tickToMs(lastTick, ticksPerBeat, baseTempoUsPerBeat)
+    return tempoMap.tickToMs(lastTick)
 }
 
 fun tickToMs(tick: Long, ticksPerBeat: Int, usPerBeat: Int): Long {
@@ -70,22 +71,27 @@ object MidiFilePlayer {
     fun load(file: File): LoadedMidi {
         val sequence = MidiSystem.getSequence(file)
         var tempoUs = 500000  // default 120 BPM
+        val tempoChanges = mutableListOf<Pair<Long, Int>>()
 
         // Tempo (MetaMessage 0x51) is not a channel-voice message, so MidiChannelResolver
         // (which only collects ShortMessages) doesn't see it — read it directly here.
         sequence.tracks.forEach { track ->
             for (i in 0 until track.size()) {
-                val msg = track.get(i).message
+                val event = track.get(i)
+                val msg = event.message
                 if (msg is MetaMessage && msg.type == 0x51) {
                     val d = msg.data
                     if (d.size >= 3) {
-                        tempoUs = ((d[0].toInt() and 0xFF) shl 16) or
+                        val us = ((d[0].toInt() and 0xFF) shl 16) or
                                 ((d[1].toInt() and 0xFF) shl 8) or
                                 (d[2].toInt() and 0xFF)
+                        tempoUs = us
+                        tempoChanges.add(event.tick to us)
                     }
                 }
             }
         }
+        val tempoMap = MidiTempoMap.build(tempoChanges, sequence.resolution)
 
         // MidiChannelResolver resolves each NOTE_ON to the instrument the minecraft3.sf2
         // soundfont would use for that channel's GM program (or percussion for channel 10),
@@ -119,7 +125,8 @@ object MidiFilePlayer {
             baseTempoUsPerBeat = tempoUs,
             events = sortedEvents,
             distinctNotes = sortedEvents.map { it.midiNote }.toSet(),
-            noteUsageCounts = usageCounts
+            noteUsageCounts = usageCounts,
+            tempoMap = tempoMap
         )
         loadedMidi = midi
         currentTick = 0L
@@ -141,12 +148,9 @@ object MidiFilePlayer {
             try {
                 for (event in eventsToPlay) {
                     if (!isPlaying) break
-                    val scaledMs = tickToScaledMs(
-                        event.tick - startTick,
-                        midi.ticksPerBeat,
-                        midi.baseTempoUsPerBeat,
-                        tempoMultiplier
-                    )
+                    val scaledStartMs = midi.tempoMap.tickToScaledMs(startTick, tempoMultiplier)
+                    val scaledEventMs = midi.tempoMap.tickToScaledMs(event.tick, tempoMultiplier)
+                    val scaledMs = (scaledEventMs - scaledStartMs).coerceAtLeast(0L)
                     val targetWall = startWallMs + scaledMs
 
                     // Wait until target time, checking for pause

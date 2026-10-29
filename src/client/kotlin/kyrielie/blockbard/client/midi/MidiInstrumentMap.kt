@@ -1,4 +1,4 @@
-package kyrielie.blockbard.midi
+package kyrielie.blockbard.client.midi
 
 import net.minecraft.world.level.block.state.properties.NoteBlockInstrument
 
