@@ -8,6 +8,7 @@ import kyrielie.blockbard.client.playback.MidiFilePlayer
 import kyrielie.blockbard.client.playback.NbsFile
 import kyrielie.blockbard.client.playback.NbsFileLoader
 import kyrielie.blockbard.client.playback.NbsPlayer
+import kyrielie.blockbard.client.playback.SongAudioPreviewer
 import kyrielie.blockbard.client.playback.nbsInstrumentToBlock
 import kyrielie.blockbard.client.input.KeyboardInputHandler
 import kyrielie.blockbard.client.midi.MidiChannelResolver
@@ -154,7 +155,23 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
             logger.info("Refresh clicked")
             refreshFiles()
             chat("Refreshed -- ${midiFiles.size} files found")
-        }.pos(58, 157).size(60, 14).build()))
+        }.pos(58, 157).size(52, 14).build()))
+
+        tab0(addRenderableWidget(Button.builder(Component.literal(if (SongAudioPreviewer.isPlaying) "Stop Prev" else "Preview")) { btn ->
+            if (SongAudioPreviewer.isPlaying) {
+                SongAudioPreviewer.stopPreview()
+                btn.message = Component.literal("Preview")
+                chat("Audio preview stopped")
+            } else {
+                selectedFile?.let { file ->
+                    MidiFilePlayer.stop()
+                    NbsPlayer.stop()
+                    SongAudioPreviewer.startPreview(file, MidiFilePlayer.tempoMultiplier)
+                    btn.message = Component.literal("Stop Prev")
+                    chat("Auditioning: ${file.name}")
+                } ?: chatWarn("Select a song first")
+            }
+        }.pos(114, 157).size(58, 14).build()))
 
         val searchBox = EditBox(font, 10, 175, 180, 14, Component.literal("Search"))
         searchBox.setHint(Component.literal("Search tracks..."))
@@ -195,6 +212,12 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
             logger.info("Play Scale clicked")
             playScale()
         }.pos(174, organButtonY1).size(56, 14).build()))
+
+        tab1(addRenderableWidget(Button.builder(Component.literal(if (MaterialsShoppingOverlay.isVisible) "Hide Mats" else "Show Mats")) { btn ->
+            MaterialsShoppingOverlay.isVisible = !MaterialsShoppingOverlay.isVisible
+            btn.message = Component.literal(if (MaterialsShoppingOverlay.isVisible) "Hide Mats" else "Show Mats")
+            chat("Materials overlay ${if (MaterialsShoppingOverlay.isVisible) "shown" else "hidden"}")
+        }.pos(234, organButtonY1).size(60, 14).build()))
 
         tab0(addRenderableWidget(Button.builder(Component.literal("Play")) {
             logger.info("Play clicked")
@@ -428,6 +451,7 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
     // ── Tuning ─────────────────────────────────────────────────────────────────
 
     private fun startTuning(thenPlay: Boolean = false) {
+        SongAudioPreviewer.stopPreview()
         val mc = minecraft
         val player = mc.player ?: run { chatWarn("No player"); return }
 
@@ -575,6 +599,7 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
     // ── Scale playback ─────────────────────────────────────────────────────────
 
     private fun playScale() {
+        SongAudioPreviewer.stopPreview()
         val mc = minecraft
         val gameMode = mc.gameMode?.playerMode
         if (gameMode == GameType.CREATIVE) {
@@ -620,6 +645,7 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
     // ── Playback ───────────────────────────────────────────────────────────────
 
     private fun startPlayback() {
+        SongAudioPreviewer.stopPreview()
         val file = selectedFile ?: run { chatWarn("No file selected"); return }
         logger.info("startPlayback: ${file.name}")
 
@@ -662,6 +688,7 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
     }
 
     private fun selectFile(file: File) {
+        SongAudioPreviewer.stopPreview()
         selectedFile = file
         selectedIndex = midiFiles.indexOf(file)
         MidiFilePlayer.stop()
@@ -679,6 +706,7 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
             // Tier 6b (MIDI): pre-flight readiness check with full instrument list and
             // block-below material hints -- no .take(4) truncation (Tier 6a).
             val requirements = MidiChannelResolver.resolveRequirements(file)
+            MaterialsShoppingOverlay.updateRequirements(requirements)
             val report = OrganReadinessChecker.check(requirements)
             readinessMessage = if (report.isFullyCovered) {
                 "All notes covered (${report.totalRequired} notes)"
@@ -718,6 +746,7 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
                         NotePitch(note.key + 21, inst)
                     }.toSet()
 
+                MaterialsShoppingOverlay.updateRequirements(nbsRequirements)
                 val report = OrganReadinessChecker.check(nbsRequirements)
                 readinessMessage = if (report.isFullyCovered) {
                     "All notes covered (${report.totalRequired} notes)"
@@ -744,6 +773,7 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
                 chatWarn("Failed to load ${file.name}: ${e.message}")
                 loadedNbs = null
                 loadFailed = true
+                MaterialsShoppingOverlay.clear()
             }
         } else {
             loadedNbs = null
