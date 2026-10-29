@@ -53,6 +53,7 @@ class NoteBlockTuner(
      * (back-compat -- existing callers that don't pass this get the old behavior).
      */
     private val rotationConverged: ((BlockPos) -> Boolean)? = null,
+    var fastTuning: Boolean = true,
     val onProgress: (done: Int, total: Int, msg: String) -> Unit = { _, _, _ -> }
 ) {
     private val logger = LoggerFactory.getLogger("BlockBard/NoteBlockTuner")
@@ -220,20 +221,28 @@ class NoteBlockTuner(
                 // at the top of onTick() -- safe to click now.
             }
 
-            val dispatched = interactBlock(pos)
-            if (!dispatched) {
-                logger.warn("NoteBlockTuner: interactBlock false for $pos -- aborting")
-                state = TunerState.FAILED
-                pendingRotationPos = null
-                onProgress(confirmedCount, total, "FAILED: could not interact with $pos")
-                return
+            val target = targets.firstOrNull { it.pos == pos }
+            val clicksToTarget = target?.let { clicksNeeded(effectiveNote, it.targetNote) } ?: 1
+            val maxClicks = if (fastTuning) clicksToTarget.coerceAtMost(availableInteracts.toInt().coerceAtLeast(1)) else 1
+
+            var currentEffective = effectiveNote
+            for (c in 0 until maxClicks) {
+                if (availableInteracts < 1f) break
+                val dispatched = interactBlock(pos)
+                if (!dispatched) {
+                    logger.warn("NoteBlockTuner: interactBlock false for $pos -- aborting")
+                    state = TunerState.FAILED
+                    pendingRotationPos = null
+                    onProgress(confirmedCount, total, "FAILED: could not interact with $pos")
+                    return
+                }
+                currentEffective = (currentEffective + 1) % 25
+                availableInteracts -= 1f
+                lastInteractMs = now
             }
-            val predicted = (effectiveNote + 1) % 25
             val expires = now + pingMs() * 2 + 150L
-            notePredictions[pos] = Pair(predicted, expires)
-            logger.debug("NoteBlockTuner: clicked $pos note $effectiveNote -> predicted $predicted")
-            availableInteracts -= 1f
-            lastInteractMs = now
+            notePredictions[pos] = Pair(currentEffective, expires)
+            logger.debug("NoteBlockTuner: clicked $pos note $effectiveNote -> predicted $currentEffective")
             pendingRotationPos = null  // click fired, rotation no longer pending
         }
     }

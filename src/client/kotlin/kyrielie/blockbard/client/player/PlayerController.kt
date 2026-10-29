@@ -138,6 +138,7 @@ object PlayerController {
      * Use rotationConverged(pos) to check whether it is safe to fire the interact yet.
      */
     fun primeRotation(pos: BlockPos) {
+        if (!kyrielie.blockbard.client.config.ConfigManager.config.smoothCameraRotation) return
         val mc = Minecraft.getInstance()
         val player = mc.player ?: return
         val eyePos = player.eyePosition
@@ -186,6 +187,7 @@ object PlayerController {
      * ROTATION_CONVERGENCE_THRESHOLD_DEGREES of [pos]'s target rotation.
      */
     fun rotationConverged(pos: BlockPos): Boolean {
+        if (!kyrielie.blockbard.client.config.ConfigManager.config.smoothCameraRotation) return true
         val mc = Minecraft.getInstance()
         val player = mc.player ?: return false
         val primed = primedRotation?.takeIf { it.first == pos } ?: return false
@@ -249,22 +251,24 @@ object PlayerController {
             ?: (reach?.let { Pair(it.yaw, it.pitch) } ?: vecToYawPitch(delta))
         primedRotation = null
 
-        val yRotBefore = player.yRot
-        val xRotBefore = player.xRot
-        player.setYRot(yaw)
-        player.setXRot(pitch)
-        val yRotAfter = player.yRot
-        val xRotAfter = player.xRot
-        if (yRotAfter != yaw || xRotAfter != pitch) {
-            logger.warn(
-                "$caller $pos: rotation override detected -- wanted yaw=${"%.2f".format(yaw)} pitch=${"%.2f".format(pitch)}" +
-                    " got yaw=${"%.2f".format(yRotAfter)} pitch=${"%.2f".format(xRotAfter)}"
-            )
-        }
-        DebugLog.info(logger) {
-            "$caller $pos: rot ${"%.2f".format(yRotBefore)},${"%.2f".format(xRotBefore)}" +
-                " -> ${"%.2f".format(yRotAfter)},${"%.2f".format(xRotAfter)}" +
-                " liveDist=${"%.2f".format(distance)} mapDist=$mapDistStr ping=${currentPingMs()}"
+        if (kyrielie.blockbard.client.config.ConfigManager.config.smoothCameraRotation) {
+            val yRotBefore = player.yRot
+            val xRotBefore = player.xRot
+            player.setYRot(yaw)
+            player.setXRot(pitch)
+            val yRotAfter = player.yRot
+            val xRotAfter = player.xRot
+            if (yRotAfter != yaw || xRotAfter != pitch) {
+                logger.warn(
+                    "$caller $pos: rotation override detected -- wanted yaw=${"%.2f".format(yaw)} pitch=${"%.2f".format(pitch)}" +
+                        " got yaw=${"%.2f".format(yRotAfter)} pitch=${"%.2f".format(xRotAfter)}"
+                )
+            }
+            DebugLog.info(logger) {
+                "$caller $pos: rot ${"%.2f".format(yRotBefore)},${"%.2f".format(xRotBefore)}" +
+                    " -> ${"%.2f".format(yRotAfter)},${"%.2f".format(xRotAfter)}" +
+                    " liveDist=${"%.2f".format(distance)} mapDist=$mapDistStr ping=${currentPingMs()}"
+            }
         }
 
         val hitFace = when {
