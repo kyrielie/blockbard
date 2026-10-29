@@ -167,6 +167,8 @@ object NbsPlayer {
     // LittleEndianReader's EOF handling rather than re-sorting here on every play().
     private var currentTick: Long = 0L
     private var totalTick: Long = 0L
+    var currentNbs: NbsFile? = null
+        private set
 
     var onFinished: (() -> Unit)? = null
 
@@ -177,13 +179,17 @@ object NbsPlayer {
      * MidiFilePlayer.tempoMultiplier directly) and it should apply identically to
      * whichever format is currently playing.
      */
-    fun play(nbs: NbsFile) {
+    fun play(nbs: NbsFile, startFromTick: Long = 0L) {
         stop()
         isPlaying = true
         isPaused = false
-        startWallMs = System.currentTimeMillis()
-        currentTick = 0L
+        currentNbs = nbs
+        currentTick = startFromTick
         totalTick = nbs.notes.lastOrNull()?.tick?.toLong() ?: 0L
+
+        val initialRealMs = (startFromTick / nbs.tempo * 1000.0).toLong()
+        val initialScaledMs = (initialRealMs / MidiFilePlayer.tempoMultiplier).toLong()
+        startWallMs = System.currentTimeMillis() - initialScaledMs
 
         playbackThread = Thread({
             try {
@@ -192,6 +198,7 @@ object NbsPlayer {
 
                 for (tick in sortedTicks) {
                     if (!isPlaying) break
+                    if (tick < startFromTick) continue
 
                     // Recompute the scaled target time fresh from the live tempo
                     // multiplier each tick, the same way MidiFilePlayer.play() calls
@@ -270,4 +277,31 @@ object NbsPlayer {
 
     fun getCurrentTick(): Long = currentTick
     fun getTotalTicks(): Long = totalTick
+
+    fun seekToTick(tick: Long) {
+        val nbs = currentNbs ?: return
+        val clamped = tick.coerceIn(0L, totalTick.coerceAtLeast(0L))
+        val wasPlaying = isPlaying && !isPaused
+        val wasPaused = isPaused
+        stop()
+        currentNbs = nbs
+        currentTick = clamped
+        if (wasPlaying) {
+            play(nbs, clamped)
+        } else if (wasPaused) {
+            isPaused = true
+        }
+    }
+
+    fun getDurationSeconds(): Double {
+        val nbs = currentNbs ?: return 0.0
+        val tempo = if (nbs.tempo > 0f) nbs.tempo else 10f
+        return totalTick.toDouble() / tempo
+    }
+
+    fun getElapsedSeconds(): Double {
+        val nbs = currentNbs ?: return 0.0
+        val tempo = if (nbs.tempo > 0f) nbs.tempo else 10f
+        return currentTick.toDouble() / tempo
+    }
 }

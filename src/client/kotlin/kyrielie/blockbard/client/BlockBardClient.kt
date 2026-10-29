@@ -51,7 +51,7 @@ object BlockBardClient : ClientModInitializer {
         ArpeggioScheduler.staleTimeoutMs = cfg.arpeggioStaleTimeoutMs
         ArpeggioScheduler.rotationInProgressTimeoutMs = cfg.rotationInProgressTimeoutMs
         // Tier 2: max notes per tick
-        ArpeggioScheduler.maxNotesPerTick = cfg.maxNotesPerTick.coerceIn(1, 8)
+        ArpeggioScheduler.maxNotesPerTick = cfg.maxNotesPerTick.coerceIn(1, 64)
         MAX_ROTATION_DEGREES_PER_TICK = cfg.maxRotationDegreesPerTick
         ROTATION_CONVERGENCE_THRESHOLD_DEGREES = cfg.rotationConvergenceThresholdDegrees
 
@@ -61,6 +61,9 @@ object BlockBardClient : ClientModInitializer {
         }
         ArpeggioScheduler.rotationConvergedDelegate = { pos ->
             PlayerController.rotationConverged(pos)
+        }
+        ArpeggioScheduler.onNoteDispatched = { midiNote, instrument ->
+            kyrielie.blockbard.client.gui.VisualizerState.trigger(midiNote, instrument)
         }
 
         val blockbardCategory = KeyMapping.Category.register(net.minecraft.resources.Identifier.fromNamespaceAndPath("blockbard", "general"))
@@ -73,6 +76,7 @@ object BlockBardClient : ClientModInitializer {
         logger.info("Keybindings registered: B=open GUI, H=toggle HUD")
 
         KeyboardInputHandler.register()
+        PlaybackHud.isVisible = cfg.hudEnabled
         PlaybackHud.register()
         KickDiagnostics.register()
         kyrielie.blockbard.client.gui.MaterialsShoppingOverlay.register()
@@ -101,6 +105,10 @@ object BlockBardClient : ClientModInitializer {
             }
             while (toggleHudKey.consumeClick()) {
                 PlaybackHud.isVisible = !PlaybackHud.isVisible
+                ConfigManager.config.hudEnabled = PlaybackHud.isVisible
+                ConfigManager.save()
+                val status = if (PlaybackHud.isVisible) "enabled" else "disabled"
+                mc.player?.sendSystemMessage(net.minecraft.network.chat.Component.literal("§b[BlockBard] §fPlayback HUD $status"))
                 logger.info("H pressed -- HUD visible=${PlaybackHud.isVisible}")
             }
             ArpeggioScheduler.onTick()

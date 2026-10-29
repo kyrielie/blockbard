@@ -92,7 +92,7 @@ object ArpeggioScheduler {
      *
      * Set from BlockBardConfig.maxNotesPerTick at init in BlockBardClient.
      */
-    var maxNotesPerTick: Int = 1
+    var maxNotesPerTick: Int = 8
 
     /**
      * Wired to PlayerController.playNoteAt(pos, request) by the client entrypoint.
@@ -100,6 +100,7 @@ object ArpeggioScheduler {
      * PlayerController can hand the full (midiNote, instrument) pair to SoundVerifier.
      */
     var interactDelegate: ((BlockPos, NoteRequest) -> Boolean)? = null
+    var onNoteDispatched: ((midiNote: Int, instrument: NoteBlockInstrument?) -> Unit)? = null
 
     /**
      * Wired to PlayerController.rotationConverged() by the client entrypoint. Gates
@@ -249,6 +250,7 @@ object ArpeggioScheduler {
             queue.removeFirst()
             val budgetBefore = interactBudget
             val ok = interactDelegate?.invoke(pos, request) ?: false
+            onNoteDispatched?.invoke(request.midiNote, request.instrument)
             interactBudget -= 1f
             dispatchHistory.addLast(DispatchRecord(now, pos, request.midiNote, budgetBefore, interactBudget))
             if (dispatchHistory.size > RECENT_DISPATCH_CAPACITY) dispatchHistory.removeFirst()
