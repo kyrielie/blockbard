@@ -15,7 +15,10 @@ import org.slf4j.LoggerFactory
  * information -- such notes are assigned a block at the right pitch regardless of
  * instrument.
  */
-data class NotePitch(val midiNote: Int, val instrument: NoteBlockInstrument? = null)
+data class NotePitch(val midiNote: Int, val instrument: NoteBlockInstrument? = null) {
+    val isPitched: Boolean get() = instrument?.isPitched ?: true
+    val coversNatively: Boolean get() = instrument?.coversNatively(midiNote) ?: true
+}
 
 /** Human-readable display name, e.g. "C4" or "C4 (BELL)" if an instrument is specified. */
 fun NotePitch.displayName(): String =
@@ -27,7 +30,9 @@ data class OrganAssignment(
     /** Notes that could not be assigned to any block. */
     val unplayable: List<NotePitch>,
     /** Shifts applied: note -> semitone shift used. */
-    val shifts: Map<NotePitch, Int>
+    val shifts: Map<NotePitch, Int>,
+    /** Multi-voice pools: note -> all reachable blocks assigned to this pitch. */
+    val voicePools: Map<NotePitch, List<BlockPos>> = assignment.mapValues { listOf(it.value) }
 )
 
 object MidiToOrganMapper {
@@ -97,8 +102,26 @@ object MidiToOrganMapper {
             logger.warn("  ${note.displayName()} UNPLAYABLE -- no suitable block found")
         }
 
-        logger.info("buildAssignment: ${assignment.size} assigned, ${unplayable.size} unplayable")
-        return OrganAssignment(assignment, unplayable, shifts)
+        val voicePools = mutableMapOf<NotePitch, MutableList<BlockPos>>()
+        assignment.forEach { (note, pos) -> voicePools[note] = mutableListOf(pos) }
+
+        // Polyphonic voice expansion: allocate remaining reachable blocks to duplicate voice pools
+        val unassignedBlocks = reachableBlocks.filter { it.pos !in usedPositions }
+        for (unused in unassignedBlocks) {
+            val matchingNote = sortedNotes.firstOrNull { note ->
+                note.instrument == unused.instrument &&
+                assignment.containsKey(note) &&
+                unused.instrument.coversNatively(note.midiNote + (shifts[note] ?: 0))
+            }
+            if (matchingNote != null) {
+                voicePools.getOrPut(matchingNote) { mutableListOf() }.add(unused.pos)
+                usedPositions.add(unused.pos)
+                logger.debug("  Duplicate voice: ${matchingNote.displayName()} pool += ${unused.pos}")
+            }
+        }
+
+        logger.info("buildAssignment: ${assignment.size} assigned (${usedPositions.size} total blocks in pools), ${unplayable.size} unplayable")
+        return OrganAssignment(assignment, unplayable, shifts, voicePools)
     }
 
     /**
@@ -159,38 +182,40 @@ object MidiToOrganMapper {
     ): List<TuneTarget> {
         val blockByPos = reachableBlocks.associateBy { it.pos }
         val targets = mutableListOf<TuneTarget>()
+        val seenPos = mutableSetOf<BlockPos>()
 
-        for ((note, pos) in assignment.assignment) {
-            val entry = blockByPos[pos] ?: run {
-                logger.warn("computeTuneTargets: no entry for pos $pos (note=${midiNoteToName(note.midiNote)}) -- skipping")
-                continue
+        for ((note, pool) in assignment.voicePools) {
+            for (pos in pool) {
+                if (!seenPos.add(pos)) continue
+                val entry = blockByPos[pos] ?: run {
+                    logger.warn("computeTuneTargets: no entry for pos $pos (note=${midiNoteToName(note.midiNote)}) -- skipping")
+                    continue
+                }
+
+                // Unpitched instruments (SNARE, HAT, BASEDRUM) ignore noteIndex in-game.
+                if (!entry.instrument.isPitched) {
+                    targets.add(TuneTarget(pos, entry.noteIndex, entry.noteIndex, entry.instrument))
+                    logger.debug("  TuneTarget ${entry.pos} ${entry.instrument.name} (unpitched, no tuning needed)")
+                    continue
+                }
+
+                val shift = assignment.shifts[note] ?: 0
+                val effectiveMidi = note.midiNote + shift
+                val rawIndex = effectiveMidi - entry.instrument.midiBase
+
+                if (rawIndex !in 0..24) {
+                    logger.warn("computeTuneTargets: MIDI ${midiNoteToName(effectiveMidi)} (raw=$effectiveMidi) is out of range for ${entry.instrument.name} (midiBase=${entry.instrument.midiBase}) -- dropping")
+                    continue
+                }
+
+                val target = TuneTarget(pos, entry.noteIndex, rawIndex, entry.instrument)
+                logger.debug("  TuneTarget ${entry.pos} ${entry.instrument.name} ${entry.noteIndex}->${rawIndex} (${midiNoteToName(effectiveMidi)}) -- ${target.estimatedClicks} clicks")
+                targets.add(target)
             }
-
-            // Unpitched instruments (SNARE, HAT, BASEDRUM) ignore noteIndex in-game.
-            // Emit a TuneTarget with targetNote == snapshotNote so clicksNeeded returns 0
-            // and the tuner skips this block entirely without sending any clicks.
-            if (!entry.instrument.isPitched) {
-                targets.add(TuneTarget(pos, entry.noteIndex, entry.noteIndex, entry.instrument))
-                logger.debug("  TuneTarget ${entry.pos} ${entry.instrument.name} (unpitched, no tuning needed)")
-                continue
-            }
-
-            val shift = assignment.shifts[note] ?: 0
-            val effectiveMidi = note.midiNote + shift
-            val rawIndex = effectiveMidi - entry.instrument.midiBase
-
-            if (rawIndex !in 0..24) {
-                logger.warn("computeTuneTargets: MIDI ${midiNoteToName(effectiveMidi)} (raw=$effectiveMidi) is out of range for ${entry.instrument.name} (midiBase=${entry.instrument.midiBase}) -- dropping")
-                continue
-            }
-
-            val target = TuneTarget(pos, entry.noteIndex, rawIndex, entry.instrument)
-            logger.debug("  TuneTarget ${entry.pos} ${entry.instrument.name} ${entry.noteIndex}->${rawIndex} (${midiNoteToName(effectiveMidi)}) -- ${target.estimatedClicks} clicks")
-            targets.add(target)
         }
 
         val totalClicks = targets.sumOf { it.estimatedClicks }
-        logger.info("computeTuneTargets: ${targets.size} targets, $totalClicks total clicks")
+        logger.info("computeTuneTargets: ${targets.size} targets across voice pools, $totalClicks total clicks")
         return targets
     }
 }

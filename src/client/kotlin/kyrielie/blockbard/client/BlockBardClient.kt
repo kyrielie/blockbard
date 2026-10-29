@@ -5,6 +5,7 @@ import kyrielie.blockbard.client.gui.MainScreen
 import kyrielie.blockbard.client.gui.PlaybackHud
 import kyrielie.blockbard.client.input.KeyboardInputHandler
 import kyrielie.blockbard.client.input.MidiInputHandler
+import kyrielie.blockbard.client.player.KickDiagnostics
 import kyrielie.blockbard.client.player.MAX_ROTATION_DEGREES_PER_TICK
 import kyrielie.blockbard.client.player.PlayerController
 import kyrielie.blockbard.client.player.ROTATION_CONVERGENCE_THRESHOLD_DEGREES
@@ -44,6 +45,7 @@ object BlockBardClient : ClientModInitializer {
         DebugLog.enabled = cfg.debugLogging
 
         OrganScanner.scanRadius = cfg.scanRadius
+        OrganScanner.sphericalScan = cfg.sphericalScan
         InstrumentShifter.mode = cfg.shiftModeEnum()
         InstrumentShifter.maxOctaveShift = cfg.maxOctaveShift
         ArpeggioScheduler.staleTimeoutMs = cfg.arpeggioStaleTimeoutMs
@@ -71,6 +73,7 @@ object BlockBardClient : ClientModInitializer {
 
         KeyboardInputHandler.register()
         PlaybackHud.register()
+        KickDiagnostics.register()
 
         // Prime rotation in START_CLIENT_TICK -- fires before LocalPlayer.tick() calls
         // sendPosition(), so each tick's eased rotation step is included in that tick's

@@ -21,16 +21,12 @@ object OrganScanner {
     /** Scan radius in blocks (1-10). Configurable via Settings tab. */
     var scanRadius: Int = 5
 
+    /** When true, only checks blocks within Euclidean radius r, reducing iteration count by ~48%. */
+    var sphericalScan: Boolean = true
+
     /**
-     * Scans for noteblocks in a cube of [scanRadius] around the player and updates
-     * [NoteBlockRegistry]. Must be called from the client thread.
-     *
-     * Shape note: the scan is a full cube O((2r+1)^3), not a sphere. A noteblock at a
-     * cube corner (e.g. (r, r, 0)) has Euclidean distance r*sqrt(2) > r and would be
-     * excluded by a sphere check -- but it is reachable if the player stands close
-     * enough. The cube shape is intentionally kept to avoid silently dropping blocks
-     * that a sphere would miss. The unconditional-rescan-during-playback issue is fixed
-     * separately (auto-rescan timer is skipped while playing/tuning -- see MainScreen.tick).
+     * Scans for noteblocks around the player and updates [NoteBlockRegistry].
+     * Must be called from the client thread.
      */
     fun scan() {
         val mc = Minecraft.getInstance()
@@ -46,14 +42,21 @@ object OrganScanner {
         val playerPos = player.blockPosition()
         val eyePos = player.eyePosition
         val r = scanRadius
+        val rSq = r * r
         val found = mutableListOf<NoteBlockEntry>()
 
-        logger.info("scan: scanning radius=$r around $playerPos")
+        logger.info("scan: scanning radius=$r (spherical=$sphericalScan) around $playerPos")
 
-        for (x in -r..r) for (y in -r..r) for (z in -r..r) {
-            val pos = playerPos.offset(x, y, z)
-            val state = world.getBlockState(pos)
-            if (state.block != Blocks.NOTE_BLOCK) continue
+        for (x in -r..r) {
+            val xSq = x * x
+            for (y in -r..r) {
+                val xySq = xSq + y * y
+                if (sphericalScan && xySq > rSq) continue
+                for (z in -r..r) {
+                    if (sphericalScan && (xySq + z * z) > rSq) continue
+                    val pos = playerPos.offset(x, y, z)
+                    val state = world.getBlockState(pos)
+                    if (state.block != Blocks.NOTE_BLOCK) continue
 
             val instrument: NoteBlockInstrument = state.getValue(NoteBlock.INSTRUMENT)
             val noteIndex: Int = state.getValue(NoteBlock.NOTE)
@@ -86,7 +89,7 @@ object OrganScanner {
                     mobHeadType = mobHead
                 )
             )
-        }
+        } } }
 
         NoteBlockRegistry.update(found)
 

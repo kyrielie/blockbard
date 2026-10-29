@@ -27,6 +27,18 @@ data class NoteRequest(
 )
 
 /**
+ * One dispatched interact, recorded for post-disconnect diagnostics.
+ * See [ArpeggioScheduler.recentDispatches] / KickDiagnostics.
+ */
+data class DispatchRecord(
+    val atMs: Long,
+    val pos: BlockPos,
+    val midiNote: Int,
+    val budgetBefore: Float,
+    val budgetAfter: Float
+)
+
+/**
  * Tick-based queue that serialises simultaneous note requests into sequential
  * block interactions governed by a token-bucket rate limiter.
  *
@@ -42,6 +54,14 @@ object ArpeggioScheduler {
      * different instruments don't collide on one assignment slot.
      */
     var assignment: Map<NotePitch, BlockPos> = emptyMap()
+
+    /**
+     * Multi-voice pools: NotePitch -> list of all available blocks for this pitch.
+     * Allows polyphony and rapid note repetitions to alternate round-robin across physical blocks.
+     */
+    var voicePools: Map<NotePitch, List<BlockPos>> = emptyMap()
+
+    private val voiceIndices = mutableMapOf<NotePitch, Int>()
 
     /** Requests older than this are dropped to prevent note build-up after lag. */
     var staleTimeoutMs: Long = 200L
@@ -106,18 +126,49 @@ object ArpeggioScheduler {
     private var interactBudget: Float = 1f
     private var lastTickMs: Long = -1L
 
+    // ── Dispatch history (for KickDiagnostics) ──────────────────────────────────
+    // Fixed-size ring buffer of the last RECENT_DISPATCH_CAPACITY interacts. Cheap
+    // (single pre-allocated ArrayDeque with a hard cap, no per-dispatch allocation
+    // beyond the DispatchRecord itself) and gives KickDiagnostics a precise account
+    // of exactly what was sent in the moments before a disconnect -- see kdoc on
+    // recentDispatches() for why this is the only reliable way to answer "where is
+    // the real limit" after the fact, since SoundVerifier only confirms sound played,
+    // not that the server's rate limiter was untroubled by the send.
+    private const val RECENT_DISPATCH_CAPACITY = 200
+    private val dispatchHistory: ArrayDeque<DispatchRecord> = ArrayDeque()
+
     /**
      * Resolves a request to a target BlockPos, trying in order:
      * 1. resolvedPos, if the caller already knows the exact block.
-     * 2. assignment for the exact (midiNote, instrument) pair.
-     * 3. assignment for (midiNote, null) -- instrument-agnostic fallback.
-     * 4. NoteBlockRegistry.findBestFor(midiNote, instrument) -- live lookup.
+     * 2. voicePools for the exact (midiNote, instrument) pair (round-robin multi-voice).
+     * 3. voicePools for (midiNote, null) (round-robin instrument-agnostic).
+     * 4. assignment for the exact (midiNote, instrument) pair.
+     * 5. assignment for (midiNote, null) -- instrument-agnostic fallback.
+     * 6. NoteBlockRegistry.findBestFor(midiNote, instrument) -- live lookup.
      */
-    private fun resolvePos(request: NoteRequest): BlockPos? =
-        request.resolvedPos
-            ?: assignment[NotePitch(request.midiNote, request.instrument)]
-            ?: assignment[NotePitch(request.midiNote, null)]
+    private fun resolvePos(request: NoteRequest): BlockPos? {
+        if (request.resolvedPos != null) return request.resolvedPos
+
+        val exactPitch = NotePitch(request.midiNote, request.instrument)
+        val exactPool = voicePools[exactPitch]
+        if (!exactPool.isNullOrEmpty()) {
+            val idx = voiceIndices.getOrDefault(exactPitch, 0)
+            voiceIndices[exactPitch] = (idx + 1) % exactPool.size
+            return exactPool[idx]
+        }
+
+        val agnosticPitch = NotePitch(request.midiNote, null)
+        val agnosticPool = voicePools[agnosticPitch]
+        if (!agnosticPool.isNullOrEmpty()) {
+            val idx = voiceIndices.getOrDefault(agnosticPitch, 0)
+            voiceIndices[agnosticPitch] = (idx + 1) % agnosticPool.size
+            return agnosticPool[idx]
+        }
+
+        return assignment[exactPitch]
+            ?: assignment[agnosticPitch]
             ?: NoteBlockRegistry.findBestFor(request.midiNote, request.instrument)?.pos
+    }
 
     /**
      * Called every client tick. Dispatches queued notes subject to two constraints:
@@ -196,8 +247,11 @@ object ArpeggioScheduler {
             }
 
             queue.removeFirst()
+            val budgetBefore = interactBudget
             val ok = interactDelegate?.invoke(pos, request) ?: false
             interactBudget -= 1f
+            dispatchHistory.addLast(DispatchRecord(now, pos, request.midiNote, budgetBefore, interactBudget))
+            if (dispatchHistory.size > RECENT_DISPATCH_CAPACITY) dispatchHistory.removeFirst()
             DebugLog.info(logger) { "dispatch MIDI ${request.midiNote} -> $pos result=$ok age=${age}ms dispatched=${dispatched + 1}/${maxNotesPerTick} budget=${"%.2f".format(interactBudget)} queueRemaining=${queue.size}" }
             if (!ok) {
                 logger.warn("interactDelegate returned false for $pos (MIDI ${request.midiNote})")
@@ -226,11 +280,23 @@ object ArpeggioScheduler {
         queue.addLast(request)
     }
 
+    /**
+     * Snapshot of the last [RECENT_DISPATCH_CAPACITY] dispatched interacts, oldest first.
+     * Read by KickDiagnostics on disconnect to report exactly what was sent in the
+     * window leading up to a kick -- timestamps, target blocks, and the token bucket's
+     * value immediately before/after each send. A negative budgetAfter on the most
+     * recent entries is the clearest direct evidence that the configured ceiling
+     * exceeded what the server actually tolerated.
+     */
+    fun recentDispatches(): List<DispatchRecord> = synchronized(lock) { dispatchHistory.toList() }
+
     fun clear() = synchronized(lock) {
         logger.info("queue cleared (had ${queue.size} items)")
         queue.clear()
         interactBudget = 1f
         lastTickMs = -1L
+        dispatchHistory.clear()
+        voiceIndices.clear()
     }
 
     fun isEmpty(): Boolean = synchronized(lock) { queue.isEmpty() }

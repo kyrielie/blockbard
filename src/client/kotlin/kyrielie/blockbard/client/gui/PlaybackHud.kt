@@ -46,19 +46,21 @@ object PlaybackHud {
         // either MidiFilePlayer or NbsPlayer may be the one actively playing depending
         // on the loaded file type, and this HUD previously only ever checked
         // MidiFilePlayer, so NBS playback always fell through to the idle branch here.
-        val status = when {
+        val (status, progressFraction) = when {
             MidiFilePlayer.isActive() && !MidiFilePlayer.isPaused -> {
                 val currentTick = MidiFilePlayer.getCurrentTick()
                 val totalTicks = MidiFilePlayer.getTotalTicks()
-                "▶ PLAYING  tick $currentTick/$totalTicks"
+                val frac = if (totalTicks > 0) currentTick.toFloat() / totalTicks else 0f
+                Pair("▶ PLAYING  tick $currentTick/$totalTicks", frac)
             }
             NbsPlayer.isPlaying && !NbsPlayer.isPaused -> {
                 val currentTick = NbsPlayer.getCurrentTick()
                 val totalTicks = NbsPlayer.getTotalTicks()
-                "▶ PLAYING  tick $currentTick/$totalTicks"
+                val frac = if (totalTicks > 0) currentTick.toFloat() / totalTicks else 0f
+                Pair("▶ PLAYING  tick $currentTick/$totalTicks", frac)
             }
-            MidiFilePlayer.isPaused || NbsPlayer.isPaused -> "⏸ PAUSED"
-            else -> "♪ BlockBard  [B to open]"
+            MidiFilePlayer.isPaused || NbsPlayer.isPaused -> Pair("⏸ PAUSED", 0f)
+            else -> Pair("♪ BlockBard  [B to open]", 0f)
         }
 
         val tempo = "${"%.1f".format(MidiFilePlayer.tempoMultiplier)}x"
@@ -66,15 +68,21 @@ object PlaybackHud {
 
         val x = 4
         // guiHeight() in 26.x (was mc.window.guiScaledHeight)
-        var y = graphics.guiHeight() - 48
+        var y = graphics.guiHeight() - 52
+        val hudWidth = 180
 
-        // fill() signature unchanged — 0x88000000 already has a non-zero alpha byte
-        // (0x88), so this one call was unaffected by the bug fixed below.
-        graphics.fill(x - 2, y - 2, x + 180, y + 40, 0x88000000.toInt())
-        // drawString() → text() in GuiGraphicsExtractor. text() silently drops the draw
-        // entirely when the color's alpha byte is 0 — see opaque() in MainScreen.kt
-        // (same package, no import needed) for why a bare 0xRRGGBB literal does that.
+        graphics.fill(x - 2, y - 2, x + hudWidth, y + 46, 0x88000000.toInt())
         graphics.text(font, status, x, y, opaque(0xAAFFAA)); y += 10
+
+        // Progress bar
+        if (progressFraction > 0f) {
+            val barW = hudWidth - 4
+            val filledW = (barW * progressFraction.coerceIn(0f, 1f)).toInt()
+            graphics.fill(x, y + 1, x + barW, y + 4, 0x55333333.toInt())
+            graphics.fill(x, y + 1, x + filledW, y + 4, opaque(0x55FF55))
+            y += 6
+        }
+
         graphics.text(font, "Tempo: $tempo  |  $coverage", x, y, opaque(0xCCCCCC)); y += 10
         if (lastShiftMessage.isNotEmpty()) {
             graphics.text(font, lastShiftMessage, x, y, opaque(0xFFCC44))
