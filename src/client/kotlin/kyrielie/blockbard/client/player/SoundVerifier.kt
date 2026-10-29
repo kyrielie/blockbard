@@ -114,6 +114,7 @@ object SoundVerifier : SoundEventListener {
             }
 
             pending.removeFirst()
+            val expectedDesc = expectation.instrument?.name ?: "any"
             val expectedNoteIndex = expectation.instrument?.let { midiToNoteIndex(expectation.midiNote, it) }
             val instrumentMatches = expectation.instrument == null || expectation.instrument == actualInstrument
             val noteMatches = actualNoteIndex != null && expectedNoteIndex != null && actualNoteIndex == expectedNoteIndex
@@ -126,7 +127,6 @@ object SoundVerifier : SoundEventListener {
                 )
             } else {
                 misses++
-                val expectedDesc = expectation.instrument?.name ?: "any"
                 logger.warn(
                     "MISS MIDI $midiLabel -> expected $expectedDesc" +
                         (expectedNoteIndex?.let { " idx$it" } ?: "") +

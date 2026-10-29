@@ -1,7 +1,8 @@
-package kyrielie.blockbard.midi
+package kyrielie.blockbard.client.midi
 
 import kyrielie.blockbard.client.playback.LoadedMidi
 import kyrielie.blockbard.client.playback.TimedNoteEvent
+import kyrielie.blockbard.organ.NotePitch
 import net.minecraft.world.level.block.state.properties.NoteBlockInstrument
 import org.slf4j.LoggerFactory
 import javax.sound.midi.MetaMessage
@@ -79,8 +80,8 @@ object MidiChannelResolver {
      * Returns the distinct (instrument, midiNote) pairs that [file] requires.
      * This is the input to [OrganReadinessChecker.check].
      */
-    fun resolveRequirements(file: File): Set<MidiNoteRequirement> =
-        resolve(file).map { MidiNoteRequirement(it.instrument, it.midiNote) }.toSet()
+    fun resolveRequirements(file: File): Set<NotePitch> =
+        resolve(file).map { NotePitch(it.midiNote, it.instrument) }.toSet()
 
     /**
      * Returns per-channel program assignments as a human-readable summary for the GUI,

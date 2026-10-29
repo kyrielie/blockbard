@@ -42,39 +42,43 @@ src/
   client/kotlin/kyrielie/blockbard/client/
     BlockBardClient.kt          ← ClientModInitializer; wires all subsystems together
     config/
-      BlockBardConfig.kt        ← config data class + ConfigManager (plain Gson — see Config section)
+      BlockBardConfig.kt        ← config data class + ConfigManager (plain Gson with fallback coalescing)
     gui/
-      MainScreen.kt             ← primary GUI (file picker, organ overlay, controls, tuning, playback)
-      PlaybackHud.kt            ← HUD overlay via HudElementRegistry (not HudRenderCallback — see note below); checks both MidiFilePlayer and NbsPlayer state
+      MainScreen.kt             ← primary GUI (file picker, organ overlay, controls, tuning, playback, settings)
+      PlaybackHud.kt            ← HUD overlay via HudElementRegistry (checks both MidiFilePlayer and NbsPlayer state)
       BlockBardModMenuIntegration.kt
     input/
-      KeyboardInputHandler.kt   ← keys 1–9 → NoteRequest; KeyMapping registration is for the Controls menu only — actual dispatch is MainScreen.keyPressed() calling KeyboardInputHandler.tryDispatch() directly (KeyMapping.consumeClick() never fires while a Screen owns input focus)
-      MidiInputHandler.kt       ← javax.sound.midi device → NoteRequest (runs on a foreign thread — ArpeggioScheduler is synchronized against this, see Rotation/ArpeggioScheduler sections)
-    midi/                       ← package declared as kyrielie.blockbard.midi, NOT .client.midi (directory/package name mismatch, harmless but worth knowing when searching)
+      KeyboardInputHandler.kt   ← keys 1–9 → NoteRequest; direct dispatch from MainScreen.keyPressed()
+      MidiInputHandler.kt       ← javax.sound.midi device → NoteRequest (runs on a foreign thread — synchronized in ArpeggioScheduler)
+    midi/                       ← package declared as kyrielie.blockbard.midi (note directory vs package path)
       MidiChannelResolver.kt    ← resolves each MIDI NOTE_ON to a NoteBlockInstrument via per-channel GM program tracking
       MidiInstrumentMap.kt      ← GM program (0-127) + percussion → NoteBlockInstrument table
-      OrganReadinessChecker.kt  ← coverage check (MIDI requirements vs. NoteBlockRegistry) — wired into MainScreen.selectFile() on MIDI file selection, surfaced via readinessMessage in the GUI and a chat warning
+      OrganReadinessChecker.kt  ← coverage pre-flight check (MIDI requirements vs. NoteBlockRegistry)
     organ/
       OrganScanner.kt           ← world scan → NoteBlockRegistry.update()
     playback/
       MidiFilePlayer.kt         ← loads .mid via MidiChannelResolver, timed dispatch via ArpeggioScheduler
-      NbsFileLoader.kt          ← .nbs binary parser AND NbsPlayer (object NbsPlayer lives in this same file); NbsPlayer has getCurrentTick()/getTotalTicks() and reads MidiFilePlayer.tempoMultiplier live each tick, matching MidiFilePlayer's parity
+      NbsFileLoader.kt          ← .nbs binary parser AND NbsPlayer; tick getters and live tempoMultiplier parity
     player/
-      PlayerController.kt       ← eased rotation + interactWith; see "Rotation & Anti-Cheat Compatibility" below
+      PlayerController.kt       ← eased rotation + playNoteAt (left-click playback) / interactWith (right-click tuning)
+      SoundVerifier.kt          ← zero-mixin playback verification via Minecraft SoundEventListener; logs hits/misses/timeouts
+      KickDiagnostics.kt        ← disconnect postmortem via ClientPlayConnectionEvents.DISCONNECT; correlates disconnect screen reason with recent interact dispatches and token bucket state
 
   main/kotlin/kyrielie/blockbard/
     organ/
-      ArpeggioScheduler.kt      ← tick queue; dispatches one note per tick once rotation has converged; queue access is synchronized (see Rotation section)
+      ArpeggioScheduler.kt      ← token-bucket rate-limited tick queue (Paper 8/310ms limiter); per-note rotation convergence gating; dispatchHistory ring buffer for post-disconnect diagnostics; synchronized thread safety
       InstrumentShifter.kt      ← ShiftMode resolution (EXACT_ONLY/INSTRUMENT_SHIFT/OCTAVE_SHIFT/BEST_EFFORT)
       MidiToOrganMapper.kt      ← (midiNote, instrument) → BlockPos assignment; defines NotePitch
       MobHeadBlocks.kt          ← MOB_HEAD_BLOCKS constant set
       NoteBlockEntry.kt         ← data class (pos, instrument, noteIndex, midiNote, status)
       NoteBlockRegistry.kt      ← singleton Map<BlockPos, NoteBlockEntry>
-      NoteBlockTuner.kt         ← TuneTarget + stateful tuning state machine (TUNING/VERIFYING/DONE/FAILED), capped retries (maxRetries, default 3) before FAILED
+      NoteBlockTuner.kt         ← TuneTarget + stateful tuning state machine (TUNING/VERIFYING/DONE/FAILED), capped retries (maxRetries, default 3)
       OrganMap.kt               ← Map<BlockPos, ReachInfo> built by PlayerController.centerOnOrgan()
     util/
-      LittleEndianReader.kt     ← DataInputStream extensions for NBS parsing; every read throws a field-specific EOFException on truncation instead of letting -1 flow into bit-shift math
-      NoteUtils.kt              ← midiBase per instrument, noteIndex↔MIDI conversions, clicksNeeded
+      DebugLog.kt               ← hot-path conditional logger (routes to debug() when disabled, info() when enabled)
+      InstrumentMaterials.kt    ← blockBelowHint mapping for noteblock instruments (dirt, wood, wool, copper, etc.)
+      LittleEndianReader.kt     ← DataInputStream extensions for NBS parsing; throws field-specific EOFException on truncation
+      NoteUtils.kt              ← midiBase per instrument (including 26.x copper trumpet variants), noteIndex↔MIDI conversions, clicksNeeded
       VecMath.kt                ← vecToYawPitch (direction vector → yaw/pitch degrees)
 ```
 
@@ -101,6 +105,7 @@ NoteBlockRegistry        (singleton, Map<BlockPos, NoteBlockEntry>)
       ├── queried by MidiToOrganMapper.buildAssignment(noteUsageCounts, reachableBlocks)
       │         │  noteUsageCounts: Map<NotePitch, Int> — NotePitch(midiNote, instrument?)
       │         │  native-match preferred by fewest tuning clicks (not just distance),
+      │         │  prunes excess blocks beyond 25 per instrument,
       │         │  then InstrumentShifter for notes with no exact-instrument match
       │         ▼
       │   OrganAssignment { assignment: Map<NotePitch, BlockPos>, unplayable: List<NotePitch>, shifts: Map<NotePitch, Int> }
@@ -112,17 +117,22 @@ NoteBlockRegistry        (singleton, Map<BlockPos, NoteBlockEntry>)
       │   List<TuneTarget> { pos, snapshotNote, targetNote, instrument }
       │         │
       │         ▼
-      │   NoteBlockTuner (TUNING → VERIFYING → DONE/FAILED state machine; calls PlayerController.interactWith per click)
+      │   NoteBlockTuner (TUNING → VERIFYING → DONE/FAILED state machine; calls PlayerController.interactWith per right-click)
       │
       └── ArpeggioScheduler.assignment = result.assignment   ← wired by MainScreen.startTuning()
                 │  consulted at playback time by ArpeggioScheduler.resolvePos()
                 │  fallback chain: resolvedPos → assignment[exact NotePitch] → assignment[pitch-only NotePitch] → NoteBlockRegistry.findBestFor() live lookup
                 ▼
           ArpeggioScheduler.onTick()  (END_CLIENT_TICK)
-                │  only dispatches once PlayerController.rotationConverged(pos) is true
+                │  token bucket: 8 interacts / 310ms refilled, capped at maxNotesPerTick
+                │  gates dispatch on PlayerController.rotationConverged(pos)
+                │  records to dispatchHistory ring buffer for KickDiagnostics
                 ▼
-          PlayerController.interactWith(pos)
-                │  re-snaps to final rotation (already within ~2° by this point), then interacts
+          PlayerController.playNoteAt(pos, request)
+                │  registers expectation with SoundVerifier.expectNote()
+                │  re-snaps to final rotation, sends left-click attack (startDestroyBlock + stopDestroyBlock)
+                ▼
+          SoundVerifier (listens via Minecraft SoundEventListener, verifies audible output vs expectation)
 ```
 
 **MIDI file → timed events:**
@@ -336,24 +346,52 @@ dispatches by `ShiftMode`. Instrument shift checks `instrument.coversNatively(mi
 ### `ArpeggioScheduler` (main, singleton)
 Tick-driven queue (`kotlin.collections.ArrayDeque<NoteRequest>`, guarded by a private
 `lock` — every public method (`enqueue`, `onTick`, `peekNextPos`, `clear`, `isEmpty`,
-`queueSize`) is `synchronized(lock)`, since `enqueue()` is called from a
+`queueSize`, `recentDispatches`) is `synchronized(lock)`, since `enqueue()` is called from a
 `javax.sound.midi` device thread while `onTick()`/`peekNextPos()` run on the Minecraft
 client thread). Called every tick from `BlockBardClient`'s `ClientTickEvents.END_CLIENT_TICK`.
-Only dispatches the head of the queue once `rotationConvergedDelegate` confirms the player
-has finished turning toward it (see Rotation section above). `staleTimeoutMs` prunes
-backlog sitting behind an in-progress head note; `rotationInProgressTimeoutMs` caps a
-stuck head note. Delegates the actual interaction via `interactDelegate: ((BlockPos) -> Boolean)?`
-— wired to `PlayerController::interactWith` at init, **not** `Unit`-returning; the boolean
-result is logged and used to detect a failed dispatch.
+Key responsibilities:
+- **Token-bucket rate limiter:** refills continuously at Paper's standard limit (8 tokens per
+  310ms). Burst capped per tick by `maxNotesPerTick` (configurable 1–8, default 1).
+- **Per-note rotation convergence gating:** applies `rotationConvergedDelegate` to *every* note,
+  not just the first. If rotation is still in flight, dispatch halts for the tick and resumes
+  next tick so the server always receives a rotation packet between successive interacts.
+- **Backlog pruning:** drops backlogged requests sitting behind the head older than `staleTimeoutMs`
+  (default 200ms). The active head note is protected up to `rotationInProgressTimeoutMs` (default 1500ms).
+- **Dispatch history:** maintains a ring buffer of the last 200 `DispatchRecord` entries (timestamp,
+  target block, MIDI note, token budget before/after) accessible via `recentDispatches()`.
+- **Delegation:** invokes `interactDelegate: ((BlockPos, NoteRequest) -> Boolean)?` — wired to
+  `PlayerController::playNoteAt` at init.
 
 ### `PlayerController` (client)
-Handles:
-- `centerOnOrgan(blocks)` — finds best stand position, builds `OrganMap`
-- `primeRotation(pos)` — eases rotation toward target, called every tick a note is
-  pending (`START_CLIENT_TICK`, before the dispatch-gating tick)
-- `rotationConverged(pos)` — convergence query, consulted by `ArpeggioScheduler`
-- `interactWith(pos)` — looks up `ReachInfo` (or computes live), re-snaps to final
-  rotation, calls the actual block-interaction; returns `Boolean` success/failure
+Handles player positioning, rotation easing, and block interaction:
+- `centerOnOrgan()` — scans reachable blocks from current player eye position, builds `OrganMap`
+  (distance ≤ 4.5 blocks).
+- `primeRotation(pos)` — eases player view toward target block at up to `MAX_ROTATION_DEGREES_PER_TICK`
+  (default 35°/tick) in `START_CLIENT_TICK`.
+- `rotationConverged(pos)` — confirms player facing is within `ROTATION_CONVERGENCE_THRESHOLD_DEGREES`
+  (default 2°).
+- `interactWith(pos)` — **Right-click (tuning only):** aims at block, uses `gameMode.useItemOn()`,
+  advancing the noteblock's `NOTE` property by 1. Requires empty main hand and survival/adventure mode.
+- `playNoteAt(pos, request)` — **Left-click (playback):** aims at block, registers expectation with
+  `SoundVerifier.expectNote()`, then calls `gameMode.startDestroyBlock()` followed immediately by
+  `gameMode.stopDestroyBlock()`. This triggers NoteBlock attack sound without altering block pitch.
+
+### `SoundVerifier` (client, SoundEventListener)
+Provides ground-truth playback verification without mixins:
+- Registers directly with Minecraft's `SoundManager` via `addListener(SoundVerifier)`.
+- Listens to all game sound events; filters for `minecraft:block.note_block.*`.
+- Decodes sound pitch back to note index via $12 + 12 \cdot (\ln(\text{pitch}) / \ln(2))$.
+- Matches played sounds against FIFO deque of pending `Expectation` objects registered by `playNoteAt()`.
+- Flags and logs hits, misses (wrong pitch/instrument), and timeouts (no sound within 250ms).
+- Logs periodic rollup summaries every 50 notes.
+
+### `KickDiagnostics` (client)
+Captures automated postmortems upon server disconnection:
+- Registered on Fabric's `ClientPlayConnectionEvents.DISCONNECT`.
+- Extracts disconnect reason from the current Screen via reflection (`getReason`, `reason`, `getMessage`).
+- Correlates disconnect reason with `ArpeggioScheduler.recentDispatches()` (last 200 dispatches).
+- Dumps packet send volume over 310ms and 1000ms windows, along with token budget states.
+- Instantly diagnoses whether disconnect was caused by packet rate limits or server anti-cheat.
 
 ### `NoteBlockTuner` (main)
 Stateful (`TunerState`: `IDLE → TUNING → VERIFYING → DONE` or `FAILED`). Re-reads live
@@ -452,27 +490,18 @@ Current fields (`BlockBardConfig.kt`):
 `lastPlayedTrack: String?`, `shuffleHistory: MutableList<String>`, `defaultOctave: Int = 4`,
 `midiDeviceName: String?`, `keyMappings: List<Int> = [54..62]` (MIDI notes for keys 1-9),
 `maxRotationDegreesPerTick: Float = 35f`, `rotationConvergenceThresholdDegrees: Float = 2f`,
-`rotationInProgressTimeoutMs: Long = 1500L` (these last three wired to
-`PlayerController.MAX_ROTATION_DEGREES_PER_TICK`/`ROTATION_CONVERGENCE_THRESHOLD_DEGREES`
-and `ArpeggioScheduler.rotationInProgressTimeoutMs` respectively, at init in
-`BlockBardClient.onInitializeClient()`).
+`rotationInProgressTimeoutMs: Long = 1500L`, `debugLogging: Boolean = false`,
+`maxNotesPerTick: Int = 1` (range 1–8 burst cap), `loopMode: String = "NONE"` (NONE, LOOP_ONE, LOOP_ALL, SHUFFLE_ALL).
 
-**Caveat affecting every field above with a non-trivial default, not just the three
-newest ones:** this project uses plain `Gson` (`com.google.code.gson:gson:2.10.1`, no
-Kotlin-aware adapter) to deserialize `BlockBardConfig`. Plain Gson constructs Kotlin data
-classes via reflection/`Unsafe`, bypassing the primary constructor entirely — a field
-*missing* from an on-disk `config.json` (e.g. one saved by an older version of this mod,
-before a field existed) is set to the JVM bytecode default (`0`, `0L`, `0.0f`, `null`),
-**not** the Kotlin-declared default expression. Concretely: an existing user's
-pre-upgrade `config.json` loaded after this field set was added would deserialize
-`maxRotationDegreesPerTick = 0.0f` rather than `35f`, silently disabling rotation easing
-entirely (every `clampedStep()` call would clamp to `±0f`). This is a pre-existing,
-systemic risk for this entire data class (`scanRadius`, `arpeggioStaleTimeoutMs`, etc. are
-equally affected), not something specific to the rotation fields — fixing it properly
-would mean a custom `InstanceCreator`/`TypeAdapter`, switching to `kotlinx.serialization`,
-or auditing every field for a manual null/zero-coalescing fallback after deserialization.
-Out of scope for the rotation-tunables wiring change that introduced this note; flagged
-here so it isn't rediscovered the hard way.
+**Caveat affecting fields with non-trivial defaults:**
+This project uses plain `Gson` (`com.google.code.gson:gson:2.10.1`, no Kotlin-aware adapter)
+to deserialize `BlockBardConfig`. Plain Gson constructs Kotlin data classes via reflection/`Unsafe`,
+bypassing the primary constructor. To guard against zero-defaults from older `config.json` files,
+`ConfigManager.load()` explicitly coalesces `scanRadius`, `arpeggioStaleTimeoutMs`,
+`maxRotationDegreesPerTick`, `rotationConvergenceThresholdDegrees`, `rotationInProgressTimeoutMs`,
+`maxNotesPerTick`, and `shuffleHistory` back to safe defaults if loaded values are `<= 0` or null.
+A long-term architectural improvement would be migrating to `kotlinx.serialization` or providing a
+custom `InstanceCreator<BlockBardConfig>`.
 
 ---
 

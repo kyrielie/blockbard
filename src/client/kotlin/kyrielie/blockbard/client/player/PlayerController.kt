@@ -10,8 +10,10 @@ import kyrielie.blockbard.util.vecToYawPitch
 import net.minecraft.client.Minecraft
 import net.minecraft.core.BlockPos
 import net.minecraft.core.Direction
+import net.minecraft.core.particles.ParticleTypes
 import net.minecraft.util.Mth
 import net.minecraft.world.InteractionHand
+import net.minecraft.world.level.ClipContext
 import net.minecraft.world.level.GameType
 import net.minecraft.world.phys.BlockHitResult
 import net.minecraft.world.phys.HitResult
@@ -225,6 +227,23 @@ object PlayerController {
             return null
         }
 
+        // Raycast line-of-sight check: ensure no solid block obstructs the line to target
+        val world = mc.level
+        if (world != null) {
+            val clipCtx = ClipContext(
+                eyePos,
+                target,
+                ClipContext.Block.OUTLINE,
+                ClipContext.Fluid.NONE,
+                player
+            )
+            val clipHit = world.clip(clipCtx)
+            if (clipHit.type == HitResult.Type.BLOCK && clipHit.blockPos != pos) {
+                logger.warn("$caller $pos: raycast occluded by ${clipHit.blockPos} (${world.getBlockState(clipHit.blockPos).block.name.string})")
+                return null
+            }
+        }
+
         val (yaw, pitch) = primedRotation?.takeIf { it.first == pos }
             ?.let { Pair(it.second, it.third) }
             ?: (reach?.let { Pair(it.yaw, it.pitch) } ?: vecToYawPitch(delta))
@@ -325,6 +344,18 @@ object PlayerController {
         val hitResult = aimAt(pos, "playNoteAt") ?: return false
         val dispatched = mc.gameMode?.startDestroyBlock(pos, hitResult.direction) ?: false
         mc.gameMode?.stopDestroyBlock()
+        if (dispatched) {
+            val level = mc.level
+            if (level != null) {
+                val entry = NoteBlockRegistry.get(pos)
+                val note = entry?.noteIndex ?: 0
+                level.addParticle(
+                    ParticleTypes.NOTE,
+                    pos.x + 0.5, pos.y + 1.2, pos.z + 0.5,
+                    note / 24.0, 0.0, 0.0
+                )
+            }
+        }
         return dispatched
     }
 

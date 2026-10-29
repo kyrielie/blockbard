@@ -10,9 +10,8 @@ import kyrielie.blockbard.client.playback.NbsFileLoader
 import kyrielie.blockbard.client.playback.NbsPlayer
 import kyrielie.blockbard.client.playback.nbsInstrumentToBlock
 import kyrielie.blockbard.client.input.KeyboardInputHandler
-import kyrielie.blockbard.midi.MidiChannelResolver
-import kyrielie.blockbard.midi.MidiNoteRequirement
-import kyrielie.blockbard.midi.OrganReadinessChecker
+import kyrielie.blockbard.client.midi.MidiChannelResolver
+import kyrielie.blockbard.client.midi.OrganReadinessChecker
 import kyrielie.blockbard.organ.*
 import kyrielie.blockbard.client.organ.OrganScanner
 import kyrielie.blockbard.client.player.CenterResult
@@ -24,7 +23,9 @@ import kyrielie.blockbard.util.blockBelowHint
 import kyrielie.blockbard.util.midiNoteToName
 import net.fabricmc.loader.api.FabricLoader
 import net.minecraft.client.gui.GuiGraphicsExtractor
+import net.minecraft.client.gui.components.AbstractWidget
 import net.minecraft.client.gui.components.Button
+import net.minecraft.client.gui.components.EditBox
 import net.minecraft.client.gui.screens.Screen
 import net.minecraft.client.input.KeyEvent
 import net.minecraft.client.input.MouseButtonEvent
@@ -53,8 +54,8 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
 
     // Tab button references kept so updateTabVisibility() can toggle them
     private var tabButtons: List<Button> = emptyList()
-    // All per-tab content buttons, grouped by tab index
-    private val tabContent: MutableMap<Int, MutableList<Button>> = mutableMapOf(
+    // All per-tab content widgets, grouped by tab index
+    private val tabContent: MutableMap<Int, MutableList<AbstractWidget>> = mutableMapOf(
         0 to mutableListOf(),
         1 to mutableListOf(),
         2 to mutableListOf()
@@ -73,6 +74,9 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
     }
 
     private var midiFiles: List<File> = emptyList()
+    private var searchQuery: String = ""
+    private val displayedFiles: List<File>
+        get() = if (searchQuery.isBlank()) midiFiles else midiFiles.filter { it.name.contains(searchQuery, ignoreCase = true) }
     private var selectedFile: File? = null
     private var selectedIndex: Int = -1
     private var scrollOffset: Int = 0
@@ -136,14 +140,14 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
         tabButtons = listOf(tabBtnFiles, tabBtnOrgan, tabBtnSettings)
 
         // ── Tab 0: Files ──────────────────────────────────────────────────────
-        fun tab0(b: Button): Button { tabContent[0]!!.add(b); return b }
+        fun <T : AbstractWidget> tab0(w: T): T { tabContent[0]!!.add(w); return w }
 
         tab0(addRenderableWidget(Button.builder(Component.literal("↑")) {
             scrollOffset = (scrollOffset - 1).coerceAtLeast(0)
         }.pos(10, 157).size(20, 14).build()))
 
         tab0(addRenderableWidget(Button.builder(Component.literal("↓")) {
-            scrollOffset = (scrollOffset + 1).coerceAtMost((midiFiles.size - maxVisible).coerceAtLeast(0))
+            scrollOffset = (scrollOffset + 1).coerceAtMost((displayedFiles.size - maxVisible).coerceAtLeast(0))
         }.pos(34, 157).size(20, 14).build()))
 
         tab0(addRenderableWidget(Button.builder(Component.literal("Refresh")) {
@@ -152,8 +156,17 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
             chat("Refreshed -- ${midiFiles.size} files found")
         }.pos(58, 157).size(60, 14).build()))
 
+        val searchBox = EditBox(font, 10, 175, 180, 14, Component.literal("Search"))
+        searchBox.setHint(Component.literal("Search tracks..."))
+        searchBox.value = searchQuery
+        searchBox.setResponder { text ->
+            searchQuery = text
+            scrollOffset = 0
+        }
+        tab0(addRenderableWidget(searchBox))
+
         // ── Tab 1: Organ ──────────────────────────────────────────────────────
-        fun tab1(b: Button): Button { tabContent[1]!!.add(b); return b }
+        fun <T : AbstractWidget> tab1(w: T): T { tabContent[1]!!.add(w); return w }
 
         tab1(addRenderableWidget(Button.builder(Component.literal("Scan")) {
             logger.info("Scan clicked")
@@ -239,8 +252,8 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
             logger.info("loopMode -> $next")
         }.pos(130, filesPlaybackY2).size(100, 14).build()))
 
-        // ── Tab 1: Organ ──────────────────────────────────────────────────────
-        fun tab2(b: Button): Button { tabContent[2]!!.add(b); return b }
+        // ── Tab 2: Settings ───────────────────────────────────────────────────
+        fun <T : AbstractWidget> tab2(w: T): T { tabContent[2]!!.add(w); return w }
 
         val cfg = ConfigManager.config
         var settingsY = 36
@@ -450,6 +463,7 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
             val result = MidiToOrganMapper.buildAssignment(noteUsageCounts, reachable)
             assignment = result
             ArpeggioScheduler.assignment = result.assignment
+            ArpeggioScheduler.voicePools = result.voicePools
             if (result.unplayable.isNotEmpty()) {
                 val names = result.unplayable.map { it.displayName() }
                 chatWarn("${names.size} notes unplayable: ${names.take(6).joinToString()}")
@@ -484,6 +498,7 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
             }
             assignment = null
             ArpeggioScheduler.assignment = emptyMap()
+            ArpeggioScheduler.voicePools = emptyMap()
             coverageMessage = "Test scale: ${sorted.size} blocks"
         }
 
@@ -697,10 +712,10 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
                 // Custom instruments (index >= 16) have no NoteBlockInstrument equivalent
                 // and resolve to null; they are excluded from the requirements set since
                 // OrganReadinessChecker cannot check for them by instrument type.
-                val nbsRequirements: Set<MidiNoteRequirement> = nbs.notes
+                val nbsRequirements: Set<NotePitch> = nbs.notes
                     .mapNotNull { note ->
                         val inst = nbsInstrumentToBlock(note.instrument) ?: return@mapNotNull null
-                        MidiNoteRequirement(inst, note.key + 21)
+                        NotePitch(note.key + 21, inst)
                     }.toSet()
 
                 val report = OrganReadinessChecker.check(nbsRequirements)
@@ -837,23 +852,25 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
     private fun renderFilesTab(graphics: GuiGraphicsExtractor, font: net.minecraft.client.gui.Font) {
         graphics.text(font, "MIDI / NBS Files:", 10, 30, opaque(0xCCCCCC))
 
-        val visibleFiles = midiFiles.drop(scrollOffset).take(maxVisible)
+        val visibleFiles = displayedFiles.drop(scrollOffset).take(maxVisible)
         visibleFiles.forEachIndexed { i, file ->
             val y = 40 + i * 14
-            val realIdx = scrollOffset + i
-            val color = if (realIdx == selectedIndex) opaque(0x55FF55) else opaque(0xDDDDDD)
-            val prefix = if (realIdx == selectedIndex) "> " else "  "
+            val isSelected = file == selectedFile
+            val color = if (isSelected) opaque(0x55FF55) else opaque(0xDDDDDD)
+            val prefix = if (isSelected) "> " else "  "
             graphics.text(font, prefix + file.name.take(34), 34, y, color)
         }
-        if (midiFiles.isEmpty()) {
-            graphics.text(font, "(no files -- drop .mid/.nbs into config/blockbard/midis/)", 10, 40, opaque(0xAAAAAA))
+        if (displayedFiles.isEmpty()) {
+            val emptyMsg = if (midiFiles.isEmpty()) "(no files -- drop .mid/.nbs into config/blockbard/midis/)"
+                           else "(no matches for \"$searchQuery\")"
+            graphics.text(font, emptyMsg, 10, 40, opaque(0xAAAAAA))
         }
 
-        // Coverage / readiness -- multi-line word-wrap, no length truncation (Tier 6a)
+        // Coverage / readiness -- multi-line word-wrap below search box
         val statusLine = coverageMessage.takeIf { it.isNotEmpty() } ?: readinessMessage
         if (statusLine.isNotEmpty()) {
             val color = if (coverageMessage.isNotEmpty()) opaque(0xFFCC44) else opaque(0xFF8844)
-            renderWrapped(graphics, font, statusLine, 10, 176, width - 20, 9, color, maxLines = 6)
+            renderWrapped(graphics, font, statusLine, 10, 194, width - 20, 9, color, maxLines = 4)
         }
 
         // Playback status bar -- shown here since playback controls live on this tab
@@ -1047,7 +1064,7 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
         val mouseY = event.y()
         // File clicks only active on the Files tab
         if (event.button() == 0 && activeTab == 0) {
-            val visibleFiles = midiFiles.drop(scrollOffset).take(maxVisible)
+            val visibleFiles = displayedFiles.drop(scrollOffset).take(maxVisible)
             visibleFiles.forEachIndexed { i, file ->
                 val y = 40 + i * 14
                 if (mouseX >= 34 && mouseX <= width - 10 && mouseY >= y && mouseY < y + 14) {
@@ -1062,7 +1079,7 @@ class MainScreen(private val parent: Screen? = null) : Screen(Component.literal(
 
     override fun keyPressed(event: KeyEvent): Boolean {
         val keyCode = event.key()
-        if (keyCode in GLFW.GLFW_KEY_1..GLFW.GLFW_KEY_9) {
+        if (keyCode in GLFW.GLFW_KEY_1..GLFW.GLFW_KEY_9 && (focused == null || focused !is EditBox)) {
             if (KeyboardInputHandler.tryDispatch(keyCode)) return true
         }
         return super.keyPressed(event)
