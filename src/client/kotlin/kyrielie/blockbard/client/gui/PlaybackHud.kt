@@ -18,7 +18,7 @@ object PlaybackHud {
 
     private val logger = LoggerFactory.getLogger("BlockBard/PlaybackHud")
 
-    var isVisible: Boolean = true
+    var isVisible: Boolean = false
     var lastShiftMessage: String = ""
 
     // Identifier.of() was removed — use fromNamespaceAndPath(namespace, path)
@@ -35,10 +35,14 @@ object PlaybackHud {
     }
 
     private fun render(graphics: GuiGraphicsExtractor) {
-        if (!isVisible) return
+        if (!isVisible || !kyrielie.blockbard.client.config.ConfigManager.config.hudEnabled) return
         val mc = Minecraft.getInstance()
         // Screen access in 26.x: mc.gui.screen(), not mc.screen
         if (mc.gui.screen() != null) return
+
+        // Only render when actively playing or paused -- never render an intrusive box when idle
+        val isPlayingOrPaused = MidiFilePlayer.isActive() || NbsPlayer.isPlaying || MidiFilePlayer.isPaused || NbsPlayer.isPaused
+        if (!isPlayingOrPaused) return
         val font = mc.font
 
         val playable = NoteBlockRegistry.allPlayable().size

@@ -207,9 +207,28 @@ object MidiFilePlayer {
     }
 
     fun seekToTick(tick: Long) {
+        val total = getTotalTicks()
+        val clamped = tick.coerceIn(0L, total.coerceAtLeast(0L))
         val wasPlaying = isPlaying && !isPaused
+        val wasPaused = isPaused
         stop()
-        if (wasPlaying) play(tick)
+        currentTick = clamped
+        if (wasPlaying) {
+            play(clamped)
+        } else if (wasPaused) {
+            isPaused = true
+        }
+    }
+
+    fun getDurationSeconds(): Double {
+        val midi = loadedMidi ?: return 0.0
+        val total = getTotalTicks()
+        return midi.tempoMap.tickToMs(total) / 1000.0
+    }
+
+    fun getElapsedSeconds(): Double {
+        val midi = loadedMidi ?: return 0.0
+        return midi.tempoMap.tickToMs(currentTick) / 1000.0
     }
 
     fun isActive(): Boolean = isPlaying

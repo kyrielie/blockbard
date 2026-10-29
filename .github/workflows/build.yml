@@ -38,16 +38,16 @@ jobs:
       - name: Build mod
         run: ./gradlew clean build --no-daemon
 
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: blockbard-mod-jar
-          path: build/libs/blockbard-*.jar
-          if-no-files-found: error
-
       - name: Verify JAR is non-empty
         run: |
           JAR=$(ls build/libs/blockbard-*.jar | grep -v sources | grep -v dev | head -1)
           SIZE=$(stat -c%s "$JAR")
           echo "JAR size: $SIZE bytes"
           [ "$SIZE" -gt 10000 ] || (echo "JAR too small, build likely failed" && exit 1)
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: blockbard-mod-jar
+          path: build/libs/blockbard-*.jar
+          if-no-files-found: error

@@ -117,6 +117,7 @@ object SongAudioPreviewer {
 
     /** Plays a single note sound locally at the player's position. */
     fun playLocalNote(instrument: NoteBlockInstrument, noteIndex: Int) {
+        kyrielie.blockbard.client.gui.VisualizerState.trigger(noteIndex + 54, instrument)
         val mc = Minecraft.getInstance()
         val player = mc.player ?: return
         val level = mc.level ?: return

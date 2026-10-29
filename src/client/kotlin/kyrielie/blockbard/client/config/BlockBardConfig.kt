@@ -16,7 +16,7 @@ data class BlockBardConfig(
     var shiftMode: String = ShiftMode.BEST_EFFORT.name,
     var maxOctaveShift: Int = 1,
     var reportShiftsInHud: Boolean = true,
-    var hudEnabled: Boolean = true,
+    var hudEnabled: Boolean = false,
     var arpeggioStaleTimeoutMs: Long = 200L,
     var defaultTempoMultiplier: Float = 1.0f,
     var autoRescanIntervalSeconds: Int = 3,
@@ -39,11 +39,9 @@ data class BlockBardConfig(
     // important events (scan summaries, tuning start/done, file load, errors).
     var debugLogging: Boolean = false,
     // Tier 2: multi-note dispatch
-    // Maximum notes dispatched per game tick. 1 = default musical behavior with full
-    // rotation convergence gating. 2-8 = speed test; notes 2+ skip the convergence
-    // gate and fire immediately after note 1 (useful for measuring max throughput or
-    // diagnosing chord timing). Range 1-8.
-    var maxNotesPerTick: Int = 1,
+    // Maximum notes dispatched per game tick. Default is 8. Can be set higher (up to 64)
+    // for high-density chords and complex multi-track songs.
+    var maxNotesPerTick: Int = 8,
     // Tier 4: loop / auto-advance mode
     // NONE        = stop after each song (current behavior)
     // LOOP_ONE    = repeat the same song indefinitely (no retune needed)
@@ -52,8 +50,22 @@ data class BlockBardConfig(
     //               retuning between tracks
     var loopMode: String = LoopMode.NONE.name,
     // Instrument remapping: source instrument name -> target instrument name (or null/"MUTE" to silence)
-    var instrumentRemap: MutableMap<String, String?> = mutableMapOf()
+    var instrumentRemap: MutableMap<String, String?> = mutableMapOf(),
+    // Favorites & filter state
+    var favorites: MutableList<String> = mutableListOf(),
+    var activeFilter: String = "ALL" // ALL, FAVORITES, MIDI, NBS
 ) {
+    fun isFavorite(fileName: String): Boolean = favorites.contains(fileName)
+
+    fun toggleFavorite(fileName: String): Boolean {
+        return if (favorites.contains(fileName)) {
+            favorites.remove(fileName)
+            false
+        } else {
+            favorites.add(fileName)
+            true
+        }
+    }
     fun shiftModeEnum(): ShiftMode = try {
         ShiftMode.valueOf(shiftMode)
     } catch (_: IllegalArgumentException) {
@@ -95,8 +107,8 @@ object ConfigManager {
             if (config.maxRotationDegreesPerTick <= 0f) config.maxRotationDegreesPerTick = 35f
             if (config.rotationConvergenceThresholdDegrees <= 0f) config.rotationConvergenceThresholdDegrees = 2f
             if (config.rotationInProgressTimeoutMs <= 0L) config.rotationInProgressTimeoutMs = 1500L
-            if (config.maxNotesPerTick <= 0) config.maxNotesPerTick = 1
-            if (config.maxNotesPerTick > 8) config.maxNotesPerTick = 8
+            if (config.maxNotesPerTick <= 0) config.maxNotesPerTick = 8
+            if (config.maxNotesPerTick > 64) config.maxNotesPerTick = 64
             @Suppress("SENSELESS_COMPARISON")
             if ((config.shuffleHistory as MutableList<String>?) == null) config.shuffleHistory = mutableListOf()
             @Suppress("SENSELESS_COMPARISON")
