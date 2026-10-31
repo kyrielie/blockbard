@@ -53,7 +53,14 @@ data class BlockBardConfig(
     var instrumentRemap: MutableMap<String, String?> = mutableMapOf(),
     // Favorites & filter state
     var favorites: MutableList<String> = mutableListOf(),
-    var activeFilter: String = "ALL" // ALL, FAVORITES, MIDI, NBS
+    var activeFilter: String = "ALL", // ALL, FAVORITES, MIDI, NBS
+    // Dynamic on-the-fly retuning
+    var dynamicRetuning: Boolean = false,
+    var dynamicRetuningMaxClicks: Int = 2,
+    // Optional player movement when centering
+    var centerMovesPlayer: Boolean = false,
+    // Send feedback to chat (false = only in debug buffer & logs)
+    var enableChatFeedback: Boolean = false
 ) {
     fun isFavorite(fileName: String): Boolean = favorites.contains(fileName)
 

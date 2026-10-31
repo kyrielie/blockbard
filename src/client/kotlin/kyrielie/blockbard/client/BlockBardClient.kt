@@ -59,6 +59,11 @@ object BlockBardClient : ClientModInitializer {
             logger.debug("interactDelegate: -> $pos (MIDI ${request.midiNote})")
             PlayerController.playNoteAt(pos, request)
         }
+        ArpeggioScheduler.dynamicRetuningEnabled = cfg.dynamicRetuning
+        ArpeggioScheduler.dynamicRetuneDelegate = { pos, request ->
+            logger.debug("dynamicRetuneDelegate: -> $pos (MIDI ${request.midiNote})")
+            PlayerController.retuneAndPlayNoteAt(pos, request)
+        }
         ArpeggioScheduler.rotationConvergedDelegate = { pos ->
             PlayerController.rotationConverged(pos)
         }
@@ -111,6 +116,7 @@ object BlockBardClient : ClientModInitializer {
                 mc.player?.sendSystemMessage(net.minecraft.network.chat.Component.literal("§b[BlockBard] §fPlayback HUD $status"))
                 logger.info("H pressed -- HUD visible=${PlaybackHud.isVisible}")
             }
+            MainScreen.onClientTick(mc)
             ArpeggioScheduler.onTick()
         }
 

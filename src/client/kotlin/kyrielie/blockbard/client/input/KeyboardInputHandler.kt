@@ -3,6 +3,7 @@ package kyrielie.blockbard.client.input
 import kyrielie.blockbard.client.config.ConfigManager
 import kyrielie.blockbard.organ.ArpeggioScheduler
 import kyrielie.blockbard.organ.NoteRequest
+import kyrielie.blockbard.util.midiBase
 import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper
 import net.minecraft.client.KeyMapping
 import net.minecraft.client.Minecraft
@@ -52,23 +53,68 @@ object KeyboardInputHandler {
     }
 
     /**
-     * Attempts to dispatch [keyCode] as a note-key press. Returns true if [keyCode]
-     * matched one of the 9 note keys (1–9) and the note was enqueued — callers should
-     * treat a true return as "consumed" so the key doesn't also fall through to
-     * vanilla hotbar-slot switching.
+     * Map of GLFW key codes to noteIndex (0..24).
      */
-    fun tryDispatch(keyCode: Int): Boolean {
-        val i = keyCode - GLFW.GLFW_KEY_1
-        if (i < 0 || i > 8) return false
+    private val keyToNoteIndex: Map<Int, Int> = mapOf(
+        // Lower Octave White Keys
+        GLFW.GLFW_KEY_Z to 1,         // G
+        GLFW.GLFW_KEY_X to 3,         // A
+        GLFW.GLFW_KEY_C to 5,         // B
+        GLFW.GLFW_KEY_V to 6,         // C
+        GLFW.GLFW_KEY_B to 8,         // D
+        GLFW.GLFW_KEY_N to 10,        // E
+        GLFW.GLFW_KEY_M to 11,        // F
+        GLFW.GLFW_KEY_COMMA to 13,    // G
+        GLFW.GLFW_KEY_PERIOD to 15,   // A
+        GLFW.GLFW_KEY_SLASH to 17,    // B
 
+        // Lower Octave Black Keys
+        GLFW.GLFW_KEY_A to 0,         // F#3
+        GLFW.GLFW_KEY_S to 2,         // G#
+        GLFW.GLFW_KEY_D to 4,         // A#
+        GLFW.GLFW_KEY_G to 7,         // C#
+        GLFW.GLFW_KEY_H to 9,         // D#
+        GLFW.GLFW_KEY_K to 12,        // F#4
+        GLFW.GLFW_KEY_L to 14,        // G#
+        GLFW.GLFW_KEY_SEMICOLON to 16,// A#
+
+        // Upper Octave
+        GLFW.GLFW_KEY_Q to 18,        // C5
+        GLFW.GLFW_KEY_W to 20,        // D5
+        GLFW.GLFW_KEY_E to 22,        // E5
+        GLFW.GLFW_KEY_R to 23,        // F5
+        GLFW.GLFW_KEY_2 to 19,        // C#5
+        GLFW.GLFW_KEY_3 to 21,        // D#5
+        GLFW.GLFW_KEY_5 to 24         // F#5
+    )
+
+    /**
+     * Maps a GLFW key code to a noteblock noteIndex (0..24), or null if not mapped.
+     */
+    fun getNoteIndex(keyCode: Int): Int? {
+        return keyToNoteIndex[keyCode] ?: run {
+            val legacy = keyCode - GLFW.GLFW_KEY_1
+            if (legacy in 0..8) legacy else null
+        }
+    }
+
+    /**
+     * Attempts to dispatch [keyCode] as a note-key press. Returns true if [keyCode]
+     * matched a mapped note key and the note was enqueued.
+     */
+    fun tryDispatch(keyCode: Int, instrument: net.minecraft.world.level.block.state.properties.NoteBlockInstrument? = null): Boolean {
+        val noteIdx = getNoteIndex(keyCode) ?: return false
+
+        val inst = instrument ?: net.minecraft.world.level.block.state.properties.NoteBlockInstrument.HARP
+        val midiNote = inst.midiBase + noteIdx
+        logger.debug("KeyboardInputHandler: key {} -> noteIndex {}, MIDI {} ({})", keyCode, noteIdx, midiNote, inst.name)
         val mc = Minecraft.getInstance()
-        val mappings = ConfigManager.config.keyMappings
-        val midiNote = mappings.getOrElse(i) { 54 + i }
-        logger.info("KeyboardInputHandler: key ${i + 1} → MIDI $midiNote")
-        mc.player?.sendSystemMessage(
-            net.minecraft.network.chat.Component.literal("§b[BlockBard] §fKey ${i + 1} → MIDI $midiNote")
-        )
-        ArpeggioScheduler.enqueue(NoteRequest(midiNote))
+        if (ConfigManager.config.enableChatFeedback) {
+            mc.player?.sendSystemMessage(
+                net.minecraft.network.chat.Component.literal("§b[BlockBard] §fPlay §e${kyrielie.blockbard.util.midiNoteToName(midiNote)}§f (${inst.name})")
+            )
+        }
+        ArpeggioScheduler.enqueue(NoteRequest(midiNote, instrument = inst))
         return true
     }
 }

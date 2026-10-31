@@ -20,61 +20,57 @@ class SongListWidget(
     private val onToggleFavorite: ((File) -> Unit)? = null
 ) : ObjectSelectionList<SongListWidget.SongEntry>(minecraft, width, height, y, itemHeight) {
 
+    private var isRefreshingFiles = false
+
+    override fun isMouseOver(mouseX: Double, mouseY: Double): Boolean {
+        return visible && super.isMouseOver(mouseX, mouseY)
+    }
+
+    override fun mouseClicked(event: MouseButtonEvent, doubleClick: Boolean): Boolean {
+        if (!visible) return false
+        return super.mouseClicked(event, doubleClick)
+    }
+
+    override fun mouseScrolled(mouseX: Double, mouseY: Double, horizontalAmount: Double, verticalAmount: Double): Boolean {
+        if (!visible) return false
+        return super.mouseScrolled(mouseX, mouseY, horizontalAmount, verticalAmount)
+    }
+
     fun setFiles(files: List<File>, currentSelected: File?) {
-        clearEntries()
-        var selectedEntry: SongEntry? = null
-        for (file in files) {
-            val entry = SongEntry(file)
-            addEntry(entry)
-            if (file == currentSelected || file.name.equals(currentSelected?.name, ignoreCase = true)) {
-                selectedEntry = entry
+        isRefreshingFiles = true
+        try {
+            clearEntries()
+            var selectedEntry: SongEntry? = null
+            for (file in files) {
+                val entry = SongEntry(file)
+                addEntry(entry)
+                if (file == currentSelected || file.name.equals(currentSelected?.name, ignoreCase = true)) {
+                    selectedEntry = entry
+                }
             }
+            setSelected(selectedEntry)
+            if (selectedEntry != null) {
+                centerScrollOn(selectedEntry)
+            }
+        } finally {
+            isRefreshingFiles = false
         }
-        setSelected(selectedEntry)
+    }
+
+    override fun setSelected(entry: SongEntry?) {
+        super.setSelected(entry)
+        if (!isRefreshingFiles && entry != null) {
+            onSelect(entry.file)
+        }
     }
 
     fun getSelectedFile(): File? = selected?.file
 
     override fun getRowWidth(): Int = (width - 24).coerceAtLeast(100)
 
-    fun getEntryAt(mouseX: Double, mouseY: Double): SongEntry? {
-        if (mouseY < y || mouseY >= y + height) return null
-        if (mouseX < getRowLeft() - 10 || mouseX > getRowRight() + 10) return null
-        val relativeY = (mouseY - y + scrollAmount() - 2).toInt()
-        if (relativeY < 0) return null
-        val index = relativeY / defaultEntryHeight
-        val entries = children()
-        return if (index in entries.indices) entries[index] else null
-    }
-
-    override fun mouseClicked(event: MouseButtonEvent, doubleClick: Boolean): Boolean {
-        if (updateScrolling(event)) return true
-        if (event.button() == 0) {
-            val entry = getEntryAt(event.x(), event.y())
-            if (entry != null) {
-                val entryX = entry.getContentX()
-                if (event.x() >= entryX && event.x() <= entryX + 16) {
-                    onToggleFavorite?.invoke(entry.file)
-                    return true
-                }
-                setSelected(entry)
-                onSelect(entry.file)
-                if (doubleClick) {
-                    onDoubleClick?.invoke(entry.file)
-                }
-                return true
-            }
-        }
-        return super.mouseClicked(event, doubleClick)
-    }
-
     inner class SongEntry(val file: File) : ObjectSelectionList.Entry<SongEntry>() {
 
         override fun getNarration(): Component = Component.literal(file.name)
-
-        override fun isMouseOver(mx: Double, my: Double): Boolean {
-            return mx >= getRowLeft() - 10 && mx <= getRowRight() + 10 && my >= y && my < y + height
-        }
 
         override fun extractContent(
             graphics: GuiGraphicsExtractor,
@@ -98,7 +94,7 @@ class SongListWidget(
                 graphics.fill(x - 2, y - 1, x + w + 2, y + h + 1, opaque(0x333333))
             }
 
-            // Star icon (Item 3)
+            // Star icon
             val isFav = ConfigManager.config.isFavorite(file.name)
             val star = if (isFav) "★" else "☆"
             val starColor = if (isFav) opaque(0xFFFF55) else opaque(0x777777)
@@ -121,7 +117,7 @@ class SongListWidget(
             val sizeStr = "${kb}KB"
             graphics.text(font, sizeStr, x + w - font.width(sizeStr) - 4, y + 2, opaque(0x888888))
 
-            // Metadata subtext (Item 10)
+            // Metadata subtext
             val meta = SongMetadataCache.get(file)
             val subtext = meta?.summaryString ?: "Analyzing..."
             val subtextColor = if (meta != null) opaque(0xAAAAAA) else opaque(0x666666)
@@ -131,7 +127,7 @@ class SongListWidget(
         override fun mouseClicked(event: MouseButtonEvent, doubleClick: Boolean): Boolean {
             if (event.button() == 0) {
                 val entryX = getContentX()
-                if (event.x() >= entryX && event.x() <= entryX + 16) {
+                if (event.x() >= entryX && event.x() <= entryX + 22) {
                     onToggleFavorite?.invoke(file)
                     return true
                 }

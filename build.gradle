@@ -11,6 +11,7 @@ group = project.maven_group
 
 repositories {
 	maven { url = "https://maven.terraformersmc.com/releases/" }
+	maven { url = "https://maven.isxander.dev/releases" }
 	mavenCentral()
 }
 
@@ -36,6 +37,9 @@ dependencies {
 
 	// ModMenu — optional soft dependency; compile against its API but don't require it at runtime
 	implementation "com.terraformersmc:modmenu:${project.modmenu_version}"
+
+	// YetAnotherConfigLib (YACL)
+	implementation "dev.isxander:yet-another-config-lib:${project.yacl_version}"
 
 	// Gson — for config serialization (bundled in Minecraft, but declared explicitly)
 	implementation "com.google.code.gson:gson:2.10.1"

@@ -1,6 +1,7 @@
 package kyrielie.blockbard.organ
 
 import kyrielie.blockbard.util.DebugLog
+import kyrielie.blockbard.util.midiBase
 import net.minecraft.core.BlockPos
 import net.minecraft.world.level.block.state.properties.NoteBlockInstrument
 import org.slf4j.LoggerFactory
@@ -23,7 +24,8 @@ data class NoteRequest(
      * Pre-resolved block position. When set, bypasses the assignment map entirely.
      * Used by the scale test and any direct-play path that already knows which block to hit.
      */
-    val resolvedPos: BlockPos? = null
+    val resolvedPos: BlockPos? = null,
+    val isRetuneStep: Boolean = false
 )
 
 /**
@@ -100,6 +102,13 @@ object ArpeggioScheduler {
      * PlayerController can hand the full (midiNote, instrument) pair to SoundVerifier.
      */
     var interactDelegate: ((BlockPos, NoteRequest) -> Boolean)? = null
+
+    /**
+     * Wired to PlayerController.retuneAndPlayNoteAt(pos, request) for dynamic retuning.
+     */
+    var dynamicRetuneDelegate: ((BlockPos, NoteRequest) -> Boolean)? = null
+    var dynamicRetuningEnabled: Boolean = false
+
     var onNoteDispatched: ((midiNote: Int, instrument: NoteBlockInstrument?) -> Unit)? = null
 
     /**
@@ -138,6 +147,8 @@ object ArpeggioScheduler {
     private const val RECENT_DISPATCH_CAPACITY = 200
     private val dispatchHistory: ArrayDeque<DispatchRecord> = ArrayDeque()
 
+    data class TargetResolution(val pos: BlockPos, val isRetuneStep: Boolean = false)
+
     /**
      * Resolves a request to a target BlockPos, trying in order:
      * 1. resolvedPos, if the caller already knows the exact block.
@@ -146,16 +157,17 @@ object ArpeggioScheduler {
      * 4. assignment for the exact (midiNote, instrument) pair.
      * 5. assignment for (midiNote, null) -- instrument-agnostic fallback.
      * 6. NoteBlockRegistry.findBestFor(midiNote, instrument) -- live lookup.
+     * 7. Dynamic retuning: candidate noteblock at noteIndex - 1 (JIT right-click step).
      */
-    private fun resolvePos(request: NoteRequest): BlockPos? {
-        if (request.resolvedPos != null) return request.resolvedPos
+    private fun resolveTarget(request: NoteRequest): TargetResolution? {
+        if (request.resolvedPos != null) return TargetResolution(request.resolvedPos, request.isRetuneStep)
 
         val exactPitch = NotePitch(request.midiNote, request.instrument)
         val exactPool = voicePools[exactPitch]
         if (!exactPool.isNullOrEmpty()) {
             val idx = voiceIndices.getOrDefault(exactPitch, 0)
             voiceIndices[exactPitch] = (idx + 1) % exactPool.size
-            return exactPool[idx]
+            return TargetResolution(exactPool[idx])
         }
 
         val agnosticPitch = NotePitch(request.midiNote, null)
@@ -163,13 +175,33 @@ object ArpeggioScheduler {
         if (!agnosticPool.isNullOrEmpty()) {
             val idx = voiceIndices.getOrDefault(agnosticPitch, 0)
             voiceIndices[agnosticPitch] = (idx + 1) % agnosticPool.size
-            return agnosticPool[idx]
+            return TargetResolution(agnosticPool[idx])
         }
 
-        return assignment[exactPitch]
-            ?: assignment[agnosticPitch]
-            ?: NoteBlockRegistry.findBestFor(request.midiNote, request.instrument)?.pos
+        val assigned = assignment[exactPitch] ?: assignment[agnosticPitch]
+        if (assigned != null) return TargetResolution(assigned)
+
+        val liveMatch = NoteBlockRegistry.findBestFor(request.midiNote, request.instrument)?.pos
+        if (liveMatch != null) return TargetResolution(liveMatch)
+
+        // Dynamic On-the-fly retuning:
+        if (dynamicRetuningEnabled && request.instrument != null) {
+            val targetNoteIndex = request.midiNote - request.instrument.midiBase
+            if (targetNoteIndex in 0..24) {
+                val candidateNoteIndex = (targetNoteIndex - 1 + 25) % 25
+                val candidate = NoteBlockRegistry.allPlayable()
+                    .filter { it.instrument == request.instrument && it.noteIndex == candidateNoteIndex }
+                    .minByOrNull { it.distanceFromPlayer }
+                if (candidate != null) {
+                    return TargetResolution(candidate.pos, isRetuneStep = true)
+                }
+            }
+        }
+
+        return null
     }
+
+    private fun resolvePos(request: NoteRequest): BlockPos? = resolveTarget(request)?.pos
 
     /**
      * Called every client tick. Dispatches queued notes subject to two constraints:
@@ -221,8 +253,8 @@ object ArpeggioScheduler {
             val request = queue.first()
             val age = now - request.enqueuedAtMs
 
-            val pos = resolvePos(request)
-            if (pos == null) {
+            val target = resolveTarget(request)
+            if (target == null) {
                 queue.removeFirst()
                 logger.warn("no block found for MIDI ${request.midiNote} -- skipping (assignment has ${assignment.size} entries, resolvedPos=${request.resolvedPos})")
                 // Count as a dispatch slot consumed so we don't spin through the entire
@@ -230,6 +262,7 @@ object ArpeggioScheduler {
                 dispatched++
                 continue
             }
+            val pos = target.pos
 
             // Rotation convergence gate applies to every note. If the player is not yet
             // facing this block, stop dispatching for this tick and wait. The next tick
@@ -249,7 +282,11 @@ object ArpeggioScheduler {
 
             queue.removeFirst()
             val budgetBefore = interactBudget
-            val ok = interactDelegate?.invoke(pos, request) ?: false
+            val ok = if (target.isRetuneStep) {
+                dynamicRetuneDelegate?.invoke(pos, request) ?: interactDelegate?.invoke(pos, request) ?: false
+            } else {
+                interactDelegate?.invoke(pos, request) ?: false
+            }
             onNoteDispatched?.invoke(request.midiNote, request.instrument)
             interactBudget -= 1f
             dispatchHistory.addLast(DispatchRecord(now, pos, request.midiNote, budgetBefore, interactBudget))

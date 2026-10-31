@@ -1,9 +1,11 @@
 package kyrielie.blockbard.client.organ
 
+import kyrielie.blockbard.client.config.ConfigManager
 import kyrielie.blockbard.organ.MOB_HEAD_BLOCKS
 import kyrielie.blockbard.organ.NoteBlockEntry
 import kyrielie.blockbard.organ.NoteBlockRegistry
 import kyrielie.blockbard.organ.NoteBlockStatus
+import kyrielie.blockbard.util.BlockBardLogBuffer
 import kyrielie.blockbard.util.midiBase
 import kyrielie.blockbard.util.noteIndexToMidi
 import kyrielie.blockbard.util.midiNoteToName
@@ -103,7 +105,10 @@ object OrganScanner {
                 val msg = "${o.instrument.name} has ${o.count} blocks (max 25 unique pitches). " +
                     "${o.excess} excess will be ignored automatically -- no action needed."
                 logger.warn("scan: instrument overflow -- $msg")
-                player.sendSystemMessage(Component.literal("§b[BlockBard] §e$msg"))
+                BlockBardLogBuffer.warn("OrganScanner", msg)
+                if (ConfigManager.config.enableChatFeedback) {
+                    player.sendSystemMessage(Component.literal("§b[BlockBard] §e$msg"))
+                }
             }
         }
 
@@ -113,15 +118,22 @@ object OrganScanner {
 
         val summary = "Scan complete: ${found.size} total -- $playable playable, $silenced silenced, $mobHeads mob-head"
         logger.info("scan: $summary")
-        player.sendSystemMessage(Component.literal("§b[BlockBard] §f$summary"))
+        BlockBardLogBuffer.info("OrganScanner", summary)
+        if (ConfigManager.config.enableChatFeedback) {
+            player.sendSystemMessage(Component.literal("§b[BlockBard] §f$summary"))
+        }
 
         if (playable > 0) {
             val playableEntries = found.filter { it.status == NoteBlockStatus.PLAYABLE }
             val noteRange = playableEntries.sortedBy { it.midiNote }
             val low = midiNoteToName(noteRange.first().midiNote)
             val high = midiNoteToName(noteRange.last().midiNote)
+            val rangeMsg = "Playable range: $low - $high"
             logger.info("scan: playable MIDI range $low-$high")
-            player.sendSystemMessage(Component.literal("§b[BlockBard] §7Playable range: $low - $high"))
+            BlockBardLogBuffer.info("OrganScanner", rangeMsg)
+            if (ConfigManager.config.enableChatFeedback) {
+                player.sendSystemMessage(Component.literal("§b[BlockBard] §7$rangeMsg"))
+            }
 
             logger.info("scan: per-instrument note coverage --")
             playableEntries

@@ -19,8 +19,11 @@ import kyrielie.blockbard.client.player.CenterResult
 import kyrielie.blockbard.client.player.PlayerController
 import kyrielie.blockbard.client.player.SoundVerifier
 import kyrielie.blockbard.organ.ArpeggioScheduler
+import kyrielie.blockbard.util.BlockBardLogBuffer
 import kyrielie.blockbard.util.DebugLog
+import kyrielie.blockbard.util.LogLevel
 import kyrielie.blockbard.util.blockBelowHint
+import kyrielie.blockbard.util.clicksNeeded
 import kyrielie.blockbard.util.midiNoteToName
 import net.fabricmc.loader.api.FabricLoader
 import net.minecraft.client.gui.GuiGraphicsExtractor
@@ -33,6 +36,8 @@ import net.minecraft.client.input.KeyEvent
 import net.minecraft.client.input.MouseButtonEvent
 import net.minecraft.network.chat.Component
 import net.minecraft.world.level.GameType
+import net.minecraft.world.level.block.state.properties.NoteBlockInstrument
+import kyrielie.blockbard.client.config.BlockBardYaclConfig
 import org.lwjgl.glfw.GLFW
 import org.slf4j.LoggerFactory
 import java.io.File
@@ -53,8 +58,8 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
     private val logger = LoggerFactory.getLogger("BlockBard/MainScreen")
 
     // ── Tab state ──────────────────────────────────────────────────────────────
-    // 0 = Files, 1 = Organ, 2 = Settings
-    private var activeTab: Int = initialTab
+    // 0 = Files, 1 = Queue, 2 = Organ, 3 = Logs
+    private var activeTab: Int = initialTab.coerceIn(0, 3)
 
     // Tab button references kept so updateTabVisibility() can toggle them
     private var tabButtons: List<Button> = emptyList()
@@ -62,10 +67,40 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
     private val tabContent: MutableMap<Int, MutableList<AbstractWidget>> = mutableMapOf(
         0 to mutableListOf(),
         1 to mutableListOf(),
-        2 to mutableListOf()
+        2 to mutableListOf(),
+        3 to mutableListOf()
     )
+    private val jukeboxWidgets: MutableList<AbstractWidget> = mutableListOf()
+    private lateinit var playPauseBtn: Button
+    private lateinit var loopBtn: Button
+
+    private val playableInstruments = listOf(
+        NoteBlockInstrument.HARP,
+        NoteBlockInstrument.BASEDRUM,
+        NoteBlockInstrument.SNARE,
+        NoteBlockInstrument.HAT,
+        NoteBlockInstrument.BASS,
+        NoteBlockInstrument.FLUTE,
+        NoteBlockInstrument.BELL,
+        NoteBlockInstrument.GUITAR,
+        NoteBlockInstrument.CHIME,
+        NoteBlockInstrument.XYLOPHONE,
+        NoteBlockInstrument.IRON_XYLOPHONE,
+        NoteBlockInstrument.COW_BELL,
+        NoteBlockInstrument.DIDGERIDOO,
+        NoteBlockInstrument.BIT,
+        NoteBlockInstrument.BANJO,
+        NoteBlockInstrument.PLING
+    )
+    private var selectedInstrumentIndex: Int = 0
+    val selectedInstrument: NoteBlockInstrument get() = playableInstruments[selectedInstrumentIndex]
+    private var virtualKeyboard: VirtualKeyboardWidget? = null
+    private var instBtn: Button? = null
 
     private lateinit var songListWidget: SongListWidget
+    private lateinit var queueListWidget: QueueListWidget
+    private lateinit var logListWidget: LogListWidget
+    private val shuffleQueue = mutableListOf<File>()
 
     // ── File list ──────────────────────────────────────────────────────────────
     private val midisDir: File by lazy {
@@ -135,27 +170,44 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
         logger.info("MainScreen: init()")
         tabContent.values.forEach { it.clear() }
         refreshFiles()
-        OrganScanner.scan()
+        if (!PlayerController.isOrganMapValid()) {
+            PlayerController.reconfirmOrgan()
+        } else {
+            OrganScanner.scan()
+        }
         updateOrganInfo()
 
         // ── Tab buttons (always visible) ──────────────────────────────────────
-        val tabW = 60
+        val tabW = 50
         val tabBtnFiles = addRenderableWidget(Button.builder(Component.literal("Files")) {
             switchTab(0)
         }.pos(10, 6).size(tabW, 16).build())
-        val tabBtnOrgan = addRenderableWidget(Button.builder(Component.literal("Organ")) {
+        val tabBtnQueue = addRenderableWidget(Button.builder(Component.literal("Queue")) {
             switchTab(1)
-        }.pos(74, 6).size(tabW, 16).build())
-        val tabBtnSettings = addRenderableWidget(Button.builder(Component.literal("Settings")) {
+        }.pos(64, 6).size(tabW, 16).build())
+        val tabBtnOrgan = addRenderableWidget(Button.builder(Component.literal("Organ")) {
             switchTab(2)
-        }.pos(138, 6).size(tabW, 16).build())
-        tabButtons = listOf(tabBtnFiles, tabBtnOrgan, tabBtnSettings)
+        }.pos(118, 6).size(tabW, 16).build())
+        val tabBtnLogs = addRenderableWidget(Button.builder(Component.literal("Logs")) {
+            switchTab(3)
+        }.pos(172, 6).size(tabW, 16).build())
+        tabButtons = listOf(tabBtnFiles, tabBtnQueue, tabBtnOrgan, tabBtnLogs)
+
+        // Settings button opens YACL screen
+        addRenderableWidget(Button.builder(Component.literal("⚙ Settings")) {
+            logger.info("Opening YACL settings screen")
+            minecraft.gui.setScreen(BlockBardYaclConfig.createScreen(this))
+        }.pos(width - 148, 6).size(78, 16).build())
 
         // Close button -- always visible top right
         addRenderableWidget(Button.builder(Component.literal("Close")) {
             logger.info("Close clicked")
             onClose()
         }.pos(width - 64, 6).size(54, 16).build())
+
+        val listTop = 46
+        val listBottom = height - 112
+        val listHeight = (listBottom - listTop).coerceAtLeast(30)
 
         // ── Tab 0: Files ──────────────────────────────────────────────────────
         fun <T : AbstractWidget> tab0(w: T): T { tabContent[0]!!.add(w); return w }
@@ -194,9 +246,6 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
         filterButtons["MID"] = midBtn
         filterButtons["NBS"] = nbsBtn
 
-        val listTop = 46
-        val listBottom = height - 96
-        val listHeight = (listBottom - listTop).coerceAtLeast(30)
         songListWidget = SongListWidget(
             minecraft = minecraft,
             width = width,
@@ -208,7 +257,7 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
             },
             onDoubleClick = { file ->
                 selectFile(file)
-                startPlayback()
+                playSelectedSong()
             },
             onToggleFavorite = { file ->
                 ConfigManager.config.toggleFavorite(file.name)
@@ -219,46 +268,159 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
         tab0(addRenderableWidget(songListWidget))
         songListWidget.setFiles(displayedFiles, selectedFile)
 
-        // Playback row 1 (height - 44)
-        val row1Y = height - 44
-        tab0(addRenderableWidget(Button.builder(Component.literal("Play")) {
-            logger.info("Play clicked")
-            when {
-                MidiFilePlayer.isPaused -> { MidiFilePlayer.resume(); chat("Resumed") }
-                NbsPlayer.isPaused      -> { NbsPlayer.resume();      chat("Resumed") }
-                else                    -> startPlayback()
-            }
-        }.pos(10, row1Y).size(40, 16).build()))
+        // ── Tab 1: Queue ──────────────────────────────────────────────────────
+        fun <T : AbstractWidget> tab1(w: T): T { tabContent[1]!!.add(w); return w }
+        val qBtnY = 26
+        tab1(addRenderableWidget(Button.builder(Component.literal("← Library")) {
+            switchTab(0)
+        }.pos(10, qBtnY).size(62, 16).build()))
 
-        tab0(addRenderableWidget(Button.builder(Component.literal("Tune & Play")) {
-            logger.info("Tune & Play clicked")
-            val file = selectedFile ?: run { chatWarn("Select a song first"); return@builder }
-            val map = PlayerController.organMap ?: run {
-                chatWarn("Run Center on Organ first!")
-                return@builder
-            }
-            val reachable = NoteBlockRegistry.allPlayable().filter { map.isReachable(it.pos) }
-            if (reachable.isEmpty()) {
-                chatWarn("No reachable noteblocks -- run Center first")
-                return@builder
-            }
-            chat("Preparing organ & playing ${file.name}...")
-            startTuning(thenPlay = true)
-        }.pos(52, row1Y).size(74, 16).build()))
+        tab1(addRenderableWidget(Button.builder(Component.literal("🔀 Reshuffle")) {
+            reshuffleQueue()
+            chat("Queue reshuffled")
+        }.pos(76, qBtnY).size(74, 16).build()))
 
-        tab0(addRenderableWidget(Button.builder(Component.literal("Pause")) {
-            logger.info("Pause clicked")
-            when {
-                MidiFilePlayer.isPaused   -> { MidiFilePlayer.resume(); chat("Resumed") }
-                NbsPlayer.isPaused        -> { NbsPlayer.resume();      chat("Resumed") }
-                MidiFilePlayer.isActive() -> { MidiFilePlayer.pause();  chat("Paused") }
-                NbsPlayer.isPlaying       -> { NbsPlayer.pause();       chat("Paused") }
-                else                      -> chat("Nothing playing")
-            }
-        }.pos(128, row1Y).size(42, 16).build()))
+        tab1(addRenderableWidget(Button.builder(Component.literal("Clear History")) {
+            ConfigManager.config.shuffleHistory.clear()
+            ConfigManager.save()
+            updateQueueDisplay()
+            chat("Shuffle history cleared")
+        }.pos(154, qBtnY).size(78, 16).build()))
 
-        tab0(addRenderableWidget(Button.builder(Component.literal("Stop")) {
-            logger.info("Stop clicked")
+        queueListWidget = QueueListWidget(
+            minecraft = minecraft,
+            width = width,
+            height = listHeight,
+            y = listTop,
+            itemHeight = 26,
+            onSelect = { file -> selectFile(file) },
+            onDoubleClick = { file ->
+                selectFile(file)
+                playSelectedSong()
+            },
+            onRemove = { idx -> removeFromQueue(idx) }
+        )
+        tab1(addRenderableWidget(queueListWidget))
+
+        // ── Tab 2: Organ Console ─────────────────────────────────────────────
+        fun <T : AbstractWidget> tab2(w: T): T { tabContent[2]!!.add(w); return w }
+        val organBtnY = 26
+
+        // Instrument Switcher
+        tab2(addRenderableWidget(Button.builder(Component.literal("<")) {
+            selectedInstrumentIndex = (selectedInstrumentIndex - 1 + playableInstruments.size) % playableInstruments.size
+            virtualKeyboard?.instrument = selectedInstrument
+            instBtn?.message = Component.literal(selectedInstrument.name)
+        }.pos(10, organBtnY).size(20, 16).build()))
+
+        val buttonInst = tab2(addRenderableWidget(Button.builder(Component.literal(selectedInstrument.name)) {
+            selectedInstrumentIndex = (selectedInstrumentIndex + 1) % playableInstruments.size
+            virtualKeyboard?.instrument = selectedInstrument
+            instBtn?.message = Component.literal(selectedInstrument.name)
+        }.pos(32, organBtnY).size(92, 16).build()))
+        instBtn = buttonInst
+
+        tab2(addRenderableWidget(Button.builder(Component.literal(">")) {
+            selectedInstrumentIndex = (selectedInstrumentIndex + 1) % playableInstruments.size
+            virtualKeyboard?.instrument = selectedInstrument
+            instBtn?.message = Component.literal(selectedInstrument.name)
+        }.pos(126, organBtnY).size(20, 16).build()))
+
+        // Organ Utility Buttons
+        tab2(addRenderableWidget(Button.builder(Component.literal("Scan")) {
+            logger.info("Scan clicked")
+            OrganScanner.scan()
+            updateOrganInfo()
+        }.pos(152, organBtnY).size(40, 16).build()))
+
+        tab2(addRenderableWidget(Button.builder(Component.literal("Center")) {
+            logger.info("Center clicked")
+            val result = PlayerController.centerOnOrgan()
+            organScanMessage = when (result) {
+                is CenterResult.Centered -> "${result.reachableCount}/${result.totalFound} reachable."
+                CenterResult.NoBlocks   -> "No playable noteblocks found."
+                CenterResult.NoPlayer   -> "No player found."
+            }
+            chat(organScanMessage)
+        }.pos(194, organBtnY).size(48, 16).build()))
+
+        tab2(addRenderableWidget(Button.builder(Component.literal("Tune")) {
+            logger.info("Tune clicked (chromatic mode)")
+            startTuning(forceChromatic = true)
+        }.pos(244, organBtnY).size(42, 16).build()))
+
+        tab2(addRenderableWidget(Button.builder(Component.literal("Scale")) {
+            logger.info("Play Scale clicked")
+            playScale()
+        }.pos(288, organBtnY).size(42, 16).build()))
+
+        tab2(addRenderableWidget(Button.builder(Component.literal(if (MaterialsShoppingOverlay.isVisible) "Hide Mats" else "Mats")) { btn ->
+            MaterialsShoppingOverlay.isVisible = !MaterialsShoppingOverlay.isVisible
+            btn.message = Component.literal(if (MaterialsShoppingOverlay.isVisible) "Hide Mats" else "Mats")
+            chat("Materials overlay ${if (MaterialsShoppingOverlay.isVisible) "shown" else "hidden"}")
+        }.pos(332, organBtnY).size(46, 16).build()))
+
+        // Virtual Piano Keyboard Widget
+        val kbW = (width - 20).coerceAtMost(480)
+        val kbH = (height - 130).coerceIn(60, 95)
+        val kbX = (width - kbW) / 2
+        val kbY = 66
+        val vk = VirtualKeyboardWidget(kbX, kbY, kbW, kbH, selectedInstrument) { noteIdx, midi, inst ->
+            chat("Played ${midiNoteToName(midi)} (${inst.name})")
+        }
+        virtualKeyboard = vk
+        tab2(addRenderableWidget(vk))
+
+        // ── Tab 3: Logs ───────────────────────────────────────────────────────
+        fun <T : AbstractWidget> tab3(w: T): T { tabContent[3]!!.add(w); return w }
+
+        val logBtnY = 26
+        tab3(addRenderableWidget(Button.builder(Component.literal("Copy All")) {
+            val text = BlockBardLogBuffer.getAllText()
+            minecraft.keyboardHandler.clipboard = text
+            chat("Copied ${BlockBardLogBuffer.size} log entries to clipboard")
+        }.pos(10, logBtnY).size(65, 16).build()))
+
+        var errorFilterOnly = false
+        tab3(addRenderableWidget(Button.builder(Component.literal("Show: All")) { btn ->
+            errorFilterOnly = !errorFilterOnly
+            btn.message = Component.literal(if (errorFilterOnly) "Show: Errors" else "Show: All")
+            logListWidget.refreshLogs(if (errorFilterOnly) LogLevel.WARN else null)
+        }.pos(79, logBtnY).size(84, 16).build()))
+
+        tab3(addRenderableWidget(Button.builder(Component.literal("Clear")) {
+            BlockBardLogBuffer.clear()
+            logListWidget.refreshLogs()
+            chat("Logs cleared")
+        }.pos(167, logBtnY).size(48, 16).build()))
+
+        val logListH = height - 52
+        val logWidget = LogListWidget(minecraft, width - 20, logListH, 46, 14) { entry ->
+            minecraft.keyboardHandler.clipboard = entry.formatted()
+            chat("Copied entry to clipboard: ${entry.message.take(35)}...")
+        }
+        logListWidget = logWidget
+        tab3(addRenderableWidget(logWidget))
+
+        // ── Jukebox Controls (Shared across Tab 0 & Tab 1) ────────────────────
+        jukeboxWidgets.clear()
+        fun <T : AbstractWidget> jb(w: T): T { jukeboxWidgets.add(w); return w }
+
+        val jbX = 6
+        val jbY = height - 108
+        val row1Y = jbY + 68
+        val row2Y = jbY + 86
+
+        // Row 1: Primary transport
+        jb(addRenderableWidget(Button.builder(Component.literal("|◀")) {
+            playPrevSong()
+        }.pos(jbX + 8, row1Y).size(30, 16).build()))
+
+        playPauseBtn = jb(addRenderableWidget(Button.builder(Component.literal("▶ Play")) {
+            togglePlayPause()
+        }.pos(jbX + 42, row1Y).size(56, 16).build()))
+
+        jb(addRenderableWidget(Button.builder(Component.literal("⏹")) {
             MidiFilePlayer.stop()
             NbsPlayer.stop()
             stopScale()
@@ -266,17 +428,20 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
             pendingAutoPlay = false
             pendingNextFile = null
             chat("Stopped")
-        }.pos(172, row1Y).size(40, 16).build()))
+        }.pos(jbX + 102, row1Y).size(28, 16).build()))
 
-        tab0(addRenderableWidget(Button.builder(Component.literal("Shuffle")) {
-            logger.info("Shuffle clicked")
-            shuffle()
-        }.pos(214, row1Y).size(50, 16).build()))
+        jb(addRenderableWidget(Button.builder(Component.literal("▶|")) {
+            playNextSong()
+        }.pos(jbX + 134, row1Y).size(30, 16).build()))
 
-        tab0(addRenderableWidget(Button.builder(Component.literal(if (SongAudioPreviewer.isPlaying) "Stop Prev" else "Preview")) { btn ->
+        jb(addRenderableWidget(Button.builder(Component.literal("Tune & Play")) {
+            playSelectedSong()
+        }.pos(jbX + 168, row1Y).size(72, 16).build()))
+
+        jb(addRenderableWidget(Button.builder(Component.literal(if (SongAudioPreviewer.isPlaying) "Stop Prev" else "♪ Preview")) { btn ->
             if (SongAudioPreviewer.isPlaying) {
                 SongAudioPreviewer.stopPreview()
-                btn.message = Component.literal("Preview")
+                btn.message = Component.literal("♪ Preview")
                 chat("Audio preview stopped")
             } else {
                 selectedFile?.let { file ->
@@ -287,158 +452,43 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
                     chat("Auditioning: ${file.name}")
                 } ?: chatWarn("Select a song first")
             }
-        }.pos(266, row1Y).size(56, 16).build()))
+        }.pos(jbX + 244, row1Y).size(62, 16).build()))
 
-        // Playback row 2 (height - 24)
-        val row2Y = height - 24
-        tab0(addRenderableWidget(Button.builder(Component.literal("Tempo -")) {
+        jb(addRenderableWidget(Button.builder(Component.literal("Queue ☰")) {
+            switchTab(if (activeTab == 1) 0 else 1)
+        }.pos(jbX + 310, row1Y).size(56, 16).build()))
+
+        // Row 2: Secondary controls
+        jb(addRenderableWidget(Button.builder(Component.literal("Tempo -")) {
             MidiFilePlayer.tempoMultiplier = (MidiFilePlayer.tempoMultiplier - 0.1f).coerceAtLeast(0.5f)
             chat("Tempo: ${"%.1f".format(MidiFilePlayer.tempoMultiplier)}x")
-        }.pos(10, row2Y).size(50, 16).build()))
+        }.pos(jbX + 8, row2Y).size(48, 16).build()))
 
-        tab0(addRenderableWidget(Button.builder(Component.literal("Tempo +")) {
+        jb(addRenderableWidget(Button.builder(Component.literal("Tempo +")) {
             MidiFilePlayer.tempoMultiplier = (MidiFilePlayer.tempoMultiplier + 0.1f).coerceAtLeast(0.5f).coerceAtMost(2.0f)
             chat("Tempo: ${"%.1f".format(MidiFilePlayer.tempoMultiplier)}x")
-        }.pos(64, row2Y).size(50, 16).build()))
+        }.pos(jbX + 60, row2Y).size(48, 16).build()))
 
-        tab0(addRenderableWidget(Button.builder(Component.literal(loopModeLabel())) { btn ->
+        loopBtn = jb(addRenderableWidget(Button.builder(Component.literal(loopModeLabel())) { btn ->
             val next = nextLoopMode()
             ConfigManager.config.loopMode = next.name
             ConfigManager.save()
             btn.message = Component.literal(loopModeLabel())
             chat("Loop: ${loopModeLabel()}")
-            logger.info("loopMode -> $next")
-        }.pos(118, row2Y).size(94, 16).build()))
+            updateQueueDisplay()
+        }.pos(jbX + 112, row2Y).size(92, 16).build()))
 
-        tab0(addRenderableWidget(Button.builder(Component.literal("Refresh")) {
-            logger.info("Refresh clicked")
+        jb(addRenderableWidget(Button.builder(Component.literal("🔀 Shuffle")) {
+            reshuffleQueue()
+            shuffle()
+        }.pos(jbX + 208, row2Y).size(66, 16).build()))
+
+        jb(addRenderableWidget(Button.builder(Component.literal("Refresh")) {
             refreshFiles()
             chat("Refreshed -- ${midiFiles.size} files found")
-        }.pos(216, row2Y).size(52, 16).build()))
+        }.pos(jbX + 278, row2Y).size(52, 16).build()))
 
-        // ── Tab 1: Organ ──────────────────────────────────────────────────────
-        fun <T : AbstractWidget> tab1(w: T): T { tabContent[1]!!.add(w); return w }
-        val organBtnY = 40
-
-        tab1(addRenderableWidget(Button.builder(Component.literal("Scan")) {
-            logger.info("Scan clicked")
-            OrganScanner.scan()
-            updateOrganInfo()
-        }.pos(10, organBtnY).size(48, 16).build()))
-
-        tab1(addRenderableWidget(Button.builder(Component.literal("Center")) {
-            logger.info("Center clicked")
-            chat("Centering on organ...")
-            val result = PlayerController.centerOnOrgan()
-            organScanMessage = when (result) {
-                is CenterResult.Centered -> "Centered. ${result.reachableCount}/${result.totalFound} reachable."
-                CenterResult.NoBlocks   -> "No playable noteblocks found."
-                CenterResult.NoPlayer   -> "No player found."
-            }
-            chat(organScanMessage)
-        }.pos(62, organBtnY).size(54, 16).build()))
-
-        tab1(addRenderableWidget(Button.builder(Component.literal("Tune")) {
-            logger.info("Tune clicked")
-            startTuning()
-        }.pos(120, organBtnY).size(48, 16).build()))
-
-        tab1(addRenderableWidget(Button.builder(Component.literal("Scale")) {
-            logger.info("Play Scale clicked")
-            playScale()
-        }.pos(172, organBtnY).size(48, 16).build()))
-
-        tab1(addRenderableWidget(Button.builder(Component.literal(if (MaterialsShoppingOverlay.isVisible) "Hide Mats" else "Show Mats")) { btn ->
-            MaterialsShoppingOverlay.isVisible = !MaterialsShoppingOverlay.isVisible
-            btn.message = Component.literal(if (MaterialsShoppingOverlay.isVisible) "Hide Mats" else "Show Mats")
-            chat("Materials overlay ${if (MaterialsShoppingOverlay.isVisible) "shown" else "hidden"}")
-        }.pos(224, organBtnY).size(74, 16).build()))
-
-        // ── Tab 2: Settings ───────────────────────────────────────────────────
-        fun <T : AbstractWidget> tab2(w: T): T { tabContent[2]!!.add(w); return w }
-
-        val cfg = ConfigManager.config
-        val col2X = (width - 150).coerceIn(180, 240)
-        var sy = 42
-
-        // Fast Tuning toggle
-        tab2(addRenderableWidget(Button.builder(Component.literal(if (cfg.fastTuning) "ON" else "OFF")) { btn ->
-            cfg.fastTuning = !cfg.fastTuning
-            ConfigManager.save()
-            btn.message = Component.literal(if (cfg.fastTuning) "ON" else "OFF")
-            chat("Fast tuning: ${if (cfg.fastTuning) "ON" else "OFF"}")
-            logger.info("fastTuning -> ${cfg.fastTuning}")
-        }.pos(col2X, sy).size(54, 16).build()))
-        sy += 20
-
-        // Smooth camera rotation toggle
-        tab2(addRenderableWidget(Button.builder(Component.literal(if (cfg.smoothCameraRotation) "ON" else "OFF")) { btn ->
-            cfg.smoothCameraRotation = !cfg.smoothCameraRotation
-            ConfigManager.save()
-            btn.message = Component.literal(if (cfg.smoothCameraRotation) "ON" else "OFF")
-            chat("Camera rotation: ${if (cfg.smoothCameraRotation) "ON" else "OFF"}")
-            logger.info("smoothCameraRotation -> ${cfg.smoothCameraRotation}")
-        }.pos(col2X, sy).size(54, 16).build()))
-        sy += 20
-
-        // Notes per tick
-        tab2(addRenderableWidget(Button.builder(Component.literal("-")) {
-            cfg.maxNotesPerTick = (cfg.maxNotesPerTick - 1).coerceAtLeast(1)
-            ArpeggioScheduler.maxNotesPerTick = cfg.maxNotesPerTick
-            ConfigManager.save()
-            chat("Notes/tick: ${cfg.maxNotesPerTick}")
-        }.pos(col2X, sy).size(20, 16).build()))
-        tab2(addRenderableWidget(Button.builder(Component.literal("+")) {
-            cfg.maxNotesPerTick = (cfg.maxNotesPerTick + 1).coerceAtMost(64)
-            ArpeggioScheduler.maxNotesPerTick = cfg.maxNotesPerTick
-            ConfigManager.save()
-            chat("Notes/tick: ${cfg.maxNotesPerTick}")
-        }.pos(col2X + 24, sy).size(20, 16).build()))
-        sy += 20
-
-        // Scan radius
-        tab2(addRenderableWidget(Button.builder(Component.literal("-")) {
-            cfg.scanRadius = (cfg.scanRadius - 1).coerceAtLeast(1)
-            OrganScanner.scanRadius = cfg.scanRadius
-            ConfigManager.save()
-            chat("Scan radius: ${cfg.scanRadius}")
-        }.pos(col2X, sy).size(20, 16).build()))
-        tab2(addRenderableWidget(Button.builder(Component.literal("+")) {
-            cfg.scanRadius = (cfg.scanRadius + 1).coerceAtMost(10)
-            OrganScanner.scanRadius = cfg.scanRadius
-            ConfigManager.save()
-            chat("Scan radius: ${cfg.scanRadius}")
-        }.pos(col2X + 24, sy).size(20, 16).build()))
-        sy += 20
-
-        // Shift mode
-        tab2(addRenderableWidget(Button.builder(Component.literal(shiftModeLabel())) { btn ->
-            val modes = kyrielie.blockbard.organ.ShiftMode.entries
-            val cur = cfg.shiftModeEnum()
-            val next = modes[(modes.indexOf(cur) + 1) % modes.size]
-            cfg.shiftMode = next.name
-            InstrumentShifter.mode = next
-            ConfigManager.save()
-            btn.message = Component.literal(shiftModeLabel())
-            chat("Shift mode: $next")
-        }.pos(col2X, sy).size(110, 16).build()))
-        sy += 20
-
-        // Debug log toggle
-        tab2(addRenderableWidget(Button.builder(Component.literal(debugLogLabel())) { btn ->
-            cfg.debugLogging = !cfg.debugLogging
-            DebugLog.enabled = cfg.debugLogging
-            ConfigManager.save()
-            btn.message = Component.literal(debugLogLabel())
-            chat("Debug log: ${if (cfg.debugLogging) "ON" else "OFF"}")
-            logger.info("debugLogging -> ${cfg.debugLogging}")
-        }.pos(col2X, sy).size(54, 16).build()))
-        sy += 20
-
-        // Keybinds button
-        tab2(addRenderableWidget(Button.builder(Component.literal("Key Binds...")) {
-            minecraft.gui.setScreen(KeyBindsScreen(this, minecraft.options))
-        }.pos(col2X, sy).size(110, 16).build()))
+        updateQueueDisplay()
 
         // Apply initial tab visibility
         updateTabVisibility()
@@ -448,6 +498,13 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
 
     private fun switchTab(index: Int) {
         activeTab = index
+        focused = null
+        if (activeTab == 1 && ::queueListWidget.isInitialized) {
+            updateQueueDisplay()
+        }
+        if (activeTab == 3 && ::logListWidget.isInitialized) {
+            logListWidget.refreshLogs()
+        }
         updateTabVisibility()
     }
 
@@ -459,6 +516,13 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
             val visible = tab == activeTab
             widgets.forEach { it.visible = visible; it.active = visible }
         }
+        if (::songListWidget.isInitialized) songListWidget.visible = (activeTab == 0)
+        if (::queueListWidget.isInitialized) queueListWidget.visible = (activeTab == 1)
+        virtualKeyboard?.visible = (activeTab == 2)
+        if (::logListWidget.isInitialized) logListWidget.visible = (activeTab == 3)
+
+        val showJukebox = (activeTab == 0 || activeTab == 1)
+        jukeboxWidgets.forEach { it.visible = showJukebox; it.active = showJukebox }
     }
 
     // ── Label helpers ──────────────────────────────────────────────────────────
@@ -476,21 +540,20 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
         return modes[(modes.indexOf(cur) + 1) % modes.size]
     }
 
-    private fun debugLogLabel(): String {
-        val on = ConfigManager.config.debugLogging
-        return "Debug Log: ${if (on) "ON" else "OFF"}"
-    }
-
-    private fun shiftModeLabel(): String = "Shift: ${ConfigManager.config.shiftModeEnum().name}"
-
     // ── Helpers ────────────────────────────────────────────────────────────────
 
     private fun chat(msg: String) {
-        minecraft.player?.sendSystemMessage(Component.literal("§b[BlockBard] §f$msg"))
+        BlockBardLogBuffer.info("GUI", msg)
+        if (ConfigManager.config.enableChatFeedback) {
+            minecraft.player?.sendSystemMessage(Component.literal("§b[BlockBard] §f$msg"))
+        }
     }
 
     private fun chatWarn(msg: String) {
-        minecraft.player?.sendSystemMessage(Component.literal("§b[BlockBard] §c$msg"))
+        BlockBardLogBuffer.warn("GUI", msg)
+        if (ConfigManager.config.enableChatFeedback) {
+            minecraft.player?.sendSystemMessage(Component.literal("§b[BlockBard] §c$msg"))
+        }
     }
 
     private fun refreshFiles() {
@@ -519,7 +582,147 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
         logger.info("updateOrganInfo: $organScanMessage")
     }
 
-    // ── Loop / auto-advance (Tier 4) ───────────────────────────────────────────
+    // ── Loop / auto-advance (Tier 4) & Queue ───────────────────────────────────
+
+    private fun getUpcomingQueue(): List<File> {
+        val files = displayedFiles.ifEmpty { midiFiles }
+        if (files.isEmpty()) return emptyList()
+
+        return when (ConfigManager.config.loopModeEnum()) {
+            LoopMode.NONE -> {
+                val curIdx = selectedFile?.let { sf -> files.indexOfFirst { it.name.equals(sf.name, true) } } ?: -1
+                if (curIdx >= 0 && curIdx < files.size - 1) {
+                    files.subList(curIdx + 1, files.size)
+                } else emptyList()
+            }
+            LoopMode.LOOP_ONE -> {
+                val cur = selectedFile ?: files.firstOrNull() ?: return emptyList()
+                List(minOf(8, files.size.coerceAtLeast(4))) { cur }
+            }
+            LoopMode.LOOP_ALL -> {
+                val curIdx = selectedFile?.let { sf -> files.indexOfFirst { it.name.equals(sf.name, true) } } ?: 0
+                val queue = mutableListOf<File>()
+                for (i in 1 until files.size) {
+                    queue.add(files[(curIdx + i) % files.size])
+                }
+                queue
+            }
+            LoopMode.SHUFFLE_ALL -> {
+                ensureShuffleQueue()
+                shuffleQueue.toList()
+            }
+        }
+    }
+
+    private fun ensureShuffleQueue(forceReshuffle: Boolean = false) {
+        val all = midiFiles
+        if (all.isEmpty()) {
+            shuffleQueue.clear()
+            return
+        }
+        if (forceReshuffle || shuffleQueue.isEmpty()) {
+            shuffleQueue.clear()
+            val remaining = all.filter { it != selectedFile }.shuffled().toMutableList()
+            shuffleQueue.addAll(remaining)
+            if (shuffleQueue.isEmpty() && selectedFile != null) {
+                shuffleQueue.add(selectedFile!!)
+            }
+        }
+    }
+
+    private fun getNextSongInQueue(): File? {
+        val files = displayedFiles.ifEmpty { midiFiles }
+        if (files.isEmpty()) return null
+
+        return when (ConfigManager.config.loopModeEnum()) {
+            LoopMode.NONE -> {
+                val curIdx = selectedFile?.let { sf -> files.indexOfFirst { it.name.equals(sf.name, true) } } ?: -1
+                if (curIdx >= 0 && curIdx < files.size - 1) files[curIdx + 1] else null
+            }
+            LoopMode.LOOP_ONE -> selectedFile ?: files.firstOrNull()
+            LoopMode.LOOP_ALL -> {
+                val curIdx = selectedFile?.let { sf -> files.indexOfFirst { it.name.equals(sf.name, true) } } ?: 0
+                files[(curIdx + 1) % files.size]
+            }
+            LoopMode.SHUFFLE_ALL -> {
+                ensureShuffleQueue()
+                if (shuffleQueue.isNotEmpty()) {
+                    val pick = shuffleQueue.removeAt(0)
+                    if (shuffleQueue.isEmpty()) ensureShuffleQueue()
+                    pick
+                } else nextShuffle()
+            }
+        }
+    }
+
+    private fun getPrevSongInQueue(): File? {
+        val files = displayedFiles.ifEmpty { midiFiles }
+        if (files.isEmpty()) return null
+        val curIdx = selectedFile?.let { sf -> files.indexOfFirst { it.name.equals(sf.name, true) } } ?: 0
+        val prevIdx = if (curIdx - 1 < 0) files.size - 1 else curIdx - 1
+        return files[prevIdx]
+    }
+
+    private fun playNextSong() {
+        val next = getNextSongInQueue() ?: run {
+            chatWarn("End of queue")
+            return
+        }
+        selectFile(next)
+        if (::songListWidget.isInitialized) {
+            songListWidget.setFiles(displayedFiles, selectedFile)
+        }
+        updateQueueDisplay()
+        playSelectedSong()
+    }
+
+    private fun playPrevSong() {
+        val (elapsedSecs, _) = getPlaybackTimes()
+        if (elapsedSecs > 3.0) {
+            seekToFraction(0.0)
+            chat("Restarted track")
+            return
+        }
+        val prev = getPrevSongInQueue() ?: return
+        selectFile(prev)
+        if (::songListWidget.isInitialized) {
+            songListWidget.setFiles(displayedFiles, selectedFile)
+        }
+        updateQueueDisplay()
+        playSelectedSong()
+    }
+
+    private fun reshuffleQueue() {
+        ensureShuffleQueue(forceReshuffle = true)
+        updateQueueDisplay()
+    }
+
+    private fun removeFromQueue(idx: Int) {
+        if (ConfigManager.config.loopModeEnum() == LoopMode.SHUFFLE_ALL) {
+            if (idx in 0 until shuffleQueue.size) {
+                val removed = shuffleQueue.removeAt(idx)
+                chat("Removed from queue: ${removed.nameWithoutExtension}")
+                updateQueueDisplay()
+            }
+        }
+    }
+
+    private fun updateQueueDisplay() {
+        val q = getUpcomingQueue()
+        if (::queueListWidget.isInitialized) {
+            queueListWidget.setQueue(q, selectedFile)
+        }
+    }
+
+    private fun togglePlayPause() {
+        when {
+            MidiFilePlayer.isPaused   -> { MidiFilePlayer.resume(); chat("Resumed") }
+            NbsPlayer.isPaused        -> { NbsPlayer.resume();      chat("Resumed") }
+            MidiFilePlayer.isActive() -> { MidiFilePlayer.pause();  chat("Paused") }
+            NbsPlayer.isPlaying       -> { NbsPlayer.pause();       chat("Paused") }
+            else                      -> { playSelectedSong() }
+        }
+    }
 
     /**
      * Called by MidiFilePlayer.onFinished and NbsPlayer.onFinished -- may run on the
@@ -530,16 +733,13 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
         when (ConfigManager.config.loopModeEnum()) {
             LoopMode.NONE        -> { /* stay idle */ }
             LoopMode.LOOP_ONE    -> { pendingAutoPlay = true }
-            LoopMode.LOOP_ALL    -> { pendingNextFile = nextInOrder(); pendingAutoPlay = true }
-            LoopMode.SHUFFLE_ALL -> { pendingNextFile = nextShuffle(); pendingAutoPlay = true }
+            LoopMode.LOOP_ALL,
+            LoopMode.SHUFFLE_ALL -> {
+                pendingNextFile = getNextSongInQueue()
+                pendingAutoPlay = true
+            }
         }
         logger.info("onSongFinished: loopMode=${ConfigManager.config.loopMode} pendingNext=${pendingNextFile?.name}")
-    }
-
-    private fun nextInOrder(): File? {
-        if (midiFiles.isEmpty()) return null
-        val cur = selectedIndex
-        return midiFiles[(cur + 1) % midiFiles.size]
     }
 
     private fun nextShuffle(): File? {
@@ -563,7 +763,7 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
 
     // ── Tuning ─────────────────────────────────────────────────────────────────
 
-    private fun startTuning(thenPlay: Boolean = false) {
+    private fun startTuning(forceChromatic: Boolean = false, thenPlay: Boolean = false) {
         SongAudioPreviewer.stopPreview()
         val mc = minecraft
         val player = mc.player ?: run { chatWarn("No player"); return }
@@ -574,13 +774,19 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
             return
         }
 
-        val mainHand = player.mainHandItem
-        val offHand  = player.offhandItem
-        if (!mainHand.isEmpty) {
-            chatWarn("Empty your main hand before tuning")
-            return
+        // Auto-select empty hotbar slot if main hand is holding an item
+        if (!player.mainHandItem.isEmpty) {
+            val emptySlot = (0..8).firstOrNull { player.inventory.getItem(it).isEmpty }
+            if (emptySlot != null) {
+                player.inventory.selectedSlot = emptySlot
+                player.connection.send(net.minecraft.network.protocol.game.ServerboundSetCarriedItemPacket(emptySlot))
+                logger.info("startTuning: switched to empty hotbar slot $emptySlot")
+            } else {
+                chatWarn("Hotbar has no empty slots -- clear a slot before tuning")
+                return
+            }
         }
-        if (!offHand.isEmpty) {
+        if (!player.offhandItem.isEmpty) {
             chatWarn("Empty your offhand before tuning")
             return
         }
@@ -609,8 +815,8 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
             return MidiToOrganMapper.computeTuneTargets(result, reachable)
         }
 
-        val midi = MidiFilePlayer.loadedMidi
-        val nbs = loadedNbs?.takeIf { it.file == selectedFile }
+        val midi = if (forceChromatic) null else MidiFilePlayer.loadedMidi
+        val nbs = if (forceChromatic) null else loadedNbs?.takeIf { it.file == selectedFile }
         val targets: List<TuneTarget>
 
         if (midi != null) {
@@ -624,32 +830,65 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
             logger.info("startTuning: NBS mode -- ${reachable.size} reachable, ${noteUsageCounts.size} distinct pairs")
             targets = assignAndReport(noteUsageCounts)
         } else {
-            // No song -- chromatic scale test
-            logger.info("startTuning: no-song mode -- ${reachable.size} blocks to chromatic scale")
-            chat("No song loaded -- tuning to chromatic scale (F#3 upward)")
+            // Full Chromatic Scale Tuning (0..24 for each instrument in reach)
+            logger.info("startTuning: chromatic mode -- ${reachable.size} blocks across instruments")
+            chat("Tuning organ to chromatic scale (0..24 for each instrument)...")
             val sorted = reachable.sortedBy { it.distanceFromPlayer }
-            targets = sorted.groupBy { it.instrument }.flatMap { (_, blocksForInstrument) ->
-                blocksForInstrument.mapIndexed { i, entry ->
-                    TuneTarget(entry.pos, entry.noteIndex, i.coerceIn(0, 24), entry.instrument)
+            targets = sorted.groupBy { it.instrument }.flatMap { (inst, blocksForInstrument) ->
+                val instTargets = mutableListOf<TuneTarget>()
+                val maxPitches = minOf(25, blocksForInstrument.size)
+                val pitchesToCover = (0 until maxPitches).toMutableSet()
+                val available = blocksForInstrument.toMutableList()
+
+                // Pass 1: Keep blocks that already match a pitch in 0..24 (0 clicks)
+                for (pitch in 0 until maxPitches) {
+                    val exact = available.filter { it.noteIndex == pitch }.minByOrNull { it.distanceFromPlayer }
+                    if (exact != null) {
+                        instTargets.add(TuneTarget(exact.pos, exact.noteIndex, pitch, inst))
+                        pitchesToCover.remove(pitch)
+                        available.remove(exact)
+                    }
                 }
+
+                // Pass 2: Assign missing pitches to available blocks needing the fewest clicks
+                for (pitch in pitchesToCover.sorted()) {
+                    val best = available.minWithOrNull(
+                        compareBy(
+                            { clicksNeeded(it.noteIndex, pitch) },
+                            { it.distanceFromPlayer }
+                        )
+                    )
+                    if (best != null) {
+                        instTargets.add(TuneTarget(best.pos, best.noteIndex, pitch, inst))
+                        available.remove(best)
+                    }
+                }
+
+                // Pass 3: Excess blocks beyond 25 keep their existing note (0 clicks, don't retune!)
+                for (excess in available) {
+                    instTargets.add(TuneTarget(excess.pos, excess.noteIndex, excess.noteIndex, inst))
+                }
+
+                instTargets
             }
             assignment = null
             ArpeggioScheduler.assignment = emptyMap()
             ArpeggioScheduler.voicePools = emptyMap()
-            coverageMessage = "Test scale: ${sorted.size} blocks"
+            coverageMessage = "Chromatic scale: ${targets.size} blocks"
         }
 
-        if (targets.isEmpty()) {
-            chat("Nothing to tune -- all blocks already at target notes!")
+        val totalClicks = targets.sumOf { it.estimatedClicks }
+        if (targets.isEmpty() || totalClicks == 0) {
+            chat("Organ is in tune!")
+            logger.info("startTuning: 0 clicks needed -- skipping tuner")
             if (thenPlay) startPlayback()
             return
         }
 
-        val totalClicks = targets.sumOf { it.estimatedClicks }
         chat("Tuning ${targets.size} blocks (~$totalClicks clicks)...")
         logger.info("startTuning: ${targets.size} targets, $totalClicks clicks, thenPlay=$thenPlay")
 
-        tuner = NoteBlockTuner(
+        val newTuner = NoteBlockTuner(
             targets           = targets,
             worldNoteReader   = { pos ->
                 mc.level?.getBlockState(pos)?.let { state ->
@@ -666,19 +905,23 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
                 logger.debug("tuner progress: $tuneStatusMsg")
             }
         )
+        tuner = newTuner
+        activeTuner = newTuner
+        currentScreen = this
 
         pendingAutoPlay = thenPlay
         if (thenPlay) pendingNextFile = null
 
-        tuner!!.start()
+        newTuner.start()
     }
 
     private fun abortTuning() {
-        if (tuner?.isActive == true) {
+        if (tuner?.isActive == true || activeTuner?.isActive == true) {
             chat("Tuning cancelled")
             logger.info("abortTuning: tuner cancelled")
         }
         tuner = null
+        activeTuner = null
         tuneStatusMsg = ""
     }
 
@@ -758,10 +1001,74 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
 
     // ── Playback ───────────────────────────────────────────────────────────────
 
+    private fun playSelectedSong() {
+        val file = (if (::songListWidget.isInitialized) songListWidget.getSelectedFile() else null)
+            ?: selectedFile
+            ?: run {
+                chatWarn("Select a song first")
+                return
+            }
+        if (selectedFile != file) {
+            selectFile(file)
+        }
+
+        val isCurrentMidi = MidiFilePlayer.loadedMidi?.file == file
+        val isCurrentNbs = loadedNbs?.file == file
+
+        when {
+            MidiFilePlayer.isPaused && isCurrentMidi -> {
+                MidiFilePlayer.resume()
+                chat("Resumed: ${file.name}")
+            }
+            NbsPlayer.isPaused && isCurrentNbs -> {
+                NbsPlayer.resume()
+                chat("Resumed: ${file.name}")
+            }
+            else -> {
+                if (!isCurrentMidi && !isCurrentNbs) {
+                    MidiFilePlayer.stop()
+                    NbsPlayer.stop()
+                }
+                val hasOrgan = PlayerController.reconfirmOrgan()
+                if (!hasOrgan) {
+                    chatWarn("No playable noteblocks found in reach around player.")
+                    return
+                }
+                updateOrganInfo()
+                startTuning(thenPlay = true)
+            }
+        }
+    }
+
     private fun startPlayback() {
         SongAudioPreviewer.stopPreview()
         val file = selectedFile ?: run { chatWarn("No file selected"); return }
         logger.info("startPlayback: ${file.name}")
+
+        // Ensure organ assignment is computed so ArpeggioScheduler maps notes to blocks
+        if (assignment == null) {
+            val map = PlayerController.organMap
+            val reachable = if (map != null) NoteBlockRegistry.allPlayable().filter { map.isReachable(it.pos) } else emptyList()
+            if (reachable.isNotEmpty()) {
+                val noteUsageCounts: Map<NotePitch, Int> = if (file.extension.lowercase() == "nbs") {
+                    val nbs = loadedNbs ?: try { NbsFileLoader.load(file).also { loadedNbs = it } } catch (e: Exception) { null }
+                    nbs?.notes?.mapNotNull { note ->
+                        val inst = nbsInstrumentToBlock(note.instrument) ?: return@mapNotNull null
+                        NotePitch(note.key + 21, inst)
+                    }?.groupingBy { it }?.eachCount() ?: emptyMap()
+                } else {
+                    val midi = MidiFilePlayer.loadedMidi ?: try { MidiFilePlayer.load(file) } catch (e: Exception) { null }
+                    midi?.noteUsageCounts ?: emptyMap()
+                }
+                if (noteUsageCounts.isNotEmpty()) {
+                    val result = MidiToOrganMapper.buildAssignment(noteUsageCounts, reachable)
+                    assignment = result
+                    ArpeggioScheduler.assignment = result.assignment
+                    ArpeggioScheduler.voicePools = result.voicePools
+                    updateCoverageMessage(result)
+                }
+            }
+        }
 
         // Tier 6d: warn about missing coverage so the player knows to expect silent notes,
         // but do not block -- they chose to play, let them.
@@ -799,12 +1106,16 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
     private fun shuffle() {
         val next = nextShuffle() ?: return
         selectFile(next)
+        if (::songListWidget.isInitialized) {
+            songListWidget.setFiles(displayedFiles, selectedFile)
+        }
+        playSelectedSong()
     }
 
     private fun selectFile(file: File) {
         SongAudioPreviewer.stopPreview()
         selectedFile = file
-        selectedIndex = midiFiles.indexOf(file)
+        selectedIndex = midiFiles.indexOfFirst { it.name.equals(file.name, ignoreCase = true) }
         if (::songListWidget.isInitialized && songListWidget.getSelectedFile() != file) {
             songListWidget.setFiles(displayedFiles, selectedFile)
         }
@@ -908,6 +1219,7 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
         } else {
             "Loaded: ${file.name}. Run Scan -> Center -> Tune -> Play."
         }
+        updateQueueDisplay()
     }
 
     // ── Tick ───────────────────────────────────────────────────────────────────
@@ -933,6 +1245,7 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
 
             if (t.isDone) {
                 tuner = null
+                activeTuner = null
                 tuneStatusMsg = ""
                 organScanMessage = "Tuning complete! Press Play."
                 chat("Tuning complete!")
@@ -948,6 +1261,7 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
                 }
             } else if (t.isFailed) {
                 tuner = null
+                activeTuner = null
                 tuneStatusMsg = ""
                 pendingAutoPlay = false
                 pendingNextFile = null
@@ -976,20 +1290,47 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
             }
         }
 
+        if (::playPauseBtn.isInitialized) {
+            val isPlaying = (MidiFilePlayer.isActive() && !MidiFilePlayer.isPaused) || (NbsPlayer.isPlaying && !NbsPlayer.isPaused)
+            val isPaused = MidiFilePlayer.isPaused || NbsPlayer.isPaused
+            val label = when {
+                isPlaying -> "❚❚ Pause"
+                isPaused  -> "▶ Resume"
+                else      -> "▶ Play"
+            }
+            if (playPauseBtn.message.string != label) {
+                playPauseBtn.message = Component.literal(label)
+            }
+        }
+
         tickScale()
     }
 
     // ── Render ─────────────────────────────────────────────────────────────────
 
     override fun extractRenderState(graphics: GuiGraphicsExtractor, mouseX: Int, mouseY: Int, partialTick: Float) {
-        super.extractRenderState(graphics, mouseX, mouseY, partialTick)
         val font = minecraft.font
 
+        // 1. Draw Jukebox console chassis, LCD, seek bar, and visualizer FIRST
+        if (activeTab == 0 || activeTab == 1) {
+            renderJukeboxConsole(graphics, font, mouseX, mouseY)
+        }
+
+        // 2. Render all active child widgets (buttons, transport controls, lists) ON TOP of backdrops
+        super.extractRenderState(graphics, mouseX, mouseY, partialTick)
+
+        // 3. Render per-tab text overlays
         when (activeTab) {
             0 -> renderFilesTab(graphics, font)
-            1 -> renderOrganTab(graphics, font)
-            2 -> renderSettingsTab(graphics, font)
+            1 -> renderQueueTab(graphics, font)
+            2 -> renderOrganTab(graphics, font)
+            3 -> renderLogsTab(graphics, font)
         }
+    }
+
+    private fun renderLogsTab(graphics: GuiGraphicsExtractor, font: net.minecraft.client.gui.Font) {
+        val count = BlockBardLogBuffer.size
+        graphics.text(font, "$count entries logged (click entry to copy single line, or use 'Copy All')", 220, 30, opaque(0x888888))
     }
 
     private fun renderFilesTab(graphics: GuiGraphicsExtractor, font: net.minecraft.client.gui.Font) {
@@ -998,122 +1339,196 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
                            else "(no matches for filter/search)"
             graphics.text(font, emptyMsg, 14, 54, opaque(0xAAAAAA))
         }
+    }
 
-        // Item 9: Live Piano Roll / Note Visualizer strip (y = height - 92, h = 14)
-        val visY = height - 92
-        val visW = (width - 20).coerceAtMost(320)
-        val visX = 10
-        val keyCount = 25
-        val keyW = visW.toFloat() / keyCount
-        graphics.fill(visX - 1, visY - 1, visX + visW + 1, visY + 15, opaque(0x181818))
-        for (i in 0 until keyCount) {
-            val kx1 = (visX + i * keyW).toInt()
-            val kx2 = (visX + (i + 1) * keyW - 1).toInt()
-            val isAccidental = (i % 12) in listOf(0, 2, 4, 7, 9)
-            val baseColor = if (isAccidental) opaque(0x2A2A2A) else opaque(0x555555)
-
-            val state = VisualizerState.getPitchState(i)
-            val fillColor = if (state != null) {
-                blendColor(baseColor, state.second, state.first)
-            } else baseColor
-
-            graphics.fill(kx1, visY, kx2, visY + 14, fillColor)
+    private fun renderQueueTab(graphics: GuiGraphicsExtractor, font: net.minecraft.client.gui.Font) {
+        val q = getUpcomingQueue()
+        if (q.isEmpty()) {
+            val emptyMsg = when (ConfigManager.config.loopModeEnum()) {
+                LoopMode.NONE -> "(End of queue -- enable Loop ALL or Shuffle to auto-advance tracks)"
+                else -> "(Queue is empty -- select a track or add files to midis directory)"
+            }
+            graphics.text(font, emptyMsg, 14, 54, opaque(0xAAAAAA))
+        } else {
+            val countStr = "${q.size} tracks queued"
+            graphics.text(font, countStr, width - font.width(countStr) - 16, 30, opaque(0xAAAAAA))
         }
+    }
 
-        // Item 1: Track title, status, and mm:ss timestamps (y = height - 74)
-        val trackName = selectedFile?.nameWithoutExtension?.take(32) ?: "No Track Selected"
-        val statusLabel = when {
-            MidiFilePlayer.isActive() && !MidiFilePlayer.isPaused -> "▶ PLAYING: $trackName"
-            NbsPlayer.isPlaying && !NbsPlayer.isPaused            -> "▶ PLAYING: $trackName"
-            MidiFilePlayer.isPaused || NbsPlayer.isPaused         -> "❚❚ PAUSED: $trackName"
-            SongAudioPreviewer.isPlaying                          -> "♪ PREVIEW: $trackName"
-            else                                                  -> "■ READY: $trackName"
-        }
-        val statusColor = when {
-            MidiFilePlayer.isActive() && !MidiFilePlayer.isPaused -> opaque(0x55FF55)
-            NbsPlayer.isPlaying && !NbsPlayer.isPaused            -> opaque(0x55FF55)
-            MidiFilePlayer.isPaused || NbsPlayer.isPaused         -> opaque(0xFFFF55)
-            SongAudioPreviewer.isPlaying                          -> opaque(0x55FFFF)
-            else                                                  -> opaque(0xAAAAAA)
-        }
-        graphics.text(font, statusLabel, 10, height - 74, statusColor)
+    private fun renderJukeboxConsole(graphics: GuiGraphicsExtractor, font: net.minecraft.client.gui.Font, mouseX: Int, mouseY: Int) {
+        val jbX = 6
+        val jbY = height - 108
+        val jbW = width - 12
+        val jbH = 104
 
+        // 1. Jukebox Enclosure Chassis (warm dark oak / polished mahogany wood bevel)
+        graphics.fill(jbX, jbY, jbX + jbW, jbY + jbH, opaque(0x181310))
+        // Top & Left brass bevel highlight
+        graphics.fill(jbX + 1, jbY + 1, jbX + jbW - 1, jbY + 2, opaque(0x8A6E46))
+        graphics.fill(jbX + 1, jbY + 1, jbX + 2, jbY + jbH - 1, opaque(0x6E5637))
+        // Bottom & Right shadow
+        graphics.fill(jbX + 1, jbY + jbH - 2, jbX + jbW - 1, jbY + jbH - 1, opaque(0x0A0806))
+        graphics.fill(jbX + jbW - 2, jbY + 1, jbX + jbW - 1, jbY + jbH - 1, opaque(0x0A0806))
+        // Inner chassis
+        graphics.fill(jbX + 2, jbY + 2, jbX + jbW - 2, jbY + jbH - 2, opaque(0x130F0D))
+
+        // Corner decorative brass studs/rivets
+        val studColor = opaque(0xD4AF37)
+        graphics.fill(jbX + 4, jbY + 4, jbX + 6, jbY + 6, studColor)
+        graphics.fill(jbX + jbW - 6, jbY + 4, jbX + jbW - 4, jbY + 6, studColor)
+        graphics.fill(jbX + 4, jbY + jbH - 6, jbX + 6, jbY + jbH - 4, studColor)
+        graphics.fill(jbX + jbW - 6, jbY + jbH - 6, jbX + jbW - 4, jbY + jbH - 4, studColor)
+
+        // 2. LCD / Glass Marquee Display Window (jbY + 5, h = 21)
+        val scrX = jbX + 8
+        val scrY = jbY + 5
+        val scrW = jbW - 16
+        val scrH = 21
+        graphics.fill(scrX, scrY, scrX + scrW, scrY + scrH, opaque(0x0C1510))
+        // Screen border
+        graphics.fill(scrX, scrY, scrX + scrW, scrY + 1, opaque(0x050A07))
+        graphics.fill(scrX, scrY, scrX + 1, scrY + scrH, opaque(0x050A07))
+        graphics.fill(scrX, scrY + scrH - 1, scrX + scrW, scrY + scrH, opaque(0x1B3024))
+        graphics.fill(scrX + scrW - 1, scrY, scrX + scrW, scrY + scrH, opaque(0x1B3024))
+
+        val isPlaying = (MidiFilePlayer.isActive() && !MidiFilePlayer.isPaused) || (NbsPlayer.isPlaying && !NbsPlayer.isPaused)
+        val isPaused = MidiFilePlayer.isPaused || NbsPlayer.isPaused
+        val isPreview = SongAudioPreviewer.isPlaying
+        val isTuning = tuner?.isActive == true
+
+        // Spinning vinyl record animation
+        val discFrames = listOf("◐", "◓", "◑", "◒")
+        val discIdx = if (isPlaying) ((System.currentTimeMillis() / 200) % 4).toInt() else 0
+        val discIcon = if (isPlaying) discFrames[discIdx] else "♫"
+        val discColor = if (isPlaying) opaque(0xFFD700) else if (isPaused) opaque(0xFFAA44) else opaque(0x778877)
+        graphics.text(font, discIcon, scrX + 5, scrY + 6, discColor)
+
+        // Status badge
+        val (statusText, statusBg) = when {
+            isTuning  -> Pair("TUNING", 0xFFAA00)
+            isPlaying -> Pair("PLAYING", 0x55FF77)
+            isPaused  -> Pair("PAUSED", 0xFFFF55)
+            isPreview -> Pair("PREVIEW", 0x55FFFF)
+            else      -> Pair("READY", 0x889988)
+        }
+        graphics.text(font, "[$statusText]", scrX + 16, scrY + 6, opaque(statusBg))
+
+        // Track Name & Format
+        val trackFile = selectedFile
+        val trackTitle = trackFile?.nameWithoutExtension?.take(34) ?: "No Track Selected"
+        graphics.text(font, trackTitle, scrX + 80, scrY + 6, opaque(0xFFFFFF))
+
+        val isNbs = trackFile?.extension.equals("nbs", true)
+        val fmtTag = if (trackFile == null) "" else if (isNbs) "[NBS]" else "[MID]"
+        val fmtColor = if (isNbs) opaque(0xFFCC44) else opaque(0x55FFFF)
+        graphics.text(font, fmtTag, scrX + 80 + font.width(trackTitle) + 6, scrY + 6, fmtColor)
+
+        // Right side: Time & Tempo
         val (elapsedSecs, totalSecs) = getPlaybackTimes()
-        val timeText = "${formatTime(elapsedSecs)} / ${formatTime(totalSecs)}"
-        val timeW = font.width(timeText)
-        graphics.text(font, timeText, width - 10 - timeW, height - 74, opaque(0xFFFFFF))
+        val timeStr = "${formatTime(elapsedSecs)} / ${formatTime(totalSecs)}"
+        val tempoStr = "${"%.1f".format(MidiFilePlayer.tempoMultiplier)}x"
+        val rightInfo = "$tempoStr | $timeStr"
+        val rightW = font.width(rightInfo)
+        graphics.text(font, rightInfo, scrX + scrW - rightW - 6, scrY + 6, opaque(0x77FF99))
 
-        // Item 1: Interactive Seek Bar (y = height - 62, h = 4)
-        val barY = height - 62
-        val barX = 10
-        val barW = width - 20
+        // 3. Sub-Marquee (Up Next / Queue Preview) (jbY + 28, h = 11)
+        val subY = jbY + 28
+        val upcoming = getUpcomingQueue()
+        val nextSong = upcoming.firstOrNull()
+        val nextTitle = when {
+            ConfigManager.config.loopModeEnum() == LoopMode.LOOP_ONE && trackFile != null -> "Repeat Current Track"
+            nextSong != null -> nextSong.nameWithoutExtension.take(28)
+            else -> "End of queue"
+        }
+        val modeStr = loopModeLabel()
+        val nextLine = "UP NEXT: $nextTitle  [$modeStr] (${upcoming.size} queued)"
+        graphics.text(font, nextLine, scrX + 4, subY, opaque(0xD4AF37))
+
+        // 4. Jukebox Seek Bar (jbY + 41, h = 5)
+        val barX = scrX
+        val barY = jbY + 41
+        val barW = scrW
         val fraction = if (totalSecs > 0.0) (elapsedSecs / totalSecs).coerceIn(0.0, 1.0) else 0.0
         val progressW = (barW * fraction).toInt()
 
-        graphics.fill(barX, barY, barX + barW, barY + 4, opaque(0x333333))
+        // Recessed groove
+        graphics.fill(barX, barY, barX + barW, barY + 5, opaque(0x0A0D0F))
+        graphics.fill(barX, barY, barX + barW, barY + 1, opaque(0x050708))
+        // Progress fill
         if (progressW > 0) {
-            graphics.fill(barX, barY, barX + progressW, barY + 4, opaque(0x55FF55))
+            graphics.fill(barX, barY + 1, barX + progressW, barY + 4, opaque(0x44DD66))
+            graphics.fill(barX, barY + 1, barX + progressW, barY + 2, opaque(0x77FFAA))
         }
+        // Scrubber thumb
         val thumbX = barX + progressW
-        graphics.fill(thumbX - 2, barY - 2, thumbX + 2, barY + 6, opaque(0xFFFFFF))
+        val isHoveredSeek = mouseX in barX..(barX + barW) && mouseY in (barY - 2)..(barY + 7)
+        val thumbW = if (isHoveredSeek || isScrubbing) 6 else 4
+        val thumbH = if (isHoveredSeek || isScrubbing) 9 else 7
+        val thumbColor = if (isHoveredSeek || isScrubbing) opaque(0xFFFFAA) else opaque(0xE0C068)
+        graphics.fill(thumbX - thumbW / 2, barY + 2 - thumbH / 2, thumbX + thumbW / 2, barY + 2 + thumbH / 2, thumbColor)
 
-        // Row 2 extra diagnostics (ping and coverage warning)
-        val ping = PlayerController.currentPingMs()
-        val pingStr = if (ping > 0) "Ping: ${ping}ms" else ""
-        val statusLine = coverageMessage.takeIf { it.isNotEmpty() } ?: readinessMessage
-        val row2Status = if (statusLine.isNotEmpty()) statusLine else pingStr
-        if (row2Status.isNotEmpty()) {
-            val color = if (coverageMessage.isNotEmpty()) opaque(0xFFCC44) else opaque(0x888888)
-            val maxW = (width - 275).coerceAtLeast(50)
-            val disp = if (font.width(row2Status) > maxW) {
-                var cut = row2Status
-                while (cut.isNotEmpty() && font.width("$cut...") > maxW) {
-                    cut = cut.dropLast(1)
+        // 5. Backlit Equalizer / Noteblock Visualizer Strip (jbY + 49, h = 16)
+        val visX = scrX
+        val visY = jbY + 49
+        val visW = scrW
+        val visH = 16
+        val keyCount = 25
+        val colW = visW.toFloat() / keyCount
+
+        // Equalizer casing
+        graphics.fill(visX, visY, visX + visW, visY + visH, opaque(0x0B0E12))
+        graphics.fill(visX, visY, visX + visW, visY + 1, opaque(0x040608))
+
+        for (i in 0 until keyCount) {
+            val kx1 = (visX + i * colW).toInt()
+            val kx2 = (visX + (i + 1) * colW - 1).toInt()
+            val isAccidental = (i % 12) in listOf(0, 2, 4, 7, 9)
+            val restingColor = if (isAccidental) opaque(0x1A1C22) else opaque(0x282B33)
+
+            val pitchState = VisualizerState.getPitchState(i)
+            if (pitchState != null) {
+                val (intensity, color) = pitchState
+                val activeH = (visH * intensity).toInt().coerceIn(2, visH)
+                val fillY = visY + visH - activeH
+
+                // Rising meter gradient
+                graphics.fill(kx1, fillY, kx2, visY + visH, color or 0xFF000000.toInt())
+                // Bright peak highlight
+                graphics.fill(kx1, fillY, kx2, fillY + 1, opaque(0xFFFFFF))
+            } else {
+                graphics.fill(kx1, visY + 1, kx2, visY + visH, restingColor)
+                // Resting baseline dot
+                if (isPlaying) {
+                    val restingPulse = ((Math.sin(System.currentTimeMillis() / 150.0 + i * 0.4) + 1.0) * 1.5).toInt()
+                    graphics.fill(kx1, visY + visH - restingPulse - 1, kx2, visY + visH, opaque(0x354045))
                 }
-                "$cut..."
-            } else row2Status
-            graphics.text(font, disp, 274, height - 20, color)
+            }
         }
     }
 
     private fun renderOrganTab(graphics: GuiGraphicsExtractor, font: net.minecraft.client.gui.Font) {
-        graphics.text(font, "--- Organ Overview & Diagnostics ---", 10, 28, opaque(0x88AAFF))
+        val playable = NoteBlockRegistry.allPlayable()
+        val reachable = PlayerController.organMap?.reachableCount() ?: playable.size
+        val instBlocks = playable.filter { it.instrument == selectedInstrument }
+        val coveredNotes = instBlocks.map { it.noteIndex }.distinct().size
 
-        var cy = 60
-        graphics.text(font, organScanMessage, 10, cy, opaque(0xFFFFFF))
-        cy += 12
+        // Diagnostic summary line (above keyboard)
+        val header = "Organ: ${playable.size} playable ($reachable reachable) | ${selectedInstrument.name}: ${instBlocks.size} blocks ($coveredNotes/25 pitches)"
+        graphics.text(font, header, 10, 48, opaque(0x88AAFF))
 
-        val counts = NoteBlockRegistry.countPerInstrument()
-        counts.entries.forEach { (inst, count) ->
-            if (cy >= height - 42) {
-                graphics.text(font, "... and ${counts.size} instruments total", 10, cy, opaque(0x999999))
-                cy += 9
-                return@forEach
+        // Info below keyboard
+        val vk = virtualKeyboard
+        val bottomY = if (vk != null) vk.y + vk.height + 8 else height - 42
+        graphics.text(font, "Play via mouse click, MIDI device, or PC keyboard (QWERTY layout). Greyed out notes are missing.", 10, bottomY, opaque(0xAAAAAA))
+
+        val t = tuner
+        if (t != null && bottomY + 12 < height - 24) {
+            val stateLabel = when (t.state) {
+                TunerState.TUNING    -> "Tuning..."
+                TunerState.VERIFYING -> "Verifying..."
+                else                 -> ""
             }
-            graphics.text(font, "${inst.name}: $count", 10, cy, opaque(0xDDDDDD))
-            cy += 9
-        }
-
-        if (cy < height - 36) {
-            val t = tuner
-            if (t != null) {
-                val stateLabel = when (t.state) {
-                    TunerState.TUNING    -> "Tuning..."
-                    TunerState.VERIFYING -> "Verifying..."
-                    else                 -> ""
-                }
-                graphics.text(font, "$stateLabel ${t.confirmedBlocks}/${t.total}", 10, cy, opaque(0x44FF88))
-                cy += 10
-                if (tuneStatusMsg.isNotEmpty() && cy < height - 36) {
-                    graphics.text(font, tuneStatusMsg.take(50), 10, cy, opaque(0xCCFFCC))
-                    cy += 9
-                }
-            }
-        }
-
-        if (scaleIndex >= 0 && scaleIndex < scaleNotes.size && cy < height - 36) {
-            val entry = scaleNotes[scaleIndex]
-            graphics.text(font, "Scale: ${midiNoteToName(entry.midiNote)} ($scaleIndex/${scaleNotes.size})", 10, cy, opaque(0xAAFF44))
+            graphics.text(font, "$stateLabel ${t.confirmedBlocks}/${t.total} $tuneStatusMsg", 10, bottomY + 12, opaque(0x44FF88))
         }
 
         // Bottom status
@@ -1124,43 +1539,11 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
             tuner?.isActive == true                               -> "TUNING"
             else                                                  -> "IDLE"
         }
-        graphics.text(font, status, 10, height - 24, opaque(0xAAFFAA))
+        graphics.text(font, status, 10, height - 20, opaque(0xAAFFAA))
         val ping = PlayerController.currentPingMs()
         if (ping > 0) {
-            graphics.text(font, "Ping: ${ping}ms", width - 140, height - 24, opaque(0xAAAAAA))
+            graphics.text(font, "Ping: ${ping}ms", width - 140, height - 20, opaque(0xAAAAAA))
         }
-    }
-
-    private fun renderSettingsTab(graphics: GuiGraphicsExtractor, font: net.minecraft.client.gui.Font) {
-        val cfg = ConfigManager.config
-        graphics.text(font, "--- BlockBard Configuration ---", 14, 28, opaque(0x88AAFF))
-
-        val col1X = 14
-        var sy = 42
-
-        graphics.text(font, "Fast Tuning (batch clicks per tick):", col1X, sy + 4, opaque(0xCCCCCC))
-        sy += 20
-        graphics.text(font, "Smooth Camera Rotation (face blocks):", col1X, sy + 4, opaque(0xCCCCCC))
-        sy += 20
-        graphics.text(font, "Max Notes / Tick: ${cfg.maxNotesPerTick}", col1X, sy + 4, opaque(0xCCCCCC))
-        sy += 20
-        graphics.text(font, "Scan Radius: ${cfg.scanRadius} blocks", col1X, sy + 4, opaque(0xCCCCCC))
-        sy += 20
-        graphics.text(font, "Instrument Shift Mode:", col1X, sy + 4, opaque(0xCCCCCC))
-        sy += 20
-        graphics.text(font, "Verbose Debug Logging:", col1X, sy + 4, opaque(0xCCCCCC))
-        sy += 20
-        graphics.text(font, "Minecraft Controls & Key Binds:", col1X, sy + 4, opaque(0xCCCCCC))
-        sy += 24
-
-        // Rotation tunables note
-        graphics.text(font, "Advanced Tunables (edit config.json to change):", col1X, sy, opaque(0x888888))
-        sy += 10
-        graphics.text(font, "  maxRotationDegreesPerTick: ${cfg.maxRotationDegreesPerTick}", col1X, sy, opaque(0x666666))
-        sy += 9
-        graphics.text(font, "  convergenceThresholdDegrees: ${cfg.rotationConvergenceThresholdDegrees}", col1X, sy, opaque(0x666666))
-        sy += 9
-        graphics.text(font, "  rotationInProgressTimeoutMs: ${cfg.rotationInProgressTimeoutMs}", col1X, sy, opaque(0x666666))
     }
 
     /**
@@ -1242,16 +1625,14 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
     }
 
     override fun mouseClicked(event: MouseButtonEvent, doubleClick: Boolean): Boolean {
-        if (activeTab == 0 && event.button() == 0) {
-            val barY = height - 62
-            if (event.y() >= barY - 4 && event.y() <= barY + 8 && event.x() >= 10 && event.x() <= width - 10) {
+        val jbY = height - 108
+        val barY = jbY + 41
+        val scrX = 6 + 8
+        val scrW = width - 12 - 16
+        if ((activeTab == 0 || activeTab == 1) && event.button() == 0) {
+            if (event.y() >= barY - 4 && event.y() <= barY + 9 && event.x() >= scrX && event.x() <= scrX + scrW) {
                 isScrubbing = true
                 handleScrub(event.x())
-                return true
-            }
-        }
-        if (activeTab == 0 && ::songListWidget.isInitialized && songListWidget.visible) {
-            if (songListWidget.mouseClicked(event, doubleClick)) {
                 return true
             }
         }
@@ -1259,7 +1640,7 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
     }
 
     override fun mouseDragged(event: MouseButtonEvent, dx: Double, dy: Double): Boolean {
-        if (activeTab == 0 && isScrubbing) {
+        if ((activeTab == 0 || activeTab == 1) && isScrubbing) {
             handleScrub(event.x())
             return true
         }
@@ -1275,10 +1656,13 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
     }
 
     private fun handleScrub(mouseX: Double) {
-        val barX = 10
-        val barW = (width - 20).coerceAtLeast(1)
-        val fraction = ((mouseX - barX) / barW.toDouble()).coerceIn(0.0, 1.0)
+        val scrX = 6 + 8
+        val scrW = (width - 12 - 16).coerceAtLeast(1)
+        val fraction = ((mouseX - scrX) / scrW.toDouble()).coerceIn(0.0, 1.0)
+        seekToFraction(fraction)
+    }
 
+    private fun seekToFraction(fraction: Double) {
         if (MidiFilePlayer.isActive() || MidiFilePlayer.isPaused || (MidiFilePlayer.loadedMidi?.file == selectedFile && MidiFilePlayer.loadedMidi != null)) {
             val totalTicks = MidiFilePlayer.getTotalTicks()
             if (totalTicks > 0) {
@@ -1347,12 +1731,19 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
         if (::songListWidget.isInitialized) {
             songListWidget.setFiles(displayedFiles, selectedFile)
         }
+        updateQueueDisplay()
     }
 
     override fun keyPressed(event: KeyEvent): Boolean {
         val keyCode = event.key()
-        if (keyCode in GLFW.GLFW_KEY_1..GLFW.GLFW_KEY_9 && (focused == null || focused !is EditBox)) {
-            if (KeyboardInputHandler.tryDispatch(keyCode)) return true
+        val isEditing = (activeTab == 0 && focused is EditBox && (focused as EditBox).isFocused && (focused as EditBox).visible)
+        if (!isEditing) {
+            val noteIdx = KeyboardInputHandler.getNoteIndex(keyCode)
+            if (noteIdx != null) {
+                virtualKeyboard?.flashKey(noteIdx)
+                KeyboardInputHandler.tryDispatch(keyCode, selectedInstrument)
+                return true
+            }
         }
         return super.keyPressed(event)
     }
@@ -1363,9 +1754,46 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
         minecraft.gui.setScreen(parent)
     }
 
+    override fun extractBackground(graphics: GuiGraphicsExtractor, mouseX: Int, mouseY: Int, partialTick: Float) {
+        super.extractBackground(graphics, mouseX, mouseY, partialTick)
+        // High-contrast dark backdrop so chat and world do not conflict with the menu HUD
+        graphics.fill(0, 0, width, height, 0xD0101014.toInt())
+    }
+
     override fun extractBlurredBackground(graphics: GuiGraphicsExtractor) {
-        // Intentionally empty -- do not blur the background while the GUI is open
+        super.extractBlurredBackground(graphics)
     }
 
     override fun isPauseScreen(): Boolean = false
+
+    companion object {
+        var activeTuner: NoteBlockTuner? = null
+        var currentScreen: MainScreen? = null
+
+        fun onClientTick(mc: net.minecraft.client.Minecraft) {
+            val t = activeTuner ?: return
+            // If MainScreen is not currently open, continue ticking the tuner
+            if (mc.gui.screen() !is MainScreen) {
+                t.onTick()
+                if (t.isDone) {
+                    activeTuner = null
+                    mc.player?.sendSystemMessage(Component.literal("§b[BlockBard] §fTuning complete!"))
+                    OrganScanner.scan()
+                    currentScreen?.let { screen ->
+                        if (screen.pendingAutoPlay && screen.pendingNextFile == null) {
+                            screen.pendingAutoPlay = false
+                            screen.startPlayback()
+                        }
+                    }
+                } else if (t.isFailed) {
+                    activeTuner = null
+                    currentScreen?.let {
+                        it.pendingAutoPlay = false
+                        it.pendingNextFile = null
+                    }
+                    mc.player?.sendSystemMessage(Component.literal("§b[BlockBard] §cTuning failed -- check logs for details"))
+                }
+            }
+        }
+    }
 }
