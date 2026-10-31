@@ -22,7 +22,7 @@ silently out of sync) is why this file keeps getting rewritten.
 |---|---|
 | Mod name | BlockBard |
 | Loader | Fabric |
-| MC version | **26.x (`>=26.1 <27.0`)** (compiled against `26.2`, compatible with 26.1, 26.2, 26.3+) |
+| MC version | **26.x (`>=26.1 <27.0`)** (compiled against `26.3`, compatible with 26.1, 26.2, 26.3+) |
 | Mapping layer | **None** — Minecraft ships unobfuscated Mojang names from 26.1 onward; no Yarn/Intermediary step needed |
 | Language | Kotlin |
 | Entry point | `BlockBardClient : ClientModInitializer` |

@@ -13,6 +13,7 @@ import kyrielie.blockbard.client.player.SoundVerifier
 import kyrielie.blockbard.organ.ArpeggioScheduler
 import kyrielie.blockbard.organ.InstrumentShifter
 import kyrielie.blockbard.client.organ.OrganScanner
+import kyrielie.blockbard.organ.NoteBlockRegistry
 import kyrielie.blockbard.util.DebugLog
 import net.fabricmc.api.ClientModInitializer
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents
@@ -29,6 +30,7 @@ object BlockBardClient : ClientModInitializer {
     private lateinit var openGuiKey: KeyMapping
     private lateinit var toggleHudKey: KeyMapping
     private var soundVerifierRegistered = false
+    private var liveSyncTicker = 0
 
     override fun onInitializeClient() {
         logger.info("BlockBard initializing...")
@@ -102,6 +104,12 @@ object BlockBardClient : ClientModInitializer {
                 mc.soundManager.addListener(SoundVerifier)
                 soundVerifierRegistered = true
                 logger.info("SoundVerifier registered as a SoundEventListener")
+            }
+
+            liveSyncTicker++
+            if (liveSyncTicker >= 20) {
+                liveSyncTicker = 0
+                mc.level?.let { NoteBlockRegistry.refreshLiveNoteValues(it) }
             }
 
             while (openGuiKey.consumeClick()) {
