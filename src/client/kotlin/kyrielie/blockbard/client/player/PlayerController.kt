@@ -5,6 +5,7 @@ import kyrielie.blockbard.organ.NoteBlockRegistry
 import kyrielie.blockbard.organ.NoteRequest
 import kyrielie.blockbard.organ.OrganMap
 import kyrielie.blockbard.organ.ReachInfo
+import kyrielie.blockbard.util.BlockBardLogBuffer
 import kyrielie.blockbard.util.DebugLog
 import kyrielie.blockbard.util.vecToYawPitch
 import net.minecraft.client.Minecraft
@@ -75,38 +76,125 @@ object PlayerController {
     }
 
     /**
-     * Builds the OrganMap from the player's current actual position.
-     * Does NOT move the player.
+     * Checks if the cached organMap is still valid for the player's current position.
+     * Returns false if organMap is null or player has moved from standPos.
      */
-    fun centerOnOrgan(): CenterResult {
+    fun isOrganMapValid(): Boolean {
+        val map = organMap ?: return false
+        val player = Minecraft.getInstance().player ?: return false
+        val currentPos = player.blockPosition()
+        return currentPos.distManhattan(map.standPos) <= 1
+    }
+
+    /**
+     * Reconfirms noteblocks around the player:
+     * 1. Performs a live scan of blockstates around the player's current position.
+     * 2. Rebuilds the OrganMap from the player's live eye position (without moving the player).
+     * Returns true if playable blocks were found and at least one is reachable.
+     */
+    fun reconfirmOrgan(): Boolean {
         val mc = Minecraft.getInstance()
         val player = mc.player ?: run {
-            logger.warn("centerOnOrgan: no player")
+            logger.warn("reconfirmOrgan: no player")
+            return false
+        }
+        kyrielie.blockbard.client.organ.OrganScanner.scan()
+        val result = centerOnOrgan(movePlayer = false)
+        return when (result) {
+            is CenterResult.Centered -> result.reachableCount > 0
+            else -> false
+        }
+    }
+
+    /**
+     * Builds or recalibrates the OrganMap from the player's position.
+     * When [movePlayer] is true (governed by ConfigManager.config.centerMovesPlayer),
+     * physically snaps the player to the center of the standing block.
+     * When false (default), calibrates the reach map from the player's current position without moving.
+     */
+    fun centerOnOrgan(movePlayer: Boolean = kyrielie.blockbard.client.config.ConfigManager.config.centerMovesPlayer): CenterResult {
+        val mc = Minecraft.getInstance()
+        val player = mc.player ?: run {
+            val err = "centerOnOrgan: no player found"
+            logger.warn(err)
+            BlockBardLogBuffer.warn("PlayerController", err)
             return CenterResult.NoPlayer
         }
 
         logEnvironmentBanner("centerOnOrgan")
 
         val playableBlocks = NoteBlockRegistry.allPlayable()
-        logger.info("centerOnOrgan: ${playableBlocks.size} playable blocks, player at ${player.position()} eyeHeight=${player.getEyeHeight()} ping=${currentPingMs()}")
-        if (playableBlocks.isEmpty()) return CenterResult.NoBlocks
+        if (playableBlocks.isEmpty()) {
+            val err = "centerOnOrgan: no playable noteblocks found in registry"
+            logger.warn(err)
+            BlockBardLogBuffer.warn("PlayerController", err)
+            return CenterResult.NoBlocks
+        }
 
         val playerPos = player.blockPosition()
-        buildOrganMap(playableBlocks, playerPos, player.getEyeHeight())
+        val eyeHeight = player.getEyeHeight()
+        val standPos: BlockPos
+
+        if (movePlayer) {
+            // Search candidate positions in a 5x5 horizontal grid around player
+            // to find the position that maximizes reachable playable noteblocks.
+            var bestPos = playerPos
+            var maxReachable = -1
+            var bestDistSq = Double.MAX_VALUE
+
+            for (dx in -2..2) {
+                for (dz in -2..2) {
+                    val candidate = BlockPos(playerPos.x + dx, playerPos.y, playerPos.z + dz)
+                    val candEye = Vec3(candidate.x + 0.5, candidate.y + eyeHeight.toDouble(), candidate.z + 0.5)
+                    val reachable = playableBlocks.count { entry ->
+                        val target = Vec3(entry.pos.x + 0.5, entry.pos.y + 0.5, entry.pos.z + 0.5)
+                        target.distanceTo(candEye) <= (REACH_DISTANCE + 0.5)
+                    }
+                    val distSq = (dx * dx + dz * dz).toDouble()
+                    if (reachable > maxReachable || (reachable == maxReachable && distSq < bestDistSq)) {
+                        maxReachable = reachable
+                        bestDistSq = distSq
+                        bestPos = candidate
+                    }
+                }
+            }
+
+            val targetX = bestPos.x + 0.5
+            val targetZ = bestPos.z + 0.5
+            val moved = player.x != targetX || player.z != targetZ
+            player.setPos(targetX, player.y, targetZ)
+            player.setDeltaMovement(0.0, 0.0, 0.0)
+            standPos = bestPos
+
+            val moveDesc = if (moved) "Centered player at ($targetX, ${player.y}, $targetZ)" else "Player already at center ($targetX, ${player.y}, $targetZ)"
+            logger.info("centerOnOrgan: $moveDesc")
+            BlockBardLogBuffer.info("PlayerController", moveDesc)
+        } else {
+            standPos = playerPos
+            logger.info("centerOnOrgan: calibrated from player pos $standPos (player not moved)")
+            BlockBardLogBuffer.info("PlayerController", "Calibrated from player pos $standPos (player not moved)")
+        }
+
+        buildOrganMap(playableBlocks, standPos, eyeHeight)
 
         val map = organMap!!
         val reachableCount = map.reachableCount()
         val unreachable = playableBlocks.filter { !map.isReachable(it.pos) }
+
+        val statusMsg = "Reachable: $reachableCount/${playableBlocks.size} from $standPos"
+        logger.info("centerOnOrgan: $statusMsg")
+        BlockBardLogBuffer.info("PlayerController", statusMsg)
+
         if (unreachable.isNotEmpty()) {
-            logger.warn("centerOnOrgan: ${unreachable.size} blocks out of reach from $playerPos:")
-            unreachable.forEach { e ->
-                val dist = player.eyePosition.distanceTo(Vec3(e.pos.x + 0.5, e.pos.y + 1.0, e.pos.z + 0.5))
-                logger.warn("  unreachable: ${e.pos} dist=${"%.2f".format(dist)} instrument=${e.instrument.name}")
+            val unreachSummary = unreachable.joinToString("; ") { e ->
+                val dist = player.eyePosition.distanceTo(Vec3(e.pos.x + 0.5, e.pos.y + 0.5, e.pos.z + 0.5))
+                "${e.pos} (${e.instrument.name}, dist=${"%.2f".format(dist)})"
             }
+            logger.warn("centerOnOrgan: ${unreachable.size} blocks out of reach: $unreachSummary")
+            BlockBardLogBuffer.warn("PlayerController", "${unreachable.size} blocks out of reach: $unreachSummary")
         }
 
-        logger.info("centerOnOrgan: map built -- $reachableCount/${playableBlocks.size} reachable from player position")
-        return CenterResult.Centered(playerPos, reachableCount, playableBlocks.size)
+        return CenterResult.Centered(standPos, reachableCount, playableBlocks.size)
     }
 
     private fun buildOrganMap(playableBlocks: List<kyrielie.blockbard.organ.NoteBlockEntry>, standPos: BlockPos, eyeHeight: Float) {
@@ -114,10 +202,10 @@ object PlayerController {
         val actualEyePos = mc.player?.eyePosition
             ?: Vec3(standPos.x + 0.5, standPos.y + eyeHeight.toDouble(), standPos.z + 0.5)
         val reachMap = playableBlocks.associate { entry ->
-            val target = Vec3(entry.pos.x + 0.5, entry.pos.y + 1.0, entry.pos.z + 0.5)
+            val target = Vec3(entry.pos.x + 0.5, entry.pos.y + 0.5, entry.pos.z + 0.5)
             val delta = target.subtract(actualEyePos)
             val distance = delta.length()
-            val isReachable = distance <= REACH_DISTANCE
+            val isReachable = distance <= (REACH_DISTANCE + 0.5)
             val (yaw, pitch) = if (isReachable) vecToYawPitch(delta) else Pair(0f, 0f)
             entry.pos to ReachInfo(isReachable, yaw, pitch, distance)
         }
@@ -199,6 +287,64 @@ object PlayerController {
     }
 
     /**
+     * Determines the optimal visible face and hit target vector on [pos] from [eyePos],
+     * testing visible candidates using line-of-sight raycasts (Mineflayer digging/ray_trace model).
+     */
+    private fun findBestVisibleFace(
+        world: net.minecraft.world.level.Level,
+        player: net.minecraft.world.entity.player.Player,
+        eyePos: Vec3,
+        pos: BlockPos
+    ): Pair<Vec3, Direction>? {
+        val cx = pos.x + 0.5
+        val cy = pos.y + 0.5
+        val cz = pos.z + 0.5
+        val dx = eyePos.x - cx
+        val dy = eyePos.y - cy
+        val dz = eyePos.z - cz
+
+        // Prioritize faces pointing towards player eye position
+        val candidates = mutableListOf<Direction>()
+        if (dy > 0.1) candidates.add(Direction.UP) else if (dy < -0.1) candidates.add(Direction.DOWN)
+        if (Math.abs(dx) > Math.abs(dz)) {
+            if (dx > 0) candidates.add(Direction.EAST) else candidates.add(Direction.WEST)
+            if (dz > 0) candidates.add(Direction.SOUTH) else candidates.add(Direction.NORTH)
+        } else {
+            if (dz > 0) candidates.add(Direction.SOUTH) else candidates.add(Direction.NORTH)
+            if (dx > 0) candidates.add(Direction.EAST) else candidates.add(Direction.WEST)
+        }
+        for (dir in Direction.entries) {
+            if (dir !in candidates) candidates.add(dir)
+        }
+
+        for (face in candidates) {
+            val target = when (face) {
+                Direction.UP -> Vec3(cx, pos.y + 1.0, cz)
+                Direction.DOWN -> Vec3(cx, pos.y + 0.0, cz)
+                Direction.NORTH -> Vec3(cx, cy, pos.z + 0.0)
+                Direction.SOUTH -> Vec3(cx, cy, pos.z + 1.0)
+                Direction.WEST -> Vec3(pos.x + 0.0, cy, cz)
+                Direction.EAST -> Vec3(pos.x + 1.0, cy, cz)
+            }
+            val maxReach = REACH_DISTANCE + 0.5
+            if (target.distanceTo(eyePos) > maxReach) continue
+
+            val clipCtx = ClipContext(
+                eyePos,
+                target,
+                ClipContext.Block.OUTLINE,
+                ClipContext.Fluid.NONE,
+                player
+            )
+            val clipHit = world.clip(clipCtx)
+            if (clipHit.type == HitResult.Type.MISS || clipHit.blockPos == pos) {
+                return Pair(target, face)
+            }
+        }
+        return null
+    }
+
+    /**
      * Aims at [pos] -- shared by interactWith() (tuning, right-click) and
      * playNoteAt() (playback, left-click). Returns the BlockHitResult, or null if
      * the block is out of reach.
@@ -215,70 +361,59 @@ object PlayerController {
         }
 
         val eyePos = player.eyePosition
-        val target = Vec3(pos.x + 0.5, pos.y + 1.0, pos.z + 0.5)
+        val world = mc.level ?: run {
+            logger.warn("$caller $pos: no level")
+            return null
+        }
+
+        val maxReach = REACH_DISTANCE + 0.5
+
+        // Multi-face visible raycasting inspired by Mineflayer (ray_trace & digging)
+        val (target, hitFace) = findBestVisibleFace(world, player, eyePos, pos) ?: run {
+            val defaultTarget = Vec3(pos.x + 0.5, pos.y + 0.5, pos.z + 0.5)
+            val dist = defaultTarget.distanceTo(eyePos)
+            if (dist > maxReach) {
+                val warn = "$caller $pos: beyond maximum reach (dist=${"%.2f".format(dist)} max=$maxReach)"
+                logger.warn(warn)
+                BlockBardLogBuffer.warn("PlayerController", warn)
+                return null
+            }
+            // Fallback directional face if line-of-sight is obstructed by neighboring noteblocks
+            val delta = defaultTarget.subtract(eyePos)
+            val face = when {
+                Math.abs(delta.x) > Math.abs(delta.y) && Math.abs(delta.x) > Math.abs(delta.z) ->
+                    if (delta.x > 0) Direction.WEST else Direction.EAST
+                Math.abs(delta.y) > Math.abs(delta.z) ->
+                    if (delta.y > 0) Direction.DOWN else Direction.UP
+                else ->
+                    if (delta.z > 0) Direction.NORTH else Direction.SOUTH
+            }
+            Pair(defaultTarget, face)
+        }
+
         val delta = target.subtract(eyePos)
         val distance = delta.length()
         val reach = organMap?.getReachInfo(pos)
         val mapDistStr = reach?.distance?.let { "%.2f".format(it) } ?: "n/a"
-
-        if (distance > REACH_DISTANCE) {
-            logger.warn(
-                "$caller $pos: too far liveDist=${"%.2f".format(distance)} mapDist=$mapDistStr " +
-                    "clientPos=${player.position()} ping=${currentPingMs()}"
-            )
-            return null
-        }
-
-        // Raycast line-of-sight check: ensure no solid block obstructs the line to target
-        val world = mc.level
-        if (world != null) {
-            val clipCtx = ClipContext(
-                eyePos,
-                target,
-                ClipContext.Block.OUTLINE,
-                ClipContext.Fluid.NONE,
-                player
-            )
-            val clipHit = world.clip(clipCtx)
-            if (clipHit.type == HitResult.Type.BLOCK && clipHit.blockPos != pos) {
-                logger.warn("$caller $pos: raycast occluded by ${clipHit.blockPos} (${world.getBlockState(clipHit.blockPos).block.name.string})")
-                return null
-            }
-        }
 
         val (yaw, pitch) = primedRotation?.takeIf { it.first == pos }
             ?.let { Pair(it.second, it.third) }
             ?: (reach?.let { Pair(it.yaw, it.pitch) } ?: vecToYawPitch(delta))
         primedRotation = null
 
+        // Face the target block and immediately notify the server so raycast validation passes
         if (kyrielie.blockbard.client.config.ConfigManager.config.smoothCameraRotation) {
-            val yRotBefore = player.yRot
-            val xRotBefore = player.xRot
             player.setYRot(yaw)
             player.setXRot(pitch)
-            val yRotAfter = player.yRot
-            val xRotAfter = player.xRot
-            if (yRotAfter != yaw || xRotAfter != pitch) {
-                logger.warn(
-                    "$caller $pos: rotation override detected -- wanted yaw=${"%.2f".format(yaw)} pitch=${"%.2f".format(pitch)}" +
-                        " got yaw=${"%.2f".format(yRotAfter)} pitch=${"%.2f".format(xRotAfter)}"
-                )
-            }
-            DebugLog.info(logger) {
-                "$caller $pos: rot ${"%.2f".format(yRotBefore)},${"%.2f".format(xRotBefore)}" +
-                    " -> ${"%.2f".format(yRotAfter)},${"%.2f".format(xRotAfter)}" +
-                    " liveDist=${"%.2f".format(distance)} mapDist=$mapDistStr ping=${currentPingMs()}"
-            }
         }
-
-        val hitFace = when {
-            Math.abs(delta.x) > Math.abs(delta.y) && Math.abs(delta.x) > Math.abs(delta.z) ->
-                if (delta.x > 0) Direction.WEST else Direction.EAST
-            Math.abs(delta.y) > Math.abs(delta.z) ->
-                if (delta.y > 0) Direction.DOWN else Direction.UP
-            else ->
-                if (delta.z > 0) Direction.NORTH else Direction.SOUTH
-        }
+        player.connection.send(
+            net.minecraft.network.protocol.game.ServerboundMovePlayerPacket.Rot(
+                yaw,
+                pitch,
+                player.onGround(),
+                player.horizontalCollision
+            )
+        )
 
         val liveHit = mc.hitResult
         return if (
@@ -289,7 +424,7 @@ object PlayerController {
             logger.debug("$caller $pos: using live hitResult face=${liveHit.direction}")
             liveHit
         } else {
-            logger.debug("$caller $pos: using synthetic face=$hitFace")
+            logger.debug("$caller $pos: using target face=$hitFace")
             BlockHitResult(target, hitFace, pos, false)
         }
     }
@@ -316,8 +451,23 @@ object PlayerController {
             return false
         }
 
+        // Ensure main hand is empty so NoteBlock.useWithoutItem is triggered instead of item usage
+        if (!player.mainHandItem.isEmpty) {
+            val emptySlot = (0..8).firstOrNull { player.inventory.getItem(it).isEmpty }
+            if (emptySlot != null) {
+                player.inventory.selectedSlot = emptySlot
+                player.connection.send(net.minecraft.network.protocol.game.ServerboundSetCarriedItemPacket(emptySlot))
+                logger.info("interactWith: switched to empty hotbar slot $emptySlot")
+            } else {
+                val warn = "Cannot interact with $pos: hotbar has no empty slots"
+                logger.warn("interactWith $pos: $warn")
+                BlockBardLogBuffer.warn("PlayerController", warn)
+                return false
+            }
+        }
+
         val hitResult = aimAt(pos, "interactWith") ?: return false
-        mc.gameMode?.useItemOn(player, InteractionHand.MAIN_HAND, hitResult)
+        val result = mc.gameMode?.useItemOn(player, InteractionHand.MAIN_HAND, hitResult)
         return true
     }
 
@@ -374,6 +524,31 @@ object PlayerController {
         val expectedInstrument = request.instrument ?: NoteBlockRegistry.get(pos)?.instrument
         SoundVerifier.expectNote(pos, request.midiNote, expectedInstrument)
         return playNoteAt(pos)
+    }
+
+    /**
+     * Dynamic on-the-fly retuning: right-clicks the noteblock once, which advances
+     * state.cycle(NOTE) by 1 and immediately plays the new note at note onset.
+     * Updates NoteBlockRegistry and registers SoundVerifier expectation.
+     */
+    fun retuneAndPlayNoteAt(pos: BlockPos, request: NoteRequest): Boolean {
+        val entry = NoteBlockRegistry.get(pos) ?: return playNoteAt(pos, request)
+        val newNoteIndex = (entry.noteIndex + 1) % 25
+        val expectedInstrument = request.instrument ?: entry.instrument
+        SoundVerifier.expectNote(pos, request.midiNote, expectedInstrument)
+        val success = interactWith(pos)
+        if (success) {
+            NoteBlockRegistry.updateTunedNote(pos, newNoteIndex)
+            val level = Minecraft.getInstance().level
+            if (level != null) {
+                level.addParticle(
+                    ParticleTypes.NOTE,
+                    pos.x + 0.5, pos.y + 1.2, pos.z + 0.5,
+                    newNoteIndex / 24.0, 0.0, 0.0
+                )
+            }
+        }
+        return success
     }
 
     fun clearOrganMap() {
