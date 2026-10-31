@@ -48,30 +48,54 @@ object MidiToOrganMapper {
         noteUsageCounts: Map<NotePitch, Int>,
         reachableBlocks: List<NoteBlockEntry>
     ): OrganAssignment {
-        // Prune before assignment: if any instrument has more than 25 blocks, only keep
-        // the 25 most useful (by distinct noteIndex, then closest distance). Excess blocks
-        // beyond 25 can never hold a unique pitch and would silently waste assignment slots.
-        val prunedBlocks = pruneOverflowBlocks(reachableBlocks)
-
         val assignment = mutableMapOf<NotePitch, BlockPos>()
         val unplayable = mutableListOf<NotePitch>()
         val shifts = mutableMapOf<NotePitch, Int>()
         val usedPositions = mutableSetOf<BlockPos>()
 
         val sortedNotes = noteUsageCounts.entries.sortedByDescending { it.value }.map { it.key }
-        logger.info("buildAssignment: ${sortedNotes.size} distinct notes, ${prunedBlocks.size} reachable blocks (${reachableBlocks.size} before overflow pruning)")
+        logger.info("buildAssignment: ${sortedNotes.size} distinct notes, ${reachableBlocks.size} reachable blocks")
 
+        // Pass 1: Exact matches (0 clicks needed).
+        // If an available reachable block is ALREADY tuned to the exact pitch needed for a note,
+        // assign it immediately. This preserves the organ's existing tuning and prevents
+        // unnecessary retuning across songs (minimal tuning like DiscJockey).
+        val unassignedNotes = mutableListOf<NotePitch>()
         for (note in sortedNotes) {
             val midiNote = note.midiNote
-            val available = prunedBlocks.filter { it.pos !in usedPositions }
+            val available = reachableBlocks.filter { it.pos !in usedPositions }
             val instrumentFiltered = if (note.instrument != null) {
                 available.filter { it.instrument == note.instrument }
             } else {
                 available
             }
 
-            // Among blocks whose instrument natively covers this note, prefer the one
-            // needing the fewest tuning clicks, tie-broken by distance.
+            val exactMatch = instrumentFiltered
+                .filter { it.instrument.coversNatively(midiNote) && it.noteIndex == (midiNote - it.instrument.midiBase) }
+                .minByOrNull { it.distanceFromPlayer }
+
+            if (exactMatch != null) {
+                assignment[note] = exactMatch.pos
+                usedPositions.add(exactMatch.pos)
+                shifts[note] = 0
+                logger.debug("  ${note.displayName()} -> ${exactMatch.pos} (${exactMatch.instrument.name}, exact 0-click match)")
+            } else {
+                unassignedNotes.add(note)
+            }
+        }
+
+        // Pass 2: Minimal-click assignment for notes that didn't have an exact match.
+        // For each remaining note, find the available block of matching instrument that requires
+        // the fewest clicks, tie-broken by distance.
+        for (note in unassignedNotes) {
+            val midiNote = note.midiNote
+            val available = reachableBlocks.filter { it.pos !in usedPositions }
+            val instrumentFiltered = if (note.instrument != null) {
+                available.filter { it.instrument == note.instrument }
+            } else {
+                available
+            }
+
             val nativeCandidate = instrumentFiltered
                 .filter { it.instrument.coversNatively(midiNote) }
                 .minWithOrNull(
@@ -85,7 +109,8 @@ object MidiToOrganMapper {
                 assignment[note] = nativeCandidate.pos
                 usedPositions.add(nativeCandidate.pos)
                 shifts[note] = 0
-                logger.debug("  ${note.displayName()} -> ${nativeCandidate.pos} (${nativeCandidate.instrument.name}, native)")
+                val clicks = clicksNeeded(nativeCandidate.noteIndex, midiNote - nativeCandidate.instrument.midiBase)
+                logger.debug("  ${note.displayName()} -> ${nativeCandidate.pos} (${nativeCandidate.instrument.name}, native, clicks=$clicks)")
                 continue
             }
 
@@ -105,18 +130,22 @@ object MidiToOrganMapper {
         val voicePools = mutableMapOf<NotePitch, MutableList<BlockPos>>()
         assignment.forEach { (note, pos) -> voicePools[note] = mutableListOf(pos) }
 
-        // Polyphonic voice expansion: allocate remaining reachable blocks to duplicate voice pools
+        // Polyphonic voice expansion:
+        // Allocate remaining reachable blocks to duplicate voice pools ONLY IF the block
+        // is ALREADY tuned to that note (0 clicks needed).
+        // NEVER retune an unassigned block just to make it a duplicate voice!
         val unassignedBlocks = reachableBlocks.filter { it.pos !in usedPositions }
         for (unused in unassignedBlocks) {
             val matchingNote = sortedNotes.firstOrNull { note ->
                 note.instrument == unused.instrument &&
                 assignment.containsKey(note) &&
-                unused.instrument.coversNatively(note.midiNote + (shifts[note] ?: 0))
+                unused.instrument.coversNatively(note.midiNote + (shifts[note] ?: 0)) &&
+                unused.noteIndex == (note.midiNote + (shifts[note] ?: 0) - unused.instrument.midiBase)
             }
             if (matchingNote != null) {
                 voicePools.getOrPut(matchingNote) { mutableListOf() }.add(unused.pos)
                 usedPositions.add(unused.pos)
-                logger.debug("  Duplicate voice: ${matchingNote.displayName()} pool += ${unused.pos}")
+                logger.debug("  Duplicate voice (existing pitch): ${matchingNote.displayName()} pool += ${unused.pos}")
             }
         }
 
@@ -124,52 +153,7 @@ object MidiToOrganMapper {
         return OrganAssignment(assignment, unplayable, shifts, voicePools)
     }
 
-    /**
-     * Removes blocks beyond 25 per instrument from the assignment pool.
-     *
-     * When an instrument has more than 25 blocks, not all of them can hold unique
-     * pitches (noteIndex 0-24 are the only 25 available). The excess blocks would
-     * compete for assignment slots but could never be tuned to a note the first 25
-     * can't already cover. Keeping them in the pool allows the mapper to accidentally
-     * assign them and waste a slot, leaving a genuinely useful block of a different
-     * instrument unassigned.
-     *
-     * Pruning strategy: sort by noteIndex (spread coverage across the range), then by
-     * distance (prefer closer blocks for equal noteIndex). Take distinct noteIndex values
-     * first (one block per pitch), then fill remaining slots up to 25 with closest
-     * duplicates in case some blocks have the same current note and can be retuned.
-     */
-    private fun pruneOverflowBlocks(blocks: List<NoteBlockEntry>): List<NoteBlockEntry> {
-        val byInstrument = blocks.groupBy { it.instrument }
-        return byInstrument.flatMap { (instrument, entries) ->
-            if (entries.size <= 25) {
-                entries
-            } else {
-                // First pass: one block per distinct noteIndex, closest wins.
-                val byNoteIndex = entries
-                    .sortedBy { it.distanceFromPlayer }
-                    .groupBy { it.noteIndex }
-                val distinctBest = byNoteIndex.values.map { it.first() } // closest per noteIndex
 
-                val kept = if (distinctBest.size >= 25) {
-                    // More than 25 distinct noteIndex values is impossible (0-24 only),
-                    // but defensively take the first 25 sorted by noteIndex.
-                    distinctBest.sortedBy { it.noteIndex }.take(25)
-                } else {
-                    // Fewer than 25 distinct noteIndex values -- fill remaining slots
-                    // with closest duplicates so the mapper has 25 candidates to work with.
-                    val remaining = entries
-                        .filter { it !in distinctBest }
-                        .sortedBy { it.distanceFromPlayer }
-                    (distinctBest + remaining).take(25)
-                }
-
-                val dropped = entries.size - kept.size
-                logger.warn("pruneOverflowBlocks: dropped $dropped excess ${instrument.name} blocks (had ${entries.size}, keeping ${kept.size})")
-                kept
-            }
-        }
-    }
 
     /**
      * Computes the target note index for each assigned block.

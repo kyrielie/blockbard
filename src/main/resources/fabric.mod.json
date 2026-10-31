@@ -33,7 +33,8 @@
     "minecraft": ">=26.1 <27.0",
     "java": ">=25",
     "fabric-api": "*",
-    "fabric-language-kotlin": "*"
+    "fabric-language-kotlin": "*",
+    "yet_another_config_lib_v3": ">=3.9.7"
   },
   "recommends": {
     "modmenu": "*"
