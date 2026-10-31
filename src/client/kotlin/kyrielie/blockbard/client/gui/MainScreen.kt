@@ -77,26 +77,22 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
     private lateinit var playPauseBtn: Button
     private lateinit var loopBtn: Button
 
-    private val playableInstruments = listOf(
-        NoteBlockInstrument.HARP,
-        NoteBlockInstrument.BASEDRUM,
-        NoteBlockInstrument.SNARE,
-        NoteBlockInstrument.HAT,
-        NoteBlockInstrument.BASS,
-        NoteBlockInstrument.FLUTE,
-        NoteBlockInstrument.BELL,
-        NoteBlockInstrument.GUITAR,
-        NoteBlockInstrument.CHIME,
-        NoteBlockInstrument.XYLOPHONE,
-        NoteBlockInstrument.IRON_XYLOPHONE,
-        NoteBlockInstrument.COW_BELL,
-        NoteBlockInstrument.DIDGERIDOO,
-        NoteBlockInstrument.BIT,
-        NoteBlockInstrument.BANJO,
-        NoteBlockInstrument.PLING
-    )
+    // Dynamic list of all tunable instruments (includes all 20 instruments including Trumpet variants)
+    private val playableInstruments = NoteBlockInstrument.entries.filter { it.isTunable }
     private var selectedInstrumentIndex: Int = 0
     val selectedInstrument: NoteBlockInstrument get() = playableInstruments[selectedInstrumentIndex]
+
+    private fun formatInstrumentName(inst: NoteBlockInstrument): String = when (inst) {
+        NoteBlockInstrument.IRON_XYLOPHONE    -> "Iron Xylo"
+        NoteBlockInstrument.TRUMPET           -> "Trumpet"
+        NoteBlockInstrument.TRUMPET_EXPOSED   -> "Trp (Exposed)"
+        NoteBlockInstrument.TRUMPET_WEATHERED -> "Trp (Weath)"
+        NoteBlockInstrument.TRUMPET_OXIDIZED  -> "Trp (Oxid)"
+        NoteBlockInstrument.DIDGERIDOO        -> "Didgeridoo"
+        NoteBlockInstrument.COW_BELL          -> "Cowbell"
+        NoteBlockInstrument.BASEDRUM          -> "Basedrum"
+        else -> inst.name.lowercase().replaceFirstChar { it.uppercase() }
+    }
     private var virtualKeyboard: VirtualKeyboardWidget? = null
     private var instBtn: Button? = null
 
@@ -324,20 +320,20 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
         tab2(addRenderableWidget(Button.builder(Component.literal("<")) {
             selectedInstrumentIndex = (selectedInstrumentIndex - 1 + playableInstruments.size) % playableInstruments.size
             virtualKeyboard?.instrument = selectedInstrument
-            instBtn?.message = Component.literal(selectedInstrument.name)
+            instBtn?.message = Component.literal(formatInstrumentName(selectedInstrument))
         }.pos(10, organBtnY).size(20, 16).build()))
 
-        val buttonInst = tab2(addRenderableWidget(Button.builder(Component.literal(selectedInstrument.name)) {
+        val buttonInst = tab2(addRenderableWidget(Button.builder(Component.literal(formatInstrumentName(selectedInstrument))) {
             selectedInstrumentIndex = (selectedInstrumentIndex + 1) % playableInstruments.size
             virtualKeyboard?.instrument = selectedInstrument
-            instBtn?.message = Component.literal(selectedInstrument.name)
+            instBtn?.message = Component.literal(formatInstrumentName(selectedInstrument))
         }.pos(32, organBtnY).size(92, 16).build()))
         instBtn = buttonInst
 
         tab2(addRenderableWidget(Button.builder(Component.literal(">")) {
             selectedInstrumentIndex = (selectedInstrumentIndex + 1) % playableInstruments.size
             virtualKeyboard?.instrument = selectedInstrument
-            instBtn?.message = Component.literal(selectedInstrument.name)
+            instBtn?.message = Component.literal(formatInstrumentName(selectedInstrument))
         }.pos(126, organBtnY).size(20, 16).build()))
 
         // Organ Utility Buttons
@@ -373,6 +369,18 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
             btn.message = Component.literal(if (MaterialsShoppingOverlay.isVisible) "Hide Mats" else "Mats")
             chat("Materials overlay ${if (MaterialsShoppingOverlay.isVisible) "shown" else "hidden"}")
         }.pos(332, organBtnY).size(46, 16).build()))
+
+        tab2(addRenderableWidget(Button.builder(Component.literal(if (kyrielie.blockbard.client.render.OrganOverlayRenderer.isEnabled) "Holo: ON" else "Holo: OFF")) { btn ->
+            val on = kyrielie.blockbard.client.render.OrganOverlayRenderer.toggle()
+            btn.message = Component.literal(if (on) "Holo: ON" else "Holo: OFF")
+            chat("Organ hologram ${if (on) "enabled" else "disabled"}")
+        }.pos(380, organBtnY).size(56, 16).build()))
+
+        tab2(addRenderableWidget(Button.builder(Component.literal(if (kyrielie.blockbard.client.render.OrganBlueprintBuilder.isEnabled) "Stage: ON" else "Stage: OFF")) { btn ->
+            val on = kyrielie.blockbard.client.render.OrganBlueprintBuilder.toggle()
+            btn.message = Component.literal(if (on) "Stage: ON" else "Stage: OFF")
+            chat("Stage blueprint guide ${if (on) "enabled" else "disabled"}")
+        }.pos(438, organBtnY).size(58, 16).build()))
 
         // Virtual Piano Keyboard Widget
         val kbW = (width - 20).coerceAtMost(480)
@@ -855,7 +863,9 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
                 chatWarn("${names.size} notes unplayable: ${names.take(6).joinToString()}")
             }
             updateCoverageMessage(result)
-            return MidiToOrganMapper.computeTuneTargets(result, reachable)
+            val targets = MidiToOrganMapper.computeTuneTargets(result, reachable)
+            kyrielie.blockbard.client.render.OrganOverlayRenderer.activeTargets = targets.associate { it.pos to it.targetNote }
+            return targets
         }
 
         val midi = if (forceChromatic) null else MidiFilePlayer.loadedMidi
@@ -949,6 +959,18 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
             fastTuning        = ConfigManager.config.fastTuning,
             primeRotation     = { pos -> PlayerController.primeRotation(pos, isTuning = true) },
             rotationConverged = { pos -> PlayerController.rotationConverged(pos, isTuning = true) },
+            diagnoseFailState = { pos, _, _ ->
+                PlayerController.diagnoseBlockInteractability(pos)
+            },
+            onBlockFailed     = { target, failState, _, _ ->
+                NoteBlockRegistry.markUntunable(target.pos, failState)
+                kyrielie.blockbard.client.render.ManualTuningHighlighter.add(
+                    target.pos,
+                    target.instrument,
+                    target.targetNote,
+                    failState
+                )
+            },
             onProgress        = { done, total, msg ->
                 tuneStatusMsg = "$done/$total -- $msg"
                 logger.debug("tuner progress: $tuneStatusMsg")
@@ -972,6 +994,7 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
         tuner = null
         activeTuner = null
         tuneStatusMsg = ""
+        kyrielie.blockbard.client.render.OrganOverlayRenderer.activeTargets = emptyMap()
     }
 
     private fun updateCoverageMessage(result: OrganAssignment) {
@@ -1373,8 +1396,8 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
                 tuneStatusMsg = ""
                 pendingAutoPlay = false
                 pendingNextFile = null
-                chatWarn("Tuning failed: $reason")
-                logger.warn("tick: tuning failed: $reason")
+                chatWarn("Tuning: $reason. Highlighted in world for manual tuning.")
+                logger.warn("tick: tuning finished with manual tuning required: $reason")
             }
         }
 

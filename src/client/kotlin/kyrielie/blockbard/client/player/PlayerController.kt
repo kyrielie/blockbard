@@ -5,6 +5,7 @@ import kyrielie.blockbard.organ.NoteBlockRegistry
 import kyrielie.blockbard.organ.NoteRequest
 import kyrielie.blockbard.organ.OrganMap
 import kyrielie.blockbard.organ.ReachInfo
+import kyrielie.blockbard.organ.TuningFailState
 import kyrielie.blockbard.util.BlockBardLogBuffer
 import kyrielie.blockbard.util.DebugLog
 import kyrielie.blockbard.util.vecToYawPitch
@@ -142,13 +143,21 @@ object PlayerController {
             var maxReachable = -1
             var bestDistSq = Double.MAX_VALUE
 
+            val reachThrough = kyrielie.blockbard.client.config.ConfigManager.config.reachThrough
             for (dx in -2..2) {
                 for (dz in -2..2) {
                     val candidate = BlockPos(playerPos.x + dx, playerPos.y, playerPos.z + dz)
                     val candEye = Vec3(candidate.x + 0.5, candidate.y + eyeHeight.toDouble(), candidate.z + 0.5)
                     val reachable = playableBlocks.count { entry ->
                         val target = Vec3(entry.pos.x + 0.5, entry.pos.y + 0.5, entry.pos.z + 0.5)
-                        target.distanceTo(candEye) <= (REACH_DISTANCE + 0.5)
+                        val dist = target.distanceTo(candEye)
+                        if (dist > (REACH_DISTANCE + 0.5)) false
+                        else if (reachThrough) true
+                        else {
+                            val level = mc.level
+                            if (level != null) findBestVisibleFace(level, player, candEye, entry.pos) != null
+                            else true
+                        }
                     }
                     val distSq = (dx * dx + dz * dz).toDouble()
                     if (reachable > maxReachable || (reachable == maxReachable && distSq < bestDistSq)) {
@@ -175,6 +184,10 @@ object PlayerController {
             BlockBardLogBuffer.info("PlayerController", "Calibrated from player pos $standPos (player not moved)")
         }
 
+        if (organMap?.standPos != standPos) {
+            NoteBlockRegistry.clearUntunable()
+            kyrielie.blockbard.client.render.ManualTuningHighlighter.clear()
+        }
         buildOrganMap(playableBlocks, standPos, eyeHeight)
 
         val map = organMap!!
@@ -201,16 +214,30 @@ object PlayerController {
         val mc = Minecraft.getInstance()
         val actualEyePos = mc.player?.eyePosition
             ?: Vec3(standPos.x + 0.5, standPos.y + eyeHeight.toDouble(), standPos.z + 0.5)
+        val reachThrough = kyrielie.blockbard.client.config.ConfigManager.config.reachThrough
         val reachMap = playableBlocks.associate { entry ->
             val target = Vec3(entry.pos.x + 0.5, entry.pos.y + 0.5, entry.pos.z + 0.5)
             val delta = target.subtract(actualEyePos)
             val distance = delta.length()
-            val isReachable = distance <= (REACH_DISTANCE + 0.5)
-            val (yaw, pitch) = if (isReachable) vecToYawPitch(delta) else Pair(0f, 0f)
+            val withinDist = distance <= (REACH_DISTANCE + 0.5)
+            val isReachable = if (!withinDist) {
+                false
+            } else if (reachThrough) {
+                true
+            } else {
+                val level = mc.level
+                val player = mc.player
+                if (level != null && player != null) {
+                    findBestVisibleFace(level, player, actualEyePos, entry.pos) != null
+                } else {
+                    true
+                }
+            }
+            val (yaw, pitch) = if (withinDist) vecToYawPitch(delta) else Pair(0f, 0f)
             entry.pos to ReachInfo(isReachable, yaw, pitch, distance)
         }
         organMap = OrganMap(standPos, reachMap)
-        logger.info("buildOrganMap: ${reachMap.values.count { it.isReachable }}/${playableBlocks.size} reachable from actualEye=$actualEyePos (standPos=$standPos)")
+        logger.info("buildOrganMap: ${reachMap.values.count { it.isReachable }}/${playableBlocks.size} reachable (reachThrough=$reachThrough) from actualEye=$actualEyePos (standPos=$standPos)")
     }
 
     /**
@@ -416,6 +443,13 @@ object PlayerController {
 
         // Multi-face visible raycasting inspired by Mineflayer (ray_trace & digging)
         val (target, hitFace) = findBestVisibleFace(world, player, eyePos, pos) ?: run {
+            if (!kyrielie.blockbard.client.config.ConfigManager.config.reachThrough) {
+                val warn = "$caller $pos: occluded by intervening blocks (Reach-Through is disabled in anticheat settings)"
+                logger.warn(warn)
+                BlockBardLogBuffer.warn("PlayerController", warn)
+                return null
+            }
+
             val cx = pos.x + 0.5
             val cy = pos.y + 0.5
             val cz = pos.z + 0.5
@@ -427,15 +461,19 @@ object PlayerController {
                 BlockBardLogBuffer.warn("PlayerController", warn)
                 return null
             }
-            // Fallback directional face: find face facing eyePos
-            val delta = defaultTarget.subtract(eyePos)
-            val face = when {
-                Math.abs(delta.x) >= Math.abs(delta.y) && Math.abs(delta.x) >= Math.abs(delta.z) ->
-                    if (delta.x > 0) Direction.WEST else Direction.EAST
-                Math.abs(delta.y) >= Math.abs(delta.z) ->
-                    if (delta.y > 0) Direction.DOWN else Direction.UP
-                else ->
-                    if (delta.z > 0) Direction.NORTH else Direction.SOUTH
+            // Reach-through: if above block is air, target Direction.UP (SongPlayer pattern)
+            val face = if (world.getBlockState(pos.above()).isAir) {
+                Direction.UP
+            } else {
+                val delta = defaultTarget.subtract(eyePos)
+                when {
+                    Math.abs(delta.x) >= Math.abs(delta.y) && Math.abs(delta.x) >= Math.abs(delta.z) ->
+                        if (delta.x > 0) Direction.WEST else Direction.EAST
+                    Math.abs(delta.y) >= Math.abs(delta.z) ->
+                        if (delta.y > 0) Direction.DOWN else Direction.UP
+                    else ->
+                        if (delta.z > 0) Direction.NORTH else Direction.SOUTH
+                }
             }
             val surfaceTarget = when (face) {
                 Direction.UP    -> Vec3(cx, pos.y + 1.0, cz)
@@ -530,10 +568,53 @@ object PlayerController {
             }
         }
 
-        val hitResult = aimAt(pos, "interactWith") ?: return false
+        val hitResult = aimAt(pos, "interactWith") ?: run {
+            val fail = diagnoseBlockInteractability(pos) ?: TuningFailState.OCCLUDED
+            BlockBardLogBuffer.warn("PlayerController", "[${fail.tag}] Cannot aim at $pos: ${fail.description}")
+            return false
+        }
         val result = mc.gameMode?.useItemOn(player, InteractionHand.MAIN_HAND, hitResult)
         player.swing(InteractionHand.MAIN_HAND, net.minecraft.world.item.component.SwingAnimation.DEFAULT, false)
         return true
+    }
+
+    /**
+     * Diagnoses why interaction with [pos] might fail or why it failed to tune.
+     * Evaluates block existence, distance, line-of-sight obstructions, and player state.
+     */
+    fun diagnoseBlockInteractability(pos: BlockPos): TuningFailState? {
+        val mc = Minecraft.getInstance()
+        val player = mc.player ?: return null
+        val world = mc.level ?: return null
+
+        val state = world.getBlockState(pos)
+        if (!state.`is`(net.minecraft.world.level.block.Blocks.NOTE_BLOCK)) {
+            return TuningFailState.BLOCK_MISSING
+        }
+
+        val eyePos = player.eyePosition
+        val target = Vec3(pos.x + 0.5, pos.y + 0.5, pos.z + 0.5)
+        val dist = target.distanceTo(eyePos)
+        if (dist > (REACH_DISTANCE + 0.5)) {
+            return TuningFailState.OUT_OF_REACH
+        }
+
+        val gameMode = mc.gameMode?.playerMode
+        if (gameMode == GameType.CREATIVE || gameMode == GameType.SPECTATOR) {
+            return TuningFailState.INTERACT_REJECTED
+        }
+
+        if (!player.mainHandItem.isEmpty) {
+            val hasEmptySlot = (0..8).any { player.inventory.getItem(it).isEmpty }
+            if (!hasEmptySlot) return TuningFailState.INTERACT_REJECTED
+        }
+
+        val visibleFace = findBestVisibleFace(world, player, eyePos, pos)
+        if (visibleFace == null) {
+            return TuningFailState.OCCLUDED
+        }
+
+        return null
     }
 
     /**

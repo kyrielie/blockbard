@@ -95,11 +95,13 @@ object MidiToOrganMapper {
             val available = reachableBlocks.filter { it.pos !in usedPositions }
 
             // 1. Prefer native coverage on the authored instrument if available
+            // Prioritize blocks that are tunable from the standing spot over known untunable/occluded blocks
             val nativeCandidate = if (note.instrument != null) {
                 available
                     .filter { it.instrument == note.instrument && it.instrument.coversNatively(midiNote) }
                     .minWithOrNull(
                         compareBy(
+                            { NoteBlockRegistry.isUntunable(it.pos) },
                             { clicksNeeded(it.noteIndex, midiNote - it.instrument.midiBase) },
                             { it.distanceFromPlayer }
                         )
@@ -109,6 +111,7 @@ object MidiToOrganMapper {
                     .filter { it.instrument.coversNatively(midiNote) }
                     .minWithOrNull(
                         compareBy(
+                            { NoteBlockRegistry.isUntunable(it.pos) },
                             { clicksNeeded(it.noteIndex, midiNote - it.instrument.midiBase) },
                             { it.distanceFromPlayer }
                         )
