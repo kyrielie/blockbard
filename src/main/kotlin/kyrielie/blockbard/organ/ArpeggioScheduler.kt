@@ -1,8 +1,10 @@
 package kyrielie.blockbard.organ
 
 import kyrielie.blockbard.util.DebugLog
+import kyrielie.blockbard.util.clicksNeeded
 import kyrielie.blockbard.util.isPitched
 import kyrielie.blockbard.util.midiBase
+import kyrielie.blockbard.util.noteIndexToMidi
 import net.minecraft.core.BlockPos
 import net.minecraft.world.level.block.state.properties.NoteBlockInstrument
 import org.slf4j.LoggerFactory
@@ -120,6 +122,13 @@ object ArpeggioScheduler {
     var rotationConvergedDelegate: ((BlockPos) -> Boolean)? = null
 
     private val queue: ArrayDeque<NoteRequest> = ArrayDeque()
+    private val lookaheadRetunes: ArrayDeque<ScheduledRetuneTask> = ArrayDeque()
+
+    fun loadRetuneSchedule(tasks: List<ScheduledRetuneTask>) = synchronized(lock) {
+        lookaheadRetunes.clear()
+        lookaheadRetunes.addAll(tasks.sortedBy { it.startMs })
+        logger.info("loadRetuneSchedule: loaded ${tasks.size} lookahead retune tasks")
+    }
 
     /**
      * Guards [queue], [interactBudget], and [lastTickMs].
@@ -304,6 +313,37 @@ object ArpeggioScheduler {
             }
             dispatched++
         }
+
+        // Rest-period lookahead dynamic retuning
+        if (queue.isEmpty() && dynamicRetuningEnabled && lookaheadRetunes.isNotEmpty()) {
+            val task = lookaheadRetunes.first()
+            val currentNote = NoteBlockRegistry.get(task.pos)?.noteIndex ?: task.startNoteIndex
+            val needed = clicksNeeded(currentNote, task.targetNoteIndex)
+
+            if (needed <= 0 || now > task.deadlineMs) {
+                lookaheadRetunes.removeFirst()
+            } else if (now >= task.startMs && interactBudget >= 1f) {
+                val converged = rotationConvergedDelegate?.invoke(task.pos) ?: true
+                if (converged) {
+                    val retuneRequest = NoteRequest(
+                        midiNote = noteIndexToMidi(task.instrument, (currentNote + 1) % 25),
+                        instrument = task.instrument,
+                        resolvedPos = task.pos,
+                        isRetuneStep = true
+                    )
+                    val ok = dynamicRetuneDelegate?.invoke(task.pos, retuneRequest) ?: false
+                    if (ok) {
+                        interactBudget -= 1f
+                        val newNote = (currentNote + 1) % 25
+                        NoteBlockRegistry.updateTunedNote(task.pos, newNote)
+                        logger.debug("lookahead retune click on ${task.pos} (${task.instrument.name}): $currentNote -> $newNote (target ${task.targetNoteIndex})")
+                        if (newNote == task.targetNoteIndex) {
+                            lookaheadRetunes.removeFirst()
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /**
@@ -315,10 +355,18 @@ object ArpeggioScheduler {
      * continue for a note that has started converging even if it crosses staleTimeoutMs.
      */
     fun peekNextPos(): BlockPos? = synchronized(lock) {
-        val request = queue.firstOrNull() ?: return@synchronized null
-        val pos = resolvePos(request)
-        DebugLog.info(logger) { "peekNextPos: MIDI ${request.midiNote} instrument=${request.instrument?.name ?: "any"} -> $pos" }
-        pos
+        val request = queue.firstOrNull()
+        if (request != null) {
+            val pos = resolvePos(request)
+            DebugLog.info(logger) { "peekNextPos: MIDI ${request.midiNote} instrument=${request.instrument?.name ?: "any"} -> $pos" }
+            return@synchronized pos
+        }
+        if (dynamicRetuningEnabled && lookaheadRetunes.isNotEmpty()) {
+            val now = System.currentTimeMillis()
+            val nextRetune = lookaheadRetunes.firstOrNull()?.takeIf { now >= it.startMs && now <= it.deadlineMs }
+            if (nextRetune != null) return@synchronized nextRetune.pos
+        }
+        null
     }
 
     fun enqueue(request: NoteRequest) = synchronized(lock) {
@@ -337,8 +385,9 @@ object ArpeggioScheduler {
     fun recentDispatches(): List<DispatchRecord> = synchronized(lock) { dispatchHistory.toList() }
 
     fun clear() = synchronized(lock) {
-        logger.info("queue cleared (had ${queue.size} items)")
+        logger.info("queue cleared (had ${queue.size} items, ${lookaheadRetunes.size} retune tasks)")
         queue.clear()
+        lookaheadRetunes.clear()
         interactBudget = 1f
         lastTickMs = -1L
         dispatchHistory.clear()

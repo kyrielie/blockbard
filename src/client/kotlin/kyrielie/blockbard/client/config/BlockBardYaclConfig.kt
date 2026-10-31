@@ -99,8 +99,8 @@ object BlockBardYaclConfig {
                     )
                     .option(
                         Option.createBuilder<Boolean>()
-                            .name(Component.literal("Dynamic Retuning"))
-                            .description(OptionDescription.of(Component.literal("Allows retuning noteblocks on-the-fly during playback for greater musical range with fewer blocks.")))
+                            .name(Component.literal("Dynamic Retuning (Lookahead)"))
+                            .description(OptionDescription.of(Component.literal("Proactively retunes idle noteblocks during musical rests so compact organs can play songs needing more distinct pitches than you have physical blocks.")))
                             .binding(Binding.generic(false, { cfg.dynamicRetuning }, { cfg.dynamicRetuning = it }))
                             .controller(TickBoxControllerBuilder::create)
                             .build()
