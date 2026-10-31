@@ -7,7 +7,7 @@ import kyrielie.blockbard.util.midiBase
 import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper
 import net.minecraft.client.KeyMapping
 import net.minecraft.client.Minecraft
-import org.lwjgl.glfw.GLFW
+import com.mojang.blaze3d.platform.InputConstants
 import org.slf4j.LoggerFactory
 
 /**
@@ -43,7 +43,7 @@ object KeyboardInputHandler {
             val key = KeyMappingHelper.registerKeyMapping(
                 KeyMapping(
                     "key.blockbard.note$i",
-                    GLFW.GLFW_KEY_0 + i,
+                    InputConstants.KEY_0 + i,
                     KeyMapping.Category.MISC
                 )
             )
@@ -53,47 +53,47 @@ object KeyboardInputHandler {
     }
 
     /**
-     * Map of GLFW key codes to noteIndex (0..24).
+     * Map of key codes to noteIndex (0..24).
      */
     private val keyToNoteIndex: Map<Int, Int> = mapOf(
         // Lower Octave White Keys
-        GLFW.GLFW_KEY_Z to 1,         // G
-        GLFW.GLFW_KEY_X to 3,         // A
-        GLFW.GLFW_KEY_C to 5,         // B
-        GLFW.GLFW_KEY_V to 6,         // C
-        GLFW.GLFW_KEY_B to 8,         // D
-        GLFW.GLFW_KEY_N to 10,        // E
-        GLFW.GLFW_KEY_M to 11,        // F
-        GLFW.GLFW_KEY_COMMA to 13,    // G
-        GLFW.GLFW_KEY_PERIOD to 15,   // A
-        GLFW.GLFW_KEY_SLASH to 17,    // B
+        InputConstants.KEY_Z to 1,         // G
+        InputConstants.KEY_X to 3,         // A
+        InputConstants.KEY_C to 5,         // B
+        InputConstants.KEY_V to 6,         // C
+        InputConstants.KEY_B to 8,         // D
+        InputConstants.KEY_N to 10,        // E
+        InputConstants.KEY_M to 11,        // F
+        InputConstants.KEY_COMMA to 13,    // G
+        InputConstants.KEY_PERIOD to 15,   // A
+        InputConstants.KEY_SLASH to 17,    // B
 
         // Lower Octave Black Keys
-        GLFW.GLFW_KEY_A to 0,         // F#3
-        GLFW.GLFW_KEY_S to 2,         // G#
-        GLFW.GLFW_KEY_D to 4,         // A#
-        GLFW.GLFW_KEY_G to 7,         // C#
-        GLFW.GLFW_KEY_H to 9,         // D#
-        GLFW.GLFW_KEY_K to 12,        // F#4
-        GLFW.GLFW_KEY_L to 14,        // G#
-        GLFW.GLFW_KEY_SEMICOLON to 16,// A#
+        InputConstants.KEY_A to 0,         // F#3
+        InputConstants.KEY_S to 2,         // G#
+        InputConstants.KEY_D to 4,         // A#
+        InputConstants.KEY_G to 7,         // C#
+        InputConstants.KEY_H to 9,         // D#
+        InputConstants.KEY_K to 12,        // F#4
+        InputConstants.KEY_L to 14,        // G#
+        InputConstants.KEY_SEMICOLON to 16,// A#
 
         // Upper Octave
-        GLFW.GLFW_KEY_Q to 18,        // C5
-        GLFW.GLFW_KEY_W to 20,        // D5
-        GLFW.GLFW_KEY_E to 22,        // E5
-        GLFW.GLFW_KEY_R to 23,        // F5
-        GLFW.GLFW_KEY_2 to 19,        // C#5
-        GLFW.GLFW_KEY_3 to 21,        // D#5
-        GLFW.GLFW_KEY_5 to 24         // F#5
+        InputConstants.KEY_Q to 18,        // C5
+        InputConstants.KEY_W to 20,        // D5
+        InputConstants.KEY_E to 22,        // E5
+        InputConstants.KEY_R to 23,        // F5
+        InputConstants.KEY_2 to 19,        // C#5
+        InputConstants.KEY_3 to 21,        // D#5
+        InputConstants.KEY_5 to 24         // F#5
     )
 
     /**
-     * Maps a GLFW key code to a noteblock noteIndex (0..24), or null if not mapped.
+     * Maps a key code to a noteblock noteIndex (0..24), or null if not mapped.
      */
     fun getNoteIndex(keyCode: Int): Int? {
         return keyToNoteIndex[keyCode] ?: run {
-            val legacy = keyCode - GLFW.GLFW_KEY_1
+            val legacy = keyCode - InputConstants.KEY_1
             if (legacy in 0..8) legacy else null
         }
     }

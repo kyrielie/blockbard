@@ -7,6 +7,7 @@ import kyrielie.blockbard.util.midiBase
 import kyrielie.blockbard.util.readByteChecked
 import kyrielie.blockbard.util.readLEInt
 import kyrielie.blockbard.util.readLEShort
+import kyrielie.blockbard.util.readLEUShort
 import kyrielie.blockbard.util.readNBSString
 import net.minecraft.world.level.block.state.properties.NoteBlockInstrument
 import java.io.DataInputStream
@@ -84,27 +85,22 @@ object NbsFileLoader {
                 // below where the very first short read IS the song length value.
                 version = stream.readByteChecked("version byte").toByte()
                 instrumentCount = stream.readByteChecked("instrument count byte")
-                songLength = stream.readLEShort("song length").toInt()
+                songLength = stream.readLEUShort("song length")
             } else {
                 // Classic NBS format: there is no separate format-marker short — the
                 // value already consumed into firstShort above is itself songLength.
-                // Re-reading a second short here (the original bug) shifts every
-                // subsequent field read by 2 bytes, which is why a classic-format file
-                // eventually misreads a header string's length as a huge garbage value
-                // and throws EOFException deep into the description field instead of
-                // failing immediately where the misalignment actually starts.
                 version = 0
                 instrumentCount = 0
-                songLength = firstShort.toInt()
+                songLength = firstShort.toInt() and 0xFFFF
             }
 
-            val layerCount = stream.readLEShort("layer count").toInt()
+            val layerCount = stream.readLEUShort("layer count")
             val title = stream.readNBSString("title")
             stream.readNBSString("author")
             stream.readNBSString("original author")
             stream.readNBSString("description")
             val tempoRaw = stream.readLEShort("tempo").toInt() // ticks per second × 100
-            val tempo = tempoRaw / 100f
+            val tempo = if (tempoRaw > 0) tempoRaw / 100f else 20.0f
 
             // Skip remaining header fields
             stream.readByteChecked("auto-save enabled flag")
@@ -126,12 +122,12 @@ object NbsFileLoader {
             val notes = mutableListOf<NbsNote>()
             var currentTick = -1
             while (true) {
-                val tickJump = stream.readLEShort("tick jump").toInt()
+                val tickJump = stream.readLEUShort("tick jump")
                 if (tickJump == 0) break
                 currentTick += tickJump
                 var currentLayer = -1
                 while (true) {
-                    val layerJump = stream.readLEShort("layer jump").toInt()
+                    val layerJump = stream.readLEUShort("layer jump")
                     if (layerJump == 0) break
                     currentLayer += layerJump
                     val instrument = stream.readByteChecked("instrument byte")
@@ -225,21 +221,20 @@ object NbsPlayer {
                     if (!isPlaying) return@Thread
                     currentTick = tick.toLong()
                     notesByTick[tick]?.forEach { note ->
-                        val rawMidi = note.key + 21  // NBS key → MIDI note
-                        // Resolve the NBS instrument byte so playback targets a block
-                        // tuned for the right instrument, not just any block at this
-                        // pitch — see nbsInstrumentToBlock kdoc. null for custom
-                        // (non-vanilla) instruments, which falls back to pitch-only
-                        // matching in ArpeggioScheduler.resolvePos.
                         val rawInstrument = nbsInstrumentToBlock(note.instrument)
                         val instrument = rawInstrument?.let { kyrielie.blockbard.client.midi.InstrumentRemapper.remap(it) }
                         if (rawInstrument != null && instrument == null) return@forEach // Muted by InstrumentRemapper
-                        // Unpitched instruments (SNARE, HAT, BASEDRUM) are assigned to a
-                        // single canonical block at midiBase. Use that same midiNote here
-                        // so the lookup in ArpeggioScheduler matches the assignment entry.
-                        val midiNote = if (instrument != null && !instrument.isPitched)
+
+                        // For vanilla instruments, keys 33..57 represent noteblock click indices 0..24.
+                        // The actual sounding Minecraft pitch is instrument.midiBase + (note.key - 33).
+                        // Unpitched instruments (SNARE, HAT, BASEDRUM) collapse to midiBase.
+                        val midiNote = if (instrument != null && !instrument.isPitched) {
                             instrument.midiBase
-                        else rawMidi
+                        } else if (instrument != null) {
+                            instrument.midiBase + (note.key - 33)
+                        } else {
+                            note.key + 21
+                        }
                         ArpeggioScheduler.enqueue(NoteRequest(midiNote, instrument = instrument))
                     }
                 }

@@ -1,6 +1,7 @@
 package kyrielie.blockbard.organ
 
 import kyrielie.blockbard.util.DebugLog
+import kyrielie.blockbard.util.isPitched
 import kyrielie.blockbard.util.midiBase
 import net.minecraft.core.BlockPos
 import net.minecraft.world.level.block.state.properties.NoteBlockInstrument
@@ -162,7 +163,13 @@ object ArpeggioScheduler {
     private fun resolveTarget(request: NoteRequest): TargetResolution? {
         if (request.resolvedPos != null) return TargetResolution(request.resolvedPos, request.isRetuneStep)
 
-        val exactPitch = NotePitch(request.midiNote, request.instrument)
+        // Unpitched instruments (SNARE, HAT, BASEDRUM) produce identical sounds across all notes;
+        // normalize to midiBase so they match the single canonical block assignment.
+        val effectiveMidi = if (request.instrument != null && !request.instrument.isPitched)
+            request.instrument.midiBase
+        else request.midiNote
+
+        val exactPitch = NotePitch(effectiveMidi, request.instrument)
         val exactPool = voicePools[exactPitch]
         if (!exactPool.isNullOrEmpty()) {
             val idx = voiceIndices.getOrDefault(exactPitch, 0)
@@ -170,7 +177,7 @@ object ArpeggioScheduler {
             return TargetResolution(exactPool[idx])
         }
 
-        val agnosticPitch = NotePitch(request.midiNote, null)
+        val agnosticPitch = NotePitch(effectiveMidi, null)
         val agnosticPool = voicePools[agnosticPitch]
         if (!agnosticPool.isNullOrEmpty()) {
             val idx = voiceIndices.getOrDefault(agnosticPitch, 0)
@@ -181,7 +188,7 @@ object ArpeggioScheduler {
         val assigned = assignment[exactPitch] ?: assignment[agnosticPitch]
         if (assigned != null) return TargetResolution(assigned)
 
-        val liveMatch = NoteBlockRegistry.findBestFor(request.midiNote, request.instrument)?.pos
+        val liveMatch = NoteBlockRegistry.findBestFor(effectiveMidi, request.instrument)?.pos
         if (liveMatch != null) return TargetResolution(liveMatch)
 
         // Dynamic On-the-fly retuning:

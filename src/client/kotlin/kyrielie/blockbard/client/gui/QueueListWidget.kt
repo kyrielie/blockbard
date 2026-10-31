@@ -16,7 +16,9 @@ class QueueListWidget(
     itemHeight: Int = 26,
     private val onSelect: (File) -> Unit,
     private val onDoubleClick: ((File) -> Unit)? = null,
-    private val onRemove: ((Int) -> Unit)? = null
+    private val onRemove: ((Int) -> Unit)? = null,
+    private val onMoveUp: ((Int) -> Unit)? = null,
+    private val onMoveDown: ((Int) -> Unit)? = null
 ) : ObjectSelectionList<QueueListWidget.QueueEntry>(minecraft, width, height, y, itemHeight) {
 
     private var isRefreshing = false
@@ -35,14 +37,15 @@ class QueueListWidget(
         return super.mouseScrolled(mouseX, mouseY, horizontalAmount, verticalAmount)
     }
 
-    fun setQueue(files: List<File>, currentPlaying: File?) {
+    fun setQueue(files: List<File>, currentPlaying: File?, userQueueCount: Int = 0) {
         isRefreshing = true
         try {
             clearEntries()
             var selectedEntry: QueueEntry? = null
             files.forEachIndexed { idx, file ->
                 val isCurrent = (currentPlaying != null && file.name.equals(currentPlaying.name, ignoreCase = true) && idx == 0)
-                val entry = QueueEntry(idx + 1, file, isCurrent)
+                val isUserQueued = idx < userQueueCount
+                val entry = QueueEntry(idx + 1, file, isCurrent, isUserQueued)
                 addEntry(entry)
                 if (isCurrent && selectedEntry == null) {
                     selectedEntry = entry
@@ -68,7 +71,8 @@ class QueueListWidget(
     inner class QueueEntry(
         val queuePos: Int,
         val file: File,
-        val isCurrent: Boolean
+        val isCurrent: Boolean,
+        val isUserQueued: Boolean = false
     ) : ObjectSelectionList.Entry<QueueEntry>() {
 
         override fun getNarration(): Component = Component.literal("#$queuePos ${file.name}")
@@ -100,7 +104,11 @@ class QueueListWidget(
 
             // Queue number badge: e.g. "#1" or "▶"
             val numStr = if (isCurrent) "▶" else "#$queuePos"
-            val numColor = if (isCurrent) opaque(0x55FF77) else opaque(0xFFD700)
+            val numColor = when {
+                isCurrent -> opaque(0x55FF77)
+                isUserQueued -> opaque(0x55FFFF)
+                else -> opaque(0xFFD700)
+            }
             graphics.text(font, numStr, x + 4, y + 3, numColor)
 
             // Format badge: [MID] or [NBS]
@@ -124,7 +132,21 @@ class QueueListWidget(
             } ?: (file.length() / 1024).let { "${it}KB" }
 
             val durW = font.width(durationText)
-            graphics.text(font, durationText, x + w - durW - 22, y + 3, opaque(0xAAAAAA))
+            val rightOffset = if (isUserQueued) 46 else 22
+            graphics.text(font, durationText, x + w - durW - rightOffset, y + 3, opaque(0xAAAAAA))
+
+            // Reorder controls for user-queued items: ▲ and ▼
+            if (isUserQueued) {
+                val upX = x + w - 38
+                val upHovered = mouseX >= upX - 2 && mouseX <= upX + 8 && mouseY >= y + 2 && mouseY <= y + 12
+                val upColor = if (upHovered) opaque(0xFFFF55) else opaque(0x888888)
+                graphics.text(font, "▲", upX, y + 3, upColor)
+
+                val downX = x + w - 26
+                val downHovered = mouseX >= downX - 2 && mouseX <= downX + 8 && mouseY >= y + 2 && mouseY <= y + 12
+                val downColor = if (downHovered) opaque(0xFFFF55) else opaque(0x888888)
+                graphics.text(font, "▼", downX, y + 3, downColor)
+            }
 
             // Remove button [✕]
             val removeX = x + w - 14
@@ -133,8 +155,12 @@ class QueueListWidget(
             graphics.text(font, "✕", removeX, y + 3, removeColor)
 
             // Subtext: summary (notes / channels / tempo)
-            val sub = if (isCurrent) "Currently playing" else (meta?.summaryString ?: "Queued track")
-            val subColor = if (isCurrent) opaque(0x77DD99) else opaque(0x777777)
+            val sub = when {
+                isCurrent -> "Currently playing"
+                isUserQueued -> "Custom queue: #${queuePos} • ${meta?.summaryString ?: "Queued track"}"
+                else -> meta?.summaryString ?: "Queued track"
+            }
+            val subColor = if (isCurrent) opaque(0x77DD99) else if (isUserQueued) opaque(0x88CCFF) else opaque(0x777777)
             graphics.text(font, sub, x + 58, y + 14, subColor)
         }
 
@@ -142,8 +168,20 @@ class QueueListWidget(
             if (event.button() == 0) {
                 val entryX = getContentX()
                 val entryW = getContentWidth()
+                if (isUserQueued) {
+                    val upX = entryX + entryW - 38
+                    if (event.x() >= upX - 2 && event.x() <= upX + 9) {
+                        onMoveUp?.invoke(queuePos - 1)
+                        return true
+                    }
+                    val downX = entryX + entryW - 26
+                    if (event.x() >= downX - 2 && event.x() <= downX + 9) {
+                        onMoveDown?.invoke(queuePos - 1)
+                        return true
+                    }
+                }
                 val removeX = entryX + entryW - 14
-                if (event.x() >= removeX && event.x() <= removeX + 12) {
+                if (event.x() >= removeX - 2 && event.x() <= removeX + 12) {
                     onRemove?.invoke(queuePos - 1)
                     return true
                 }
