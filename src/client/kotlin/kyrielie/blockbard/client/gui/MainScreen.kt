@@ -9,6 +9,7 @@ import kyrielie.blockbard.client.playback.NbsFile
 import kyrielie.blockbard.client.playback.NbsFileLoader
 import kyrielie.blockbard.client.playback.NbsPlayer
 import kyrielie.blockbard.client.playback.SongAudioPreviewer
+import kyrielie.blockbard.client.playback.UserPlayQueue
 import kyrielie.blockbard.client.playback.nbsInstrumentToBlock
 import kyrielie.blockbard.client.input.KeyboardInputHandler
 import kyrielie.blockbard.client.midi.MidiChannelResolver
@@ -24,12 +25,15 @@ import kyrielie.blockbard.util.DebugLog
 import kyrielie.blockbard.util.LogLevel
 import kyrielie.blockbard.util.blockBelowHint
 import kyrielie.blockbard.util.clicksNeeded
+import kyrielie.blockbard.util.isPitched
+import kyrielie.blockbard.util.midiBase
 import kyrielie.blockbard.util.midiNoteToName
 import net.fabricmc.loader.api.FabricLoader
 import net.minecraft.client.gui.GuiGraphicsExtractor
 import net.minecraft.client.gui.components.AbstractWidget
 import net.minecraft.client.gui.components.Button
 import net.minecraft.client.gui.components.EditBox
+import net.minecraft.client.gui.components.Tooltip
 import net.minecraft.client.gui.screens.Screen
 import net.minecraft.client.gui.screens.options.controls.KeyBindsScreen
 import net.minecraft.client.input.KeyEvent
@@ -38,7 +42,6 @@ import net.minecraft.network.chat.Component
 import net.minecraft.world.level.GameType
 import net.minecraft.world.level.block.state.properties.NoteBlockInstrument
 import kyrielie.blockbard.client.config.BlockBardYaclConfig
-import org.lwjgl.glfw.GLFW
 import org.slf4j.LoggerFactory
 import java.io.File
 import java.nio.file.Path
@@ -144,6 +147,7 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
     private var tuner: NoteBlockTuner? = null
     private var assignment: OrganAssignment? = null
     private var tuneStatusMsg: String = ""
+    private var tuningError: String? = null
     private var loadedNbs: NbsFile? = null
 
     // ── Loop / auto-advance (Tier 4) ───────────────────────────────────────────
@@ -263,6 +267,11 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
                 ConfigManager.config.toggleFavorite(file.name)
                 ConfigManager.save()
                 songListWidget.setFiles(displayedFiles, selectedFile)
+            },
+            onAddToQueue = { file ->
+                UserPlayQueue.add(file)
+                updateQueueDisplay()
+                chat("Added to queue: ${file.nameWithoutExtension}")
             }
         )
         tab0(addRenderableWidget(songListWidget))
@@ -271,21 +280,24 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
         // ── Tab 1: Queue ──────────────────────────────────────────────────────
         fun <T : AbstractWidget> tab1(w: T): T { tabContent[1]!!.add(w); return w }
         val qBtnY = 26
-        tab1(addRenderableWidget(Button.builder(Component.literal("← Library")) {
-            switchTab(0)
-        }.pos(10, qBtnY).size(62, 16).build()))
 
         tab1(addRenderableWidget(Button.builder(Component.literal("🔀 Reshuffle")) {
             reshuffleQueue()
             chat("Queue reshuffled")
-        }.pos(76, qBtnY).size(74, 16).build()))
+        }.pos(10, qBtnY).size(74, 16).build()))
 
         tab1(addRenderableWidget(Button.builder(Component.literal("Clear History")) {
             ConfigManager.config.shuffleHistory.clear()
             ConfigManager.save()
             updateQueueDisplay()
             chat("Shuffle history cleared")
-        }.pos(154, qBtnY).size(78, 16).build()))
+        }.pos(88, qBtnY).size(78, 16).build()))
+
+        tab1(addRenderableWidget(Button.builder(Component.literal("Clear Queue")) {
+            UserPlayQueue.clear()
+            updateQueueDisplay()
+            chat("Play queue cleared")
+        }.pos(170, qBtnY).size(74, 16).build()))
 
         queueListWidget = QueueListWidget(
             minecraft = minecraft,
@@ -298,7 +310,9 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
                 selectFile(file)
                 playSelectedSong()
             },
-            onRemove = { idx -> removeFromQueue(idx) }
+            onRemove = { idx -> removeFromQueue(idx) },
+            onMoveUp = { idx -> moveQueueItem(idx, -1) },
+            onMoveDown = { idx -> moveQueueItem(idx, 1) }
         )
         tab1(addRenderableWidget(queueListWidget))
 
@@ -414,11 +428,11 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
         // Row 1: Primary transport
         jb(addRenderableWidget(Button.builder(Component.literal("|◀")) {
             playPrevSong()
-        }.pos(jbX + 8, row1Y).size(30, 16).build()))
+        }.tooltip(Tooltip.create(Component.literal("Previous Track / Restart (if >3s)"))).pos(jbX + 8, row1Y).size(30, 16).build()))
 
         playPauseBtn = jb(addRenderableWidget(Button.builder(Component.literal("▶ Play")) {
             togglePlayPause()
-        }.pos(jbX + 42, row1Y).size(56, 16).build()))
+        }.tooltip(Tooltip.create(Component.literal("Play or Pause playback without resetting progress"))).pos(jbX + 42, row1Y).size(56, 16).build()))
 
         jb(addRenderableWidget(Button.builder(Component.literal("⏹")) {
             MidiFilePlayer.stop()
@@ -427,16 +441,17 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
             abortTuning()
             pendingAutoPlay = false
             pendingNextFile = null
+            tuningError = null
             chat("Stopped")
-        }.pos(jbX + 102, row1Y).size(28, 16).build()))
+        }.tooltip(Tooltip.create(Component.literal("Stop playback, clear queue schedule, and reset to 0:00"))).pos(jbX + 102, row1Y).size(28, 16).build()))
 
         jb(addRenderableWidget(Button.builder(Component.literal("▶|")) {
             playNextSong()
-        }.pos(jbX + 134, row1Y).size(30, 16).build()))
+        }.tooltip(Tooltip.create(Component.literal("Next Track in Queue"))).pos(jbX + 134, row1Y).size(30, 16).build()))
 
         jb(addRenderableWidget(Button.builder(Component.literal("Tune & Play")) {
             playSelectedSong()
-        }.pos(jbX + 168, row1Y).size(72, 16).build()))
+        }.tooltip(Tooltip.create(Component.literal("Tune organ to match song and start playback"))).pos(jbX + 168, row1Y).size(72, 16).build()))
 
         jb(addRenderableWidget(Button.builder(Component.literal(if (SongAudioPreviewer.isPlaying) "Stop Prev" else "♪ Preview")) { btn ->
             if (SongAudioPreviewer.isPlaying) {
@@ -561,11 +576,17 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
             f.extension.lowercase() in listOf("mid", "midi", "nbs")
         } ?: emptyArray()).toList().sortedBy { it.name }
 
-        // Automatically select the last played track or the first available file
-        if (selectedFile == null && midiFiles.isNotEmpty()) {
+        // If a track is already playing or paused, preserve it as the active selection without stopping playback
+        val activePlayingFile = MidiFilePlayer.loadedMidi?.file ?: loadedNbs?.file ?: NbsPlayer.currentNbs?.file
+        val isPlaybackActive = (MidiFilePlayer.isActive() || NbsPlayer.isPlaying || MidiFilePlayer.isPaused || NbsPlayer.isPaused)
+
+        if (activePlayingFile != null && isPlaybackActive) {
+            selectedFile = activePlayingFile
+            selectedIndex = midiFiles.indexOfFirst { it.name.equals(activePlayingFile.name, ignoreCase = true) }
+        } else if (selectedFile == null && midiFiles.isNotEmpty()) {
             val last = ConfigManager.config.lastPlayedTrack
             val match = midiFiles.firstOrNull { it.name.equals(last, ignoreCase = true) } ?: midiFiles.first()
-            selectFile(match)
+            selectFile(match, stopPlayback = false)
         }
 
         if (::songListWidget.isInitialized) {
@@ -585,10 +606,11 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
     // ── Loop / auto-advance (Tier 4) & Queue ───────────────────────────────────
 
     private fun getUpcomingQueue(): List<File> {
+        val userQ = UserPlayQueue.getAll()
         val files = displayedFiles.ifEmpty { midiFiles }
-        if (files.isEmpty()) return emptyList()
+        if (files.isEmpty() && userQ.isEmpty()) return emptyList()
 
-        return when (ConfigManager.config.loopModeEnum()) {
+        val fallback = when (ConfigManager.config.loopModeEnum()) {
             LoopMode.NONE -> {
                 val curIdx = selectedFile?.let { sf -> files.indexOfFirst { it.name.equals(sf.name, true) } } ?: -1
                 if (curIdx >= 0 && curIdx < files.size - 1) {
@@ -596,7 +618,7 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
                 } else emptyList()
             }
             LoopMode.LOOP_ONE -> {
-                val cur = selectedFile ?: files.firstOrNull() ?: return emptyList()
+                val cur = selectedFile ?: files.firstOrNull() ?: return userQ
                 List(minOf(8, files.size.coerceAtLeast(4))) { cur }
             }
             LoopMode.LOOP_ALL -> {
@@ -612,6 +634,7 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
                 shuffleQueue.toList()
             }
         }
+        return userQ + fallback
     }
 
     private fun ensureShuffleQueue(forceReshuffle: Boolean = false) {
@@ -631,6 +654,9 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
     }
 
     private fun getNextSongInQueue(): File? {
+        val userSong = UserPlayQueue.popNext()
+        if (userSong != null) return userSong
+
         val files = displayedFiles.ifEmpty { midiFiles }
         if (files.isEmpty()) return null
 
@@ -698,19 +724,36 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
     }
 
     private fun removeFromQueue(idx: Int) {
+        val userQSize = UserPlayQueue.size
+        if (idx < userQSize) {
+            val removed = UserPlayQueue.removeAt(idx)
+            if (removed != null) {
+                chat("Removed from queue: ${removed.nameWithoutExtension}")
+                updateQueueDisplay()
+            }
+            return
+        }
+        val fallbackIdx = idx - userQSize
         if (ConfigManager.config.loopModeEnum() == LoopMode.SHUFFLE_ALL) {
-            if (idx in 0 until shuffleQueue.size) {
-                val removed = shuffleQueue.removeAt(idx)
+            if (fallbackIdx in 0 until shuffleQueue.size) {
+                val removed = shuffleQueue.removeAt(fallbackIdx)
                 chat("Removed from queue: ${removed.nameWithoutExtension}")
                 updateQueueDisplay()
             }
         }
     }
 
+    private fun moveQueueItem(idx: Int, delta: Int) {
+        val targetIdx = idx + delta
+        if (UserPlayQueue.move(idx, targetIdx)) {
+            updateQueueDisplay()
+        }
+    }
+
     private fun updateQueueDisplay() {
         val q = getUpcomingQueue()
         if (::queueListWidget.isInitialized) {
-            queueListWidget.setQueue(q, selectedFile)
+            queueListWidget.setQueue(q, selectedFile, UserPlayQueue.size)
         }
     }
 
@@ -824,7 +867,11 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
             targets = assignAndReport(midi.noteUsageCounts)
         } else if (nbs != null) {
             val noteUsageCounts = nbs.notes
-                .map { NotePitch(it.key + 21, nbsInstrumentToBlock(it.instrument)) }
+                .mapNotNull { note ->
+                    val inst = nbsInstrumentToBlock(note.instrument) ?: return@mapNotNull null
+                    val midi = if (!inst.isPitched) inst.midiBase else inst.midiBase + (note.key - 33)
+                    NotePitch(midi, inst)
+                }
                 .groupingBy { it }
                 .eachCount()
             logger.info("startTuning: NBS mode -- ${reachable.size} reachable, ${noteUsageCounts.size} distinct pairs")
@@ -900,6 +947,8 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
             interactBlock     = { pos -> PlayerController.interactWith(pos) },
             pingMs            = { PlayerController.currentPingMs() },
             fastTuning        = ConfigManager.config.fastTuning,
+            primeRotation     = { pos -> PlayerController.primeRotation(pos) },
+            rotationConverged = { pos -> PlayerController.rotationConverged(pos) },
             onProgress        = { done, total, msg ->
                 tuneStatusMsg = "$done/$total -- $msg"
                 logger.debug("tuner progress: $tuneStatusMsg")
@@ -1008,8 +1057,9 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
                 chatWarn("Select a song first")
                 return
             }
+        tuningError = null
         if (selectedFile != file) {
-            selectFile(file)
+            selectFile(file, stopPlayback = true)
         }
 
         val isCurrentMidi = MidiFilePlayer.loadedMidi?.file == file
@@ -1054,7 +1104,8 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
                     val nbs = loadedNbs ?: try { NbsFileLoader.load(file).also { loadedNbs = it } } catch (e: Exception) { null }
                     nbs?.notes?.mapNotNull { note ->
                         val inst = nbsInstrumentToBlock(note.instrument) ?: return@mapNotNull null
-                        NotePitch(note.key + 21, inst)
+                        val midi = if (!inst.isPitched) inst.midiBase else inst.midiBase + (note.key - 33)
+                        NotePitch(midi, inst)
                     }?.groupingBy { it }?.eachCount() ?: emptyMap()
                 } else {
                     val midi = MidiFilePlayer.loadedMidi ?: try { MidiFilePlayer.load(file) } catch (e: Exception) { null }
@@ -1112,15 +1163,17 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
         playSelectedSong()
     }
 
-    private fun selectFile(file: File) {
+    private fun selectFile(file: File, stopPlayback: Boolean = false) {
         SongAudioPreviewer.stopPreview()
         selectedFile = file
         selectedIndex = midiFiles.indexOfFirst { it.name.equals(file.name, ignoreCase = true) }
         if (::songListWidget.isInitialized && songListWidget.getSelectedFile() != file) {
             songListWidget.setFiles(displayedFiles, selectedFile)
         }
-        MidiFilePlayer.stop()
-        NbsPlayer.stop()
+        if (stopPlayback) {
+            MidiFilePlayer.stop()
+            NbsPlayer.stop()
+        }
         readinessMessage = ""
         coverageMessage = ""
         var loadFailed = false
@@ -1128,7 +1181,12 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
         if (file.extension.lowercase() in listOf("mid", "midi")) {
             loadedNbs = null
             try {
-                val midi = MidiFilePlayer.load(file)
+                // Use parse() so selecting/inspecting a file does NOT overwrite active playback state
+                val midi = if (MidiFilePlayer.loadedMidi?.file == file) {
+                    MidiFilePlayer.loadedMidi!!
+                } else {
+                    MidiFilePlayer.parse(file)
+                }
                 logger.info("selectFile: ${file.name} -- ${midi.events.size} events")
                 chat("Loaded: ${file.name} (${midi.distinctNotes.size} distinct notes)")
 
@@ -1177,7 +1235,8 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
                 val nbsRequirements: Set<NotePitch> = nbs.notes
                     .mapNotNull { note ->
                         val inst = nbsInstrumentToBlock(note.instrument) ?: return@mapNotNull null
-                        NotePitch(note.key + 21, inst)
+                        val midi = if (!inst.isPitched) inst.midiBase else inst.midiBase + (note.key - 33)
+                        NotePitch(midi, inst)
                     }.toSet()
 
                 MaterialsShoppingOverlay.updateRequirements(nbsRequirements)
@@ -1247,6 +1306,7 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
                 tuner = null
                 activeTuner = null
                 tuneStatusMsg = ""
+                tuningError = null
                 organScanMessage = "Tuning complete! Press Play."
                 chat("Tuning complete!")
                 logger.info("tick: tuning complete, pendingAutoPlay=$pendingAutoPlay")
@@ -1260,13 +1320,15 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
                     startPlayback()
                 }
             } else if (t.isFailed) {
+                val reason = t.failureReason ?: "Verification failed after retries"
+                tuningError = reason
                 tuner = null
                 activeTuner = null
                 tuneStatusMsg = ""
                 pendingAutoPlay = false
                 pendingNextFile = null
-                chatWarn("Tuning failed -- check logs for details")
-                logger.warn("tick: tuning failed")
+                chatWarn("Tuning failed: $reason")
+                logger.warn("tick: tuning failed: $reason")
             }
         }
 
@@ -1345,12 +1407,16 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
         val q = getUpcomingQueue()
         if (q.isEmpty()) {
             val emptyMsg = when (ConfigManager.config.loopModeEnum()) {
-                LoopMode.NONE -> "(End of queue -- enable Loop ALL or Shuffle to auto-advance tracks)"
+                LoopMode.NONE -> "(Queue is empty -- click '+Q' on tracks in Library to enqueue)"
                 else -> "(Queue is empty -- select a track or add files to midis directory)"
             }
             graphics.text(font, emptyMsg, 14, 54, opaque(0xAAAAAA))
         } else {
-            val countStr = "${q.size} tracks queued"
+            val countStr = if (UserPlayQueue.isNotEmpty()) {
+                "${UserPlayQueue.size} custom, ${q.size} total queued"
+            } else {
+                "${q.size} tracks queued"
+            }
             graphics.text(font, countStr, width - font.width(countStr) - 16, 30, opaque(0xAAAAAA))
         }
     }
@@ -1405,11 +1471,12 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
 
         // Status badge
         val (statusText, statusBg) = when {
-            isTuning  -> Pair("TUNING", 0xFFAA00)
-            isPlaying -> Pair("PLAYING", 0x55FF77)
-            isPaused  -> Pair("PAUSED", 0xFFFF55)
-            isPreview -> Pair("PREVIEW", 0x55FFFF)
-            else      -> Pair("READY", 0x889988)
+            isTuning            -> Pair("TUNING", 0xFFAA00)
+            tuningError != null -> Pair("FAILED", 0xFF5555)
+            isPlaying           -> Pair("PLAYING", 0x55FF77)
+            isPaused            -> Pair("PAUSED", 0xFFFF55)
+            isPreview           -> Pair("PREVIEW", 0x55FFFF)
+            else                -> Pair("READY", 0x889988)
         }
         graphics.text(font, "[$statusText]", scrX + 16, scrY + 6, opaque(statusBg))
 

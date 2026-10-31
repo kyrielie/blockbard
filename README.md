@@ -75,10 +75,13 @@ BlockBard provides full Fabric client commands registered under `/blockbard` (or
 4. **Choose a Track**:
    - In the **Files** tab, select a `.mid` or `.nbs` file from your `config/blockbard/midis/` directory.
    - Review the pre-flight readiness report in the organ view. If notes are missing, consult the material hints to add required blocks.
-5. **Auto-Tune**:
-   - Click **Tune** in the **Organ** tab. BlockBard will aim at each block, send the required right-click pulses, verify the final pitches against the server, and confirm when complete.
-6. **Play**:
-   - Switch to the **Files** tab and press **Play**. Use the tempo buttons (<kbd>Tempo -</kbd> / <kbd>Tempo +</kbd>) and loop controls (<kbd>Loop</kbd>) to manage playback.
+5. **Auto-Tune & Play**:
+   - Click **Tune & Play** (or double-click any song). BlockBard calculates the minimal delta clicks, aims and right-clicks blocks to tune them, verifies pitches against the server, and immediately transitions to left-click world playback.
+   - For complete chromatic organs (25 blocks per instrument covering notes 0–24), tuning is skipped entirely and playback starts instantly.
+6. **Playback & Queue Management**:
+   - Manage playback with the bottom transport bar: **▶ Play / ❚❚ Pause** (freezes and resumes at exact millisecond), **⏹ Stop** (terminates playback, resets position to 0:00, clears scheduler queue and cancels auto-advance), **|◀ Prev / ▶| Next**, **Tempo - / +**, and **Loop mode** (`NONE`, `LOOP_ONE`, `LOOP_ALL`, `SHUFFLE_ALL`).
+   - Switch to the **Queue** tab to view upcoming tracks, durations, and summaries. In Shuffle mode, click `[✕]` on any track to remove it from the upcoming shuffle list, or click **🔀 Reshuffle** to re-randomize.
+   - Press <kbd>H</kbd> in-game to toggle the on-screen HUD overlay showing song progress, ticks, tempo, and notes played.
 
 ---
 
@@ -90,7 +93,7 @@ BlockBard is split cleanly between a pure logic common module (`src/main`) and a
 src/
 ├── main/kotlin/kyrielie/blockbard/
 │   ├── organ/
-│   │   ├── ArpeggioScheduler.kt    # Rate-limited note dispatch queue & history ring buffer
+│   │   ├── ArpeggioScheduler.kt    # Rate-limited note dispatch queue, multi-voice & history ring buffer
 │   │   ├── InstrumentShifter.kt    # Pitch-shifting & octave transposition engine
 │   │   ├── MidiToOrganMapper.kt    # Note-to-block assignment & tune target calculator
 │   │   ├── MobHeadBlocks.kt        # Mob skull definitions for ambient noteblocks
@@ -99,6 +102,7 @@ src/
 │   │   ├── NoteBlockTuner.kt       # Latency-compensated tuning state machine
 │   │   └── OrganMap.kt             # Precomputed reach and aim data from player position
 │   └── util/
+│       ├── BlockBardLogBuffer.kt   # In-memory circular log buffer for GUI inspection
 │       ├── DebugLog.kt             # High-performance conditional logging
 │       ├── InstrumentMaterials.kt  # Foundation block material mapping hints
 │       ├── LittleEndianReader.kt   # Stream extensions with strict EOF validation
@@ -109,12 +113,18 @@ src/
     ├── command/
     │   └── BlockBardCommands.kt    # Fabric client commands (/blockbard and /bb)
     ├── config/
-    │   └── BlockBardConfig.kt      # Configuration data model & JSON manager
+    │   ├── BlockBardConfig.kt      # Configuration data model & JSON manager
+    │   └── BlockBardYaclConfig.kt  # Yet Another Config Lib (YACL) GUI configuration screen
     ├── gui/
     │   ├── BlockBardModMenuIntegration.kt # ModMenu entrypoint
-    │   ├── MainScreen.kt           # Primary tabbed GUI (Files, Organ, Settings)
+    │   ├── MainScreen.kt           # Primary tabbed GUI (Files, Queue, Organ, Logs)
+    │   ├── QueueListWidget.kt      # Upcoming track queue with shuffle removal
+    │   ├── SongListWidget.kt       # Filterable song library list with favorite stars
+    │   ├── LogListWidget.kt        # In-game log viewer with clipboard copying
+    │   ├── VirtualKeyboardWidget.kt# Interactive on-screen piano keyboard
     │   ├── MaterialsShoppingOverlay.kt # Survival materials item-stack HUD overlay
-    │   └── PlaybackHud.kt          # On-screen HUD overlay via HudElementRegistry
+    │   ├── PlaybackHud.kt          # On-screen HUD overlay via HudElementRegistry
+    │   └── VisualizerState.kt      # Real-time note visualizer tracking
     ├── input/
     │   ├── KeyboardInputHandler.kt # 1-9 note trigger dispatcher
     │   └── MidiInputHandler.kt     # USB/Hardware MIDI receiver
@@ -124,12 +134,13 @@ src/
     │   ├── MidiInstrumentMap.kt    # Instrument mapping & percussion tables
     │   └── OrganReadinessChecker.kt# Song coverage vs organ analysis
     ├── organ/
-    │   └── OrganScanner.kt         # Client-side world block scanner
+    │   └── OrganScanner.kt         # Client-side world block scanner (cubic & spherical)
     ├── playback/
     │   ├── MidiFilePlayer.kt       # Sequence loader & scheduler driver
     │   ├── MidiTempoMap.kt         # Dynamic tempo event mapping (accelerandos/ritardandos)
     │   ├── NbsFileLoader.kt        # NBS parser & synchronized NbsPlayer
-    │   └── SongAudioPreviewer.kt   # Client-side sound engine audio auditioning
+    │   ├── SongAudioPreviewer.kt   # Client-side sound engine audio auditioning
+    │   └── SongMetadataCache.kt    # Duration, tempo, and summary metadata caching
     ├── player/
     │   ├── KickDiagnostics.kt      # Post-disconnect analysis & send history dumping
     │   ├── PlayerController.kt     # Rotation interpolation, left-click & right-click actions

@@ -63,7 +63,7 @@ object SongMetadataCache {
                 SongMetadata(durationSecs, bpm, distinct, isNbs = true)
             }
             "mid", "midi" -> {
-                val midi = MidiFilePlayer.load(file)
+                val midi = MidiFilePlayer.parse(file)
                 val lastTick = midi.events.lastOrNull()?.tick ?: 0L
                 val durationMs = midi.tempoMap.tickToMs(lastTick)
                 val durationSecs = (durationMs / 1000).toInt()

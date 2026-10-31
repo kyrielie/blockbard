@@ -22,6 +22,13 @@ fun DataInputStream.readLEShort(field: String): Short {
     return ((b1 shl 8) or b0).toShort()
 }
 
+/** Reads a 2-byte little-endian unsigned short as an Int (0..65535). [field] describes what is being read, for EOFException messages. */
+fun DataInputStream.readLEUShort(field: String): Int {
+    val b0 = readByteChecked("$field (byte 0)")
+    val b1 = readByteChecked("$field (byte 1)")
+    return ((b1 and 0xFF) shl 8) or (b0 and 0xFF)
+}
+
 /** Reads a 4-byte little-endian signed int. [field] describes what is being read, for EOFException messages. */
 fun DataInputStream.readLEInt(field: String): Int {
     val b0 = readByteChecked("$field (byte 0)")

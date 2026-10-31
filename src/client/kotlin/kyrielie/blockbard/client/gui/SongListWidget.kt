@@ -17,7 +17,8 @@ class SongListWidget(
     itemHeight: Int = 26,
     private val onSelect: (File) -> Unit,
     private val onDoubleClick: ((File) -> Unit)? = null,
-    private val onToggleFavorite: ((File) -> Unit)? = null
+    private val onToggleFavorite: ((File) -> Unit)? = null,
+    private val onAddToQueue: ((File) -> Unit)? = null
 ) : ObjectSelectionList<SongListWidget.SongEntry>(minecraft, width, height, y, itemHeight) {
 
     private var isRefreshingFiles = false
@@ -112,10 +113,16 @@ class SongListWidget(
             val name = file.nameWithoutExtension.take(maxChars)
             graphics.text(font, name, x + 46, y + 2, nameColor)
 
+            // +Queue button
+            val qBtnX = x + w - 18
+            val qBtnHovered = mouseX >= qBtnX - 2 && mouseX <= qBtnX + 16 && mouseY >= y + 1 && mouseY <= y + 13
+            val qBtnColor = if (qBtnHovered) opaque(0x55FF55) else opaque(0x77AA77)
+            graphics.text(font, "+Q", qBtnX, y + 2, qBtnColor)
+
             // File size
             val kb = file.length() / 1024
             val sizeStr = "${kb}KB"
-            graphics.text(font, sizeStr, x + w - font.width(sizeStr) - 4, y + 2, opaque(0x888888))
+            graphics.text(font, sizeStr, qBtnX - font.width(sizeStr) - 6, y + 2, opaque(0x888888))
 
             // Metadata subtext
             val meta = SongMetadataCache.get(file)
@@ -127,8 +134,13 @@ class SongListWidget(
         override fun mouseClicked(event: MouseButtonEvent, doubleClick: Boolean): Boolean {
             if (event.button() == 0) {
                 val entryX = getContentX()
+                val entryW = getContentWidth()
                 if (event.x() >= entryX && event.x() <= entryX + 22) {
                     onToggleFavorite?.invoke(file)
+                    return true
+                }
+                if (event.x() >= entryX + entryW - 22) {
+                    onAddToQueue?.invoke(file)
                     return true
                 }
                 this@SongListWidget.setSelected(this)
