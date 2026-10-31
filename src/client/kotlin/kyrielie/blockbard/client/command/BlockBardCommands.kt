@@ -283,6 +283,58 @@ object BlockBardCommands {
                 )
             root.then(remapCmd)
 
+            // /blockbard highlights
+            root.then(ClientCommands.literal("highlights")
+                .executes { ctx ->
+                    val active = kyrielie.blockbard.client.render.ManualTuningHighlighter.all()
+                    if (active.isEmpty()) {
+                        ctx.source.sendFeedback(Component.literal("§b[BlockBard] §fNo noteblocks currently require manual tuning."))
+                    } else {
+                        ctx.source.sendFeedback(Component.literal("§b[BlockBard] §e${active.size} block(s) highlighted for manual tuning:"))
+                        active.forEach { (pos, info) ->
+                            val targetMidi = kyrielie.blockbard.util.noteIndexToMidi(info.instrument, info.targetNote)
+                            val name = kyrielie.blockbard.util.midiNoteToName(targetMidi)
+                            ctx.source.sendFeedback(Component.literal("  §7- §f${pos.x}, ${pos.y}, ${pos.z} §6(${info.instrument.name}) §f-> §e$name §c[${info.failState.tag}]"))
+                        }
+                    }
+                    1
+                }
+            )
+
+            // /blockbard clearhighlights
+            root.then(ClientCommands.literal("clearhighlights")
+                .executes { ctx ->
+                    val count = kyrielie.blockbard.client.render.ManualTuningHighlighter.count()
+                    kyrielie.blockbard.client.render.ManualTuningHighlighter.clear()
+                    ctx.source.sendFeedback(Component.literal("§b[BlockBard] §fCleared $count manual tuning highlight(s)."))
+                    1
+                }
+            )
+
+            // /blockbard overlay
+            root.then(ClientCommands.literal("overlay")
+                .executes { ctx ->
+                    val on = kyrielie.blockbard.client.render.OrganOverlayRenderer.toggle()
+                    ctx.source.sendFeedback(Component.literal("§b[BlockBard] §fOrgan hologram ${if (on) "§aenabled" else "§cdisabled"}"))
+                    1
+                }
+            )
+
+            // /blockbard blueprint
+            root.then(ClientCommands.literal("blueprint")
+                .executes { ctx ->
+                    val on = kyrielie.blockbard.client.render.OrganBlueprintBuilder.toggle()
+                    val count = kyrielie.blockbard.client.render.OrganBlueprintBuilder.totalPlanned()
+                    ctx.source.sendFeedback(Component.literal("§b[BlockBard] §fStage blueprint guide ${if (on) "§aenabled ($count blocks)" else "§cdisabled"}"))
+                    1
+                }
+                .then(ClientCommands.literal("clear").executes { ctx ->
+                    kyrielie.blockbard.client.render.OrganBlueprintBuilder.clear()
+                    ctx.source.sendFeedback(Component.literal("§b[BlockBard] §fCleared stage blueprint guide."))
+                    1
+                })
+            )
+
             val registeredRoot = dispatcher.register(root)
             dispatcher.register(ClientCommands.literal("bb").redirect(registeredRoot))
             logger.info("Registered /blockbard and /bb client commands")

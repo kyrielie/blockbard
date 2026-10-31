@@ -23,6 +23,21 @@ object NoteBlockRegistry {
 
     private val logger = LoggerFactory.getLogger("BlockBard/NoteBlockRegistry")
     private val entries: MutableMap<BlockPos, NoteBlockEntry> = LinkedHashMap()
+    private val untunableBlocks: MutableMap<BlockPos, TuningFailState> = LinkedHashMap()
+
+    fun markUntunable(pos: BlockPos, reason: TuningFailState) {
+        untunableBlocks[pos] = reason
+    }
+
+    fun isUntunable(pos: BlockPos): Boolean = untunableBlocks.containsKey(pos)
+
+    fun getUntunableReason(pos: BlockPos): TuningFailState? = untunableBlocks[pos]
+
+    fun allUntunable(): Map<BlockPos, TuningFailState> = untunableBlocks.toMap()
+
+    fun clearUntunable() {
+        untunableBlocks.clear()
+    }
 
     fun update(newEntries: List<NoteBlockEntry>) {
         entries.clear()
@@ -94,6 +109,7 @@ object NoteBlockRegistry {
 
     /** Update a specific entry's noteIndex after tuning. */
     fun updateTunedNote(pos: BlockPos, newNoteIndex: Int) {
+        untunableBlocks.remove(pos)
         val existing = entries[pos] ?: return
         entries[pos] = existing.copy(
             noteIndex = newNoteIndex,

@@ -121,6 +121,14 @@ object BlockBardYaclConfig {
                     .tooltip(Component.literal("Camera smoothing and anticheat evasion settings"))
                     .option(
                         Option.createBuilder<Boolean>()
+                            .name(Component.literal("Reach-Through (Hit Blocked Blocks)"))
+                            .description(OptionDescription.of(Component.literal("Allows striking and tuning noteblocks through walls, floors, or other noteblocks (SongPlayer style). Leave OFF on strict anticheat servers (GrimAC/Vulcan) that flag line-of-sight violations.")))
+                            .binding(Binding.generic(false, { cfg.reachThrough }, { cfg.reachThrough = it }))
+                            .controller(TickBoxControllerBuilder::create)
+                            .build()
+                    )
+                    .option(
+                        Option.createBuilder<Boolean>()
                             .name(Component.literal("Smooth Camera Rotation (Playback)"))
                             .description(OptionDescription.of(Component.literal("Smoothly rotates player view toward target blocks during playback. Leave OFF to play without camera movement.")))
                             .binding(Binding.generic(false, { cfg.smoothCameraRotation }, { cfg.smoothCameraRotation = it }))

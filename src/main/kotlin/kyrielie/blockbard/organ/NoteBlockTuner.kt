@@ -22,6 +22,18 @@ data class TuneTarget(
 enum class TunerState { IDLE, TUNING, VERIFYING, DONE, FAILED }
 
 /**
+ * Categorized failstates for noteblock tuning failures.
+ */
+enum class TuningFailState(val tag: String, val description: String) {
+    OCCLUDED("OCCLUDED", "Blocked by intervening blocks; cannot tune through other blocks"),
+    OUT_OF_REACH("OUT_OF_REACH", "Beyond survival reach distance"),
+    UNRESPONSIVE("UNRESPONSIVE", "Note did not change after clicks (server anticheat dropped packet or region protected)"),
+    INTERACT_REJECTED("INTERACT_REJECTED", "Interaction could not be initiated (no empty hotbar slot or invalid gamemode)"),
+    BLOCK_MISSING("BLOCK_MISSING", "Block missing or destroyed in world"),
+    DESYNC("DESYNC", "Note advanced but did not reach target within retry limit")
+}
+
+/**
  * Stateful, anticheat-safe noteblock tuner.
  *
  * Uses deterministic click tracking with verification:
@@ -40,6 +52,8 @@ class NoteBlockTuner(
     private val primeRotation: ((BlockPos) -> Unit)? = null,
     private val rotationConverged: ((BlockPos) -> Boolean)? = null,
     var fastTuning: Boolean = true,
+    private val diagnoseFailState: ((BlockPos, Int?, Int) -> TuningFailState?)? = null,
+    private val onBlockFailed: ((TuneTarget, TuningFailState, Int?, Int) -> Unit)? = null,
     val onProgress: (done: Int, total: Int, msg: String) -> Unit = { _, _, _ -> }
 ) {
     private val logger = LoggerFactory.getLogger("BlockBard/NoteBlockTuner")
@@ -51,6 +65,11 @@ class NoteBlockTuner(
 
     // Pos -> remaining clicks required to reach target note
     private val remainingClicks = mutableMapOf<BlockPos, Int>()
+
+    // Tracking initial vs observed notes across attempts
+    private val initialNotes = mutableMapOf<BlockPos, Int>()
+    private val lastObservedNotes = mutableMapOf<BlockPos, Int>()
+    val failedTargets = mutableMapOf<TuneTarget, TuningFailState>()
 
     // Token bucket (Paper limit: 8 interacts per 310ms)
     private var availableInteracts: Float = 8f
@@ -77,10 +96,15 @@ class NoteBlockTuner(
         }
 
         remainingClicks.clear()
+        initialNotes.clear()
+        lastObservedNotes.clear()
+        failedTargets.clear()
         alreadyTunedAtStart = 0
 
         targets.forEach { t ->
             val liveNote = worldNoteReader(t.pos) ?: t.snapshotNote
+            initialNotes[t.pos] = liveNote
+            lastObservedNotes[t.pos] = liveNote
             val needed = clicksNeeded(liveNote, t.targetNote)
             if (needed == 0) {
                 alreadyTunedAtStart++
@@ -231,12 +255,13 @@ class NoteBlockTuner(
             val worldNote = worldNoteReader(target.pos)
             if (worldNote == null) {
                 allGood = false
-                val msg = "${target.pos} missing from world"
+                val msg = "[BLOCK_MISSING] ${target.pos} missing from world"
                 mismatches.add(msg)
                 logger.warn("NoteBlockTuner: $msg")
                 BlockBardLogBuffer.warn("Tuner", msg)
                 continue
             }
+            lastObservedNotes[target.pos] = worldNote
             if (worldNote == target.targetNote) {
                 confirmedCount++
                 NoteBlockRegistry.updateTunedNote(target.pos, worldNote)
@@ -244,7 +269,7 @@ class NoteBlockTuner(
                 allGood = false
                 val needed = clicksNeeded(worldNote, target.targetNote)
                 remainingClicks[target.pos] = needed
-                val desc = "${target.pos}: got $worldNote expected ${target.targetNote} ($needed clicks needed)"
+                val desc = "${target.pos} (${target.instrument.name}): got $worldNote expected ${target.targetNote} ($needed clicks needed)"
                 mismatches.add(desc)
                 logger.warn("NoteBlockTuner: $desc")
             }
@@ -261,11 +286,37 @@ class NoteBlockTuner(
             retryCount++
             if (retryCount > maxRetries) {
                 state = TunerState.FAILED
-                val failMsg = "Tuning failed after $maxRetries retries: ${mismatches.joinToString("; ")}"
+                failedTargets.clear()
+                val failReports = mutableListOf<String>()
+
+                for (target in targets) {
+                    val worldNote = worldNoteReader(target.pos)
+                    if (worldNote == target.targetNote) continue
+
+                    val failState = diagnoseFailState?.invoke(target.pos, worldNote, target.targetNote)
+                        ?: if (worldNote == null) TuningFailState.BLOCK_MISSING
+                        else if (initialNotes[target.pos] == worldNote) TuningFailState.UNRESPONSIVE
+                        else TuningFailState.DESYNC
+
+                    failedTargets[target] = failState
+                    onBlockFailed?.invoke(target, failState, worldNote, target.targetNote)
+
+                    val targetMidi = noteIndexToMidi(target.instrument, target.targetNote)
+                    val targetName = midiNoteToName(targetMidi)
+                    val currentDesc = if (worldNote != null) "$worldNote (${midiNoteToName(noteIndexToMidi(target.instrument, worldNote))})" else "missing"
+                    val report = "[${failState.tag}] ${target.pos} (${target.instrument.name}) current=$currentDesc -> target=$targetName: ${failState.description}"
+                    failReports.add(report)
+                    logger.warn("NoteBlockTuner failstate: $report")
+                    BlockBardLogBuffer.error("Tuner", report)
+                }
+
+                val failSummary = failedTargets.entries.groupBy { it.value }
+                    .map { (state, list) -> "${list.size} ${state.tag}" }.joinToString(", ")
+                val failMsg = "Tuning stopped: $confirmedCount/$total tuned. ${failedTargets.size} block(s) require manual tuning ($failSummary)"
                 failureReason = failMsg
                 logger.warn("NoteBlockTuner: $failMsg")
                 BlockBardLogBuffer.error("Tuner", failMsg)
-                onProgress(confirmedCount, total, "FAILED: ${mismatches.size} blocks did not tune")
+                onProgress(confirmedCount, total, "Requires manual tuning: $failSummary")
             } else {
                 val retryMsg = "Verification mismatch (${mismatches.size} blocks), retrying (attempt $retryCount/$maxRetries): ${mismatches.take(3).joinToString("; ")}"
                 logger.warn("NoteBlockTuner: $retryMsg")

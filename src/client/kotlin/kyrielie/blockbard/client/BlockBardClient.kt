@@ -29,6 +29,7 @@ object BlockBardClient : ClientModInitializer {
 
     private lateinit var openGuiKey: KeyMapping
     private lateinit var toggleHudKey: KeyMapping
+    private lateinit var toggleOverlayKey: KeyMapping
     private var soundVerifierRegistered = false
     private var liveSyncTicker = 0
 
@@ -80,12 +81,18 @@ object BlockBardClient : ClientModInitializer {
         toggleHudKey = KeyMappingHelper.registerKeyMapping(
             KeyMapping("key.blockbard.toggle_hud", InputConstants.KEY_H, blockbardCategory)
         )
-        logger.info("Keybindings registered: B=open GUI, H=toggle HUD")
+        toggleOverlayKey = KeyMappingHelper.registerKeyMapping(
+            KeyMapping("key.blockbard.toggle_overlay", InputConstants.KEY_O, blockbardCategory)
+        )
+        logger.info("Keybindings registered: B=open GUI, H=toggle HUD, O=toggle hologram overlay")
 
         KeyboardInputHandler.register()
         PlaybackHud.isVisible = cfg.hudEnabled
         PlaybackHud.register()
         KickDiagnostics.register()
+        kyrielie.blockbard.client.render.ManualTuningHighlighter.register()
+        kyrielie.blockbard.client.render.OrganOverlayRenderer.register()
+        kyrielie.blockbard.client.render.OrganBlueprintBuilder.register()
         kyrielie.blockbard.client.gui.MaterialsShoppingOverlay.register()
         kyrielie.blockbard.client.command.BlockBardCommands.register()
 
@@ -111,6 +118,7 @@ object BlockBardClient : ClientModInitializer {
                 liveSyncTicker = 0
                 mc.level?.let { NoteBlockRegistry.refreshLiveNoteValues(it) }
             }
+            kyrielie.blockbard.client.render.ManualTuningHighlighter.updateWorldState()
 
             while (openGuiKey.consumeClick()) {
                 logger.info("B pressed -- opening MainScreen")
@@ -123,6 +131,12 @@ object BlockBardClient : ClientModInitializer {
                 val status = if (PlaybackHud.isVisible) "enabled" else "disabled"
                 mc.player?.sendSystemMessage(net.minecraft.network.chat.Component.literal("§b[BlockBard] §fPlayback HUD $status"))
                 logger.info("H pressed -- HUD visible=${PlaybackHud.isVisible}")
+            }
+            while (toggleOverlayKey.consumeClick()) {
+                val on = kyrielie.blockbard.client.render.OrganOverlayRenderer.toggle()
+                val status = if (on) "§aenabled" else "§cdisabled"
+                mc.player?.sendSystemMessage(net.minecraft.network.chat.Component.literal("§b[BlockBard] §fOrgan hologram overlay $status"))
+                logger.info("O pressed -- Organ overlay visible=$on")
             }
             MainScreen.onClientTick(mc)
             ArpeggioScheduler.onTick()
