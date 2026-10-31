@@ -1142,6 +1142,38 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
             chatWarn("$unplayableCount notes will be silent -- organ incomplete (see Files tab)")
         }
 
+        val map = PlayerController.organMap
+        val reachable = if (map != null) NoteBlockRegistry.allPlayable().filter { map.isReachable(it.pos) } else emptyList()
+
+        // Compile lookahead dynamic performance plan if enabled
+        if (ConfigManager.config.dynamicRetuning && reachable.isNotEmpty()) {
+            val timelineNotes: List<TimelineNote> = if (file.extension.lowercase() == "nbs") {
+                val nbs = loadedNbs ?: try { NbsFileLoader.load(file).also { loadedNbs = it } } catch (e: Exception) { null }
+                nbs?.notes?.mapNotNull { note ->
+                    val inst = nbsInstrumentToBlock(note.instrument) ?: return@mapNotNull null
+                    val midi = if (!inst.isPitched) inst.midiBase else inst.midiBase + (note.key - 33)
+                    val timeMs = (note.tick / nbs.tempo * 1000.0).toLong()
+                    TimelineNote(timeMs, midi, inst)
+                } ?: emptyList()
+            } else {
+                val midi = MidiFilePlayer.loadedMidi ?: try { MidiFilePlayer.load(file) } catch (e: Exception) { null }
+                midi?.events?.map { ev ->
+                    val timeMs = midi.tempoMap.tickToMs(ev.tick)
+                    TimelineNote(timeMs, ev.midiNote, ev.instrument)
+                } ?: emptyList()
+            }
+
+            if (timelineNotes.isNotEmpty()) {
+                val plan = TimelineVoiceAllocator.compilePlan(timelineNotes, reachable)
+                ArpeggioScheduler.loadRetuneSchedule(plan.retuneTasks)
+                val stats = plan.stats
+                logger.info("Dynamic Retuning Plan loaded: ${stats.lookaheadRetunesScheduled} rest retunes for ${stats.totalNotes} notes across ${stats.physicalBlocksUsed} blocks")
+                if (stats.lookaheadRetunesScheduled > 0) {
+                    chat("Dynamic Retuning: ${stats.lookaheadRetunesScheduled} rest retunes scheduled across ${stats.physicalBlocksUsed} blocks.")
+                }
+            }
+        }
+
         SoundVerifier.reset()
 
         if (file.extension.lowercase() == "nbs") {
