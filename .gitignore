@@ -111,3 +111,7 @@ repomix-output.xml
 blockbard.xml
 blockbard.xml
 *.xml
+
+# Local development references
+LOCAL_DEV_REFERENCES.md
+*.local.md

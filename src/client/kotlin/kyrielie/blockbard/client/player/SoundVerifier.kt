@@ -79,6 +79,9 @@ object SoundVerifier : SoundEventListener {
     private var misses = 0
     private var sinceLastSummary = 0
 
+    val hitCount: Int get() = synchronized(lock) { hits }
+    val missCount: Int get() = synchronized(lock) { misses }
+
     /**
      * Registers an expectation: "the next note_block sound near [pos] should be
      * [instrument] (or any, if null) playing MIDI note [midiNote]." Called by
@@ -104,16 +107,15 @@ object SoundVerifier : SoundEventListener {
             val now = System.currentTimeMillis()
             pruneExpired(now)
 
-            val expectation = pending.firstOrNull()
+            // Position-aware matching: chords emit sounds simultaneously; match by block coordinate
+            val soundPos = BlockPos(sound.x.toInt(), sound.y.toInt(), sound.z.toInt())
+            val matchIndex = pending.indexOfFirst { it.pos.distManhattan(soundPos) <= 1 }
+            val expectation = if (matchIndex >= 0) pending.removeAt(matchIndex) else pending.removeFirstOrNull()
             if (expectation == null) {
-                // A note_block sound played with nothing pending — e.g. redstone-triggered,
-                // or this is the scale test's own rapid-fire pattern outracing registration.
-                // Not necessarily a bug; log at debug rather than spam warn for every one.
-                logger.debug("unmatched note_block sound: $instrumentName idx=${actualNoteIndex ?: "?"} (no pending expectation)")
+                logger.debug("unmatched note_block sound: $instrumentName idx=${actualNoteIndex ?: "?"} at $soundPos (no pending expectation)")
                 return
             }
 
-            pending.removeFirst()
             val expectedDesc = expectation.instrument?.name ?: "any"
             val expectedNoteIndex = expectation.instrument?.let { midiToNoteIndex(expectation.midiNote, it) }
             val instrumentMatches = expectation.instrument == null || expectation.instrument == actualInstrument
@@ -122,16 +124,15 @@ object SoundVerifier : SoundEventListener {
 
             if (instrumentMatches && (expectedNoteIndex == null || noteMatches)) {
                 hits++
-                logger.info(
+                logger.debug(
                     "OK   MIDI $midiLabel -> ${actualInstrument?.name ?: instrumentName} idx${actualNoteIndex ?: "?"} (${expectation.pos})"
                 )
             } else {
                 misses++
-                logger.warn(
-                    "MISS MIDI $midiLabel -> expected $expectedDesc" +
-                        (expectedNoteIndex?.let { " idx$it" } ?: "") +
-                        ", got ${actualInstrument?.name ?: instrumentName} idx${actualNoteIndex ?: "?"} (${expectation.pos})"
-                )
+                val missDesc = "MISS MIDI $midiLabel -> expected $expectedDesc" +
+                    (expectedNoteIndex?.let { " idx$it" } ?: "") +
+                    ", got ${actualInstrument?.name ?: instrumentName} idx${actualNoteIndex ?: "?"} (${expectation.pos})"
+                logger.debug(missDesc)
             }
             sinceLastSummary++
             if (sinceLastSummary >= summaryEvery) {
@@ -150,7 +151,7 @@ object SoundVerifier : SoundEventListener {
             val timedOut = pending.removeFirst()
             misses++
             sinceLastSummary++
-            logger.warn(
+            logger.debug(
                 "MISS MIDI ${timedOut.midiNote} (${midiNoteToName(timedOut.midiNote)}) -> no note_block sound within ${matchWindowMs}ms (${timedOut.pos})"
             )
             if (sinceLastSummary >= summaryEvery) {
