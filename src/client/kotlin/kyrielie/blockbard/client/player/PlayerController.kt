@@ -225,8 +225,13 @@ object PlayerController {
      * Call every tick a note is pending (START_CLIENT_TICK, before ArpeggioScheduler.onTick()).
      * Use rotationConverged(pos) to check whether it is safe to fire the interact yet.
      */
-    fun primeRotation(pos: BlockPos) {
-        if (!kyrielie.blockbard.client.config.ConfigManager.config.smoothCameraRotation) return
+    fun primeRotation(pos: BlockPos, isTuning: Boolean = false) {
+        val shouldRotate = if (isTuning) {
+            kyrielie.blockbard.client.config.ConfigManager.config.rotateDuringTuning
+        } else {
+            kyrielie.blockbard.client.config.ConfigManager.config.smoothCameraRotation
+        }
+        if (!shouldRotate) return
         val mc = Minecraft.getInstance()
         val player = mc.player ?: return
         val eyePos = player.eyePosition
@@ -274,8 +279,13 @@ object PlayerController {
      * Returns true once the player's current rotation is within
      * ROTATION_CONVERGENCE_THRESHOLD_DEGREES of [pos]'s target rotation.
      */
-    fun rotationConverged(pos: BlockPos): Boolean {
-        if (!kyrielie.blockbard.client.config.ConfigManager.config.smoothCameraRotation) return true
+    fun rotationConverged(pos: BlockPos, isTuning: Boolean = false): Boolean {
+        val shouldRotate = if (isTuning) {
+            kyrielie.blockbard.client.config.ConfigManager.config.rotateDuringTuning
+        } else {
+            kyrielie.blockbard.client.config.ConfigManager.config.smoothCameraRotation
+        }
+        if (!shouldRotate) return true
         val mc = Minecraft.getInstance()
         val player = mc.player ?: return false
         val primed = primedRotation?.takeIf { it.first == pos } ?: return false
@@ -449,16 +459,25 @@ object PlayerController {
         primedRotation = null
 
         // Snap or ease rotation and send to server so server raycast validation matches
-        player.setYRot(yaw)
-        player.setXRot(pitch)
-        player.connection.send(
-            net.minecraft.network.protocol.game.ServerboundMovePlayerPacket.Rot(
-                yaw,
-                pitch,
-                player.onGround(),
-                player.horizontalCollision
+        val isTuning = caller == "interactWith"
+        val shouldRotate = if (isTuning) {
+            kyrielie.blockbard.client.config.ConfigManager.config.rotateDuringTuning
+        } else {
+            kyrielie.blockbard.client.config.ConfigManager.config.smoothCameraRotation
+        }
+
+        if (shouldRotate) {
+            player.setYRot(yaw)
+            player.setXRot(pitch)
+            player.connection.send(
+                net.minecraft.network.protocol.game.ServerboundMovePlayerPacket.Rot(
+                    yaw,
+                    pitch,
+                    player.onGround(),
+                    player.horizontalCollision
+                )
             )
-        )
+        }
 
         val liveHit = mc.hitResult
         return if (
@@ -542,6 +561,20 @@ object PlayerController {
         }
 
         val hitResult = aimAt(pos, "playNoteAt") ?: return false
+
+        // Confirm live note value from world blockstate before attacking
+        val level = mc.level
+        if (level != null) {
+            val state = level.getBlockState(pos)
+            if (state.`is`(net.minecraft.world.level.block.Blocks.NOTE_BLOCK)) {
+                val liveNote = state.getValue(net.minecraft.world.level.block.NoteBlock.NOTE)
+                val entry = NoteBlockRegistry.get(pos)
+                if (entry != null && entry.noteIndex != liveNote) {
+                    NoteBlockRegistry.updateTunedNote(pos, liveNote)
+                }
+            }
+        }
+
         val dispatched = mc.gameMode?.startDestroyBlock(pos, hitResult.direction) ?: false
         mc.gameMode?.stopDestroyBlock()
         if (dispatched) {

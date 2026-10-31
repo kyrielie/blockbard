@@ -947,8 +947,8 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
             interactBlock     = { pos -> PlayerController.interactWith(pos) },
             pingMs            = { PlayerController.currentPingMs() },
             fastTuning        = ConfigManager.config.fastTuning,
-            primeRotation     = { pos -> PlayerController.primeRotation(pos) },
-            rotationConverged = { pos -> PlayerController.rotationConverged(pos) },
+            primeRotation     = { pos -> PlayerController.primeRotation(pos, isTuning = true) },
+            rotationConverged = { pos -> PlayerController.rotationConverged(pos, isTuning = true) },
             onProgress        = { done, total, msg ->
                 tuneStatusMsg = "$done/$total -- $msg"
                 logger.debug("tuner progress: $tuneStatusMsg")
@@ -987,8 +987,13 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
             .mapValues { (_, notes) -> notes.map { it.midiNote }.distinct().size }
         val anyInstrumentCount = result.unplayable.count { it.instrument == null }
 
+        val shiftedCount = result.shifts.count { it.value != 0 }
+
         coverageMessage = buildString {
             append("$covered/$total notes covered")
+            if (shiftedCount > 0) {
+                append(". ⚠ $shiftedCount note(s) octave-shifted")
+            }
             if (byInstrument.isNotEmpty()) {
                 append(". Add: ")
                 append(byInstrument.entries.joinToString { (inst, count) ->
@@ -998,6 +1003,15 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
             if (anyInstrumentCount > 0) {
                 append(". $anyInstrumentCount note(s) unplayable on any instrument")
             }
+        }
+        if (shiftedCount > 0) {
+            val shiftDetails = result.shifts.filter { it.value != 0 }
+                .map { (note, shift) -> "${note.displayName()} (${if (shift > 0) "+$shift" else "$shift"} st)" }
+                .take(6).joinToString()
+            logger.warn("coverage: $shiftedCount notes octave-shifted due to organ pitch limits: $shiftDetails")
+            PlaybackHud.lastShiftMessage = "⚠ $shiftedCount notes octave-shifted ($shiftDetails)"
+        } else {
+            PlaybackHud.lastShiftMessage = ""
         }
         logger.info("coverage: $coverageMessage")
     }

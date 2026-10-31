@@ -2,6 +2,7 @@ package kyrielie.blockbard.client.gui
 
 import kyrielie.blockbard.client.playback.MidiFilePlayer
 import kyrielie.blockbard.client.playback.NbsPlayer
+import kyrielie.blockbard.client.player.SoundVerifier
 import kyrielie.blockbard.organ.NoteBlockRegistry
 // HudRenderCallback is gone in 26.x. Use the new HudElement / HudElementRegistry API.
 import net.fabricmc.fabric.api.client.rendering.v1.hud.HudElement

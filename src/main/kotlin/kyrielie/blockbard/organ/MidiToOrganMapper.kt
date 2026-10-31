@@ -85,25 +85,35 @@ object MidiToOrganMapper {
         }
 
         // Pass 2: Minimal-click assignment for notes that didn't have an exact match.
-        // For each remaining note, find the available block of matching instrument that requires
-        // the fewest clicks, tie-broken by distance.
+        // For each remaining note, find the available block that requires the fewest clicks,
+        // prioritizing:
+        // 1. Same authored instrument (natively covering the note, 0 semitone shift)
+        // 2. Instrument shift (different instrument natively covering the exact MIDI note, 0 shift)
+        // 3. Octave shift fallback (transposed by ±12 or ±24 semitones)
         for (note in unassignedNotes) {
             val midiNote = note.midiNote
             val available = reachableBlocks.filter { it.pos !in usedPositions }
-            val instrumentFiltered = if (note.instrument != null) {
-                available.filter { it.instrument == note.instrument }
+
+            // 1. Prefer native coverage on the authored instrument if available
+            val nativeCandidate = if (note.instrument != null) {
+                available
+                    .filter { it.instrument == note.instrument && it.instrument.coversNatively(midiNote) }
+                    .minWithOrNull(
+                        compareBy(
+                            { clicksNeeded(it.noteIndex, midiNote - it.instrument.midiBase) },
+                            { it.distanceFromPlayer }
+                        )
+                    )
             } else {
                 available
-            }
-
-            val nativeCandidate = instrumentFiltered
-                .filter { it.instrument.coversNatively(midiNote) }
-                .minWithOrNull(
-                    compareBy(
-                        { clicksNeeded(it.noteIndex, midiNote - it.instrument.midiBase) },
-                        { it.distanceFromPlayer }
+                    .filter { it.instrument.coversNatively(midiNote) }
+                    .minWithOrNull(
+                        compareBy(
+                            { clicksNeeded(it.noteIndex, midiNote - it.instrument.midiBase) },
+                            { it.distanceFromPlayer }
+                        )
                     )
-                )
+            }
 
             if (nativeCandidate != null) {
                 assignment[note] = nativeCandidate.pos
@@ -114,7 +124,9 @@ object MidiToOrganMapper {
                 continue
             }
 
-            val shiftResult = InstrumentShifter.findBest(midiNote, instrumentFiltered)
+            // 2. Instrument Shift across ALL available instruments: find another instrument that
+            // natively covers this exact pitch with 0 octave shift!
+            val shiftResult = InstrumentShifter.findBest(midiNote, available)
             if (shiftResult != null) {
                 assignment[note] = shiftResult.entry.pos
                 usedPositions.add(shiftResult.entry.pos)
