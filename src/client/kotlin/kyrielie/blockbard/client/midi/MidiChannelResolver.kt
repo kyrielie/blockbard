@@ -3,6 +3,8 @@ package kyrielie.blockbard.client.midi
 import kyrielie.blockbard.client.playback.LoadedMidi
 import kyrielie.blockbard.client.playback.TimedNoteEvent
 import kyrielie.blockbard.organ.NotePitch
+import kyrielie.blockbard.util.isPitched
+import kyrielie.blockbard.util.midiBase
 import net.minecraft.world.level.block.state.properties.NoteBlockInstrument
 import org.slf4j.LoggerFactory
 import javax.sound.midi.MetaMessage
@@ -52,7 +54,11 @@ object MidiChannelResolver {
                 }
             }
         }
-        events.sortBy { it.first }
+        // Sort by tick. At the same tick, ensure PROGRAM_CHANGE precedes NOTE_ON so the new instrument is active.
+        events.sortWith(compareBy(
+            { it.first },
+            { if (it.second.command == ShortMessage.PROGRAM_CHANGE) 0 else 1 }
+        ))
 
         val resolved = mutableListOf<ResolvedNoteEvent>()
         for ((tick, msg) in events) {
@@ -80,9 +86,14 @@ object MidiChannelResolver {
     /**
      * Returns the distinct (instrument, midiNote) pairs that [file] requires.
      * This is the input to [OrganReadinessChecker.check].
+     * Unpitched instruments (BASEDRUM, SNARE, HAT) are collapsed to midiBase so that
+     * only 1 physical block is required for each drum type.
      */
     fun resolveRequirements(file: File): Set<NotePitch> =
-        resolve(file).map { NotePitch(it.midiNote, it.instrument) }.toSet()
+        resolve(file).map { event ->
+            val note = if (!event.instrument.isPitched) event.instrument.midiBase else event.midiNote
+            NotePitch(note, event.instrument)
+        }.toSet()
 
     /**
      * Returns per-channel program assignments as a human-readable summary for the GUI,

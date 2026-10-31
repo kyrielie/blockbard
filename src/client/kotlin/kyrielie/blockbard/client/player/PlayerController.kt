@@ -288,7 +288,10 @@ object PlayerController {
 
     /**
      * Determines the optimal visible face and hit target vector on [pos] from [eyePos],
-     * testing visible candidates using line-of-sight raycasts (Mineflayer digging/ray_trace model).
+     * testing visible candidates using line-of-sight raycasts.
+     *
+     * Only faces geometrically facing [eyePos] are considered candidates to ensure
+     * back-face interactions (such as clicking the top face from below) are rejected.
      */
     private fun findBestVisibleFace(
         world: net.minecraft.world.level.Level,
@@ -299,46 +302,79 @@ object PlayerController {
         val cx = pos.x + 0.5
         val cy = pos.y + 0.5
         val cz = pos.z + 0.5
-        val dx = eyePos.x - cx
-        val dy = eyePos.y - cy
-        val dz = eyePos.z - cz
 
-        // Prioritize faces pointing towards player eye position
-        val candidates = mutableListOf<Direction>()
-        if (dy > 0.1) candidates.add(Direction.UP) else if (dy < -0.1) candidates.add(Direction.DOWN)
-        if (Math.abs(dx) > Math.abs(dz)) {
-            if (dx > 0) candidates.add(Direction.EAST) else candidates.add(Direction.WEST)
-            if (dz > 0) candidates.add(Direction.SOUTH) else candidates.add(Direction.NORTH)
+        // Determine which faces can geometrically face eyePos
+        val candidateFaces = mutableListOf<Direction>()
+        if (eyePos.y > pos.y + 1.0) candidateFaces.add(Direction.UP)
+        if (eyePos.y < pos.y.toDouble()) candidateFaces.add(Direction.DOWN)
+        if (eyePos.x > pos.x + 1.0) candidateFaces.add(Direction.EAST)
+        if (eyePos.x < pos.x.toDouble()) candidateFaces.add(Direction.WEST)
+        if (eyePos.z > pos.z + 1.0) candidateFaces.add(Direction.SOUTH)
+        if (eyePos.z < pos.z.toDouble()) candidateFaces.add(Direction.NORTH)
+
+        if (candidateFaces.isEmpty()) {
+            val delta = Vec3(cx, cy, cz).subtract(eyePos)
+            candidateFaces.addAll(Direction.entries.sortedByDescending { face ->
+                Vec3(face.stepX.toDouble(), face.stepY.toDouble(), face.stepZ.toDouble()).dot(delta)
+            })
         } else {
-            if (dz > 0) candidates.add(Direction.SOUTH) else candidates.add(Direction.NORTH)
-            if (dx > 0) candidates.add(Direction.EAST) else candidates.add(Direction.WEST)
-        }
-        for (dir in Direction.entries) {
-            if (dir !in candidates) candidates.add(dir)
-        }
-
-        for (face in candidates) {
-            val target = when (face) {
-                Direction.UP -> Vec3(cx, pos.y + 1.0, cz)
-                Direction.DOWN -> Vec3(cx, pos.y + 0.0, cz)
-                Direction.NORTH -> Vec3(cx, cy, pos.z + 0.0)
-                Direction.SOUTH -> Vec3(cx, cy, pos.z + 1.0)
-                Direction.WEST -> Vec3(pos.x + 0.0, cy, cz)
-                Direction.EAST -> Vec3(pos.x + 1.0, cy, cz)
+            val deltaToEye = eyePos.subtract(Vec3(cx, cy, cz))
+            candidateFaces.sortByDescending { face ->
+                val normal = Vec3(face.stepX.toDouble(), face.stepY.toDouble(), face.stepZ.toDouble())
+                normal.dot(deltaToEye)
             }
-            val maxReach = REACH_DISTANCE + 0.5
-            if (target.distanceTo(eyePos) > maxReach) continue
+        }
 
+        val maxReach = REACH_DISTANCE + 0.5
+
+        // First attempt: direct ray towards the center of the block.
+        // If clear, it hits the optimal front-facing face directly.
+        val centerTarget = Vec3(cx, cy, cz)
+        if (centerTarget.distanceTo(eyePos) <= maxReach) {
             val clipCtx = ClipContext(
                 eyePos,
-                target,
+                centerTarget,
                 ClipContext.Block.OUTLINE,
                 ClipContext.Fluid.NONE,
                 player
             )
             val clipHit = world.clip(clipCtx)
-            if (clipHit.type == HitResult.Type.MISS || clipHit.blockPos == pos) {
-                return Pair(target, face)
+            if (clipHit.type == HitResult.Type.BLOCK && clipHit.blockPos == pos && clipHit.direction in candidateFaces) {
+                return Pair(clipHit.location, clipHit.direction)
+            }
+        }
+
+        // Second attempt: test raycasts through candidate faces at various offsets (center and edges)
+        // to bypass partial corner obstructions by neighboring blocks.
+        val offsets = doubleArrayOf(0.5, 0.25, 0.75)
+        for (face in candidateFaces) {
+            for (u in offsets) {
+                for (v in offsets) {
+                    val facePoint = when (face) {
+                        Direction.UP    -> Vec3(pos.x + u, pos.y + 1.0, pos.z + v)
+                        Direction.DOWN  -> Vec3(pos.x + u, pos.y.toDouble(), pos.z + v)
+                        Direction.NORTH -> Vec3(pos.x + u, pos.y + v, pos.z.toDouble())
+                        Direction.SOUTH -> Vec3(pos.x + u, pos.y + v, pos.z + 1.0)
+                        Direction.WEST  -> Vec3(pos.x.toDouble(), pos.y + u, pos.z + v)
+                        Direction.EAST  -> Vec3(pos.x + 1.0, pos.y + u, pos.z + v)
+                    }
+                    if (facePoint.distanceTo(eyePos) > maxReach) continue
+
+                    val inwardStep = Vec3(face.stepX.toDouble(), face.stepY.toDouble(), face.stepZ.toDouble()).scale(-0.1)
+                    val rayTarget = facePoint.add(inwardStep)
+
+                    val clipCtx = ClipContext(
+                        eyePos,
+                        rayTarget,
+                        ClipContext.Block.OUTLINE,
+                        ClipContext.Fluid.NONE,
+                        player
+                    )
+                    val clipHit = world.clip(clipCtx)
+                    if (clipHit.type == HitResult.Type.BLOCK && clipHit.blockPos == pos) {
+                        return Pair(clipHit.location, clipHit.direction)
+                    }
+                }
             }
         }
         return null
@@ -370,7 +406,10 @@ object PlayerController {
 
         // Multi-face visible raycasting inspired by Mineflayer (ray_trace & digging)
         val (target, hitFace) = findBestVisibleFace(world, player, eyePos, pos) ?: run {
-            val defaultTarget = Vec3(pos.x + 0.5, pos.y + 0.5, pos.z + 0.5)
+            val cx = pos.x + 0.5
+            val cy = pos.y + 0.5
+            val cz = pos.z + 0.5
+            val defaultTarget = Vec3(cx, cy, cz)
             val dist = defaultTarget.distanceTo(eyePos)
             if (dist > maxReach) {
                 val warn = "$caller $pos: beyond maximum reach (dist=${"%.2f".format(dist)} max=$maxReach)"
@@ -378,17 +417,25 @@ object PlayerController {
                 BlockBardLogBuffer.warn("PlayerController", warn)
                 return null
             }
-            // Fallback directional face if line-of-sight is obstructed by neighboring noteblocks
+            // Fallback directional face: find face facing eyePos
             val delta = defaultTarget.subtract(eyePos)
             val face = when {
-                Math.abs(delta.x) > Math.abs(delta.y) && Math.abs(delta.x) > Math.abs(delta.z) ->
+                Math.abs(delta.x) >= Math.abs(delta.y) && Math.abs(delta.x) >= Math.abs(delta.z) ->
                     if (delta.x > 0) Direction.WEST else Direction.EAST
-                Math.abs(delta.y) > Math.abs(delta.z) ->
+                Math.abs(delta.y) >= Math.abs(delta.z) ->
                     if (delta.y > 0) Direction.DOWN else Direction.UP
                 else ->
                     if (delta.z > 0) Direction.NORTH else Direction.SOUTH
             }
-            Pair(defaultTarget, face)
+            val surfaceTarget = when (face) {
+                Direction.UP    -> Vec3(cx, pos.y + 1.0, cz)
+                Direction.DOWN  -> Vec3(cx, pos.y.toDouble(), cz)
+                Direction.NORTH -> Vec3(cx, cy, pos.z.toDouble())
+                Direction.SOUTH -> Vec3(cx, cy, pos.z + 1.0)
+                Direction.WEST  -> Vec3(pos.x.toDouble(), cy, cz)
+                Direction.EAST  -> Vec3(pos.x + 1.0, cy, cz)
+            }
+            Pair(surfaceTarget, face)
         }
 
         val delta = target.subtract(eyePos)
@@ -401,11 +448,9 @@ object PlayerController {
             ?: (reach?.let { Pair(it.yaw, it.pitch) } ?: vecToYawPitch(delta))
         primedRotation = null
 
-        // Face the target block and immediately notify the server so raycast validation passes
-        if (kyrielie.blockbard.client.config.ConfigManager.config.smoothCameraRotation) {
-            player.setYRot(yaw)
-            player.setXRot(pitch)
-        }
+        // Snap or ease rotation and send to server so server raycast validation matches
+        player.setYRot(yaw)
+        player.setXRot(pitch)
         player.connection.send(
             net.minecraft.network.protocol.game.ServerboundMovePlayerPacket.Rot(
                 yaw,
@@ -468,6 +513,7 @@ object PlayerController {
 
         val hitResult = aimAt(pos, "interactWith") ?: return false
         val result = mc.gameMode?.useItemOn(player, InteractionHand.MAIN_HAND, hitResult)
+        player.swing(InteractionHand.MAIN_HAND, net.minecraft.world.item.component.SwingAnimation.DEFAULT, false)
         return true
     }
 

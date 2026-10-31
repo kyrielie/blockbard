@@ -18,7 +18,7 @@ import net.fabricmc.api.ClientModInitializer
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents
 import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper
 import net.minecraft.client.KeyMapping
-import org.lwjgl.glfw.GLFW
+import com.mojang.blaze3d.platform.InputConstants
 import org.slf4j.LoggerFactory
 
 object BlockBardClient : ClientModInitializer {
@@ -73,10 +73,10 @@ object BlockBardClient : ClientModInitializer {
 
         val blockbardCategory = KeyMapping.Category.register(net.minecraft.resources.Identifier.fromNamespaceAndPath("blockbard", "general"))
         openGuiKey = KeyMappingHelper.registerKeyMapping(
-            KeyMapping("key.blockbard.open_gui", GLFW.GLFW_KEY_B, blockbardCategory)
+            KeyMapping("key.blockbard.open_gui", InputConstants.KEY_B, blockbardCategory)
         )
         toggleHudKey = KeyMappingHelper.registerKeyMapping(
-            KeyMapping("key.blockbard.toggle_hud", GLFW.GLFW_KEY_H, blockbardCategory)
+            KeyMapping("key.blockbard.toggle_hud", InputConstants.KEY_H, blockbardCategory)
         )
         logger.info("Keybindings registered: B=open GUI, H=toggle HUD")
 

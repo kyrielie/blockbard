@@ -68,7 +68,7 @@ object MidiFilePlayer {
     var onFinished: (() -> Unit)? = null
     var onTickUpdate: ((currentTick: Long, totalTicks: Long) -> Unit)? = null
 
-    fun load(file: File): LoadedMidi {
+    fun parse(file: File): LoadedMidi {
         val sequence = MidiSystem.getSequence(file)
         var tempoUs = 500000  // default 120 BPM
         val tempoChanges = mutableListOf<Pair<Long, Int>>()
@@ -96,10 +96,6 @@ object MidiFilePlayer {
         // MidiChannelResolver resolves each NOTE_ON to the instrument the minecraft3.sf2
         // soundfont would use for that channel's GM program (or percussion for channel 10),
         // tracking PROGRAM_CHANGE per channel as it scans. See its kdoc for details.
-        // Note: this re-parses the file independently via its own MidiSystem.getSequence
-        // call rather than reusing `sequence` above — a small duplicate parse, traded for
-        // keeping MidiChannelResolver's resolve(File) signature self-contained and usable
-        // by other callers (e.g. OrganReadinessChecker) without needing a Sequence handle.
         val resolvedEvents = MidiChannelResolver.resolve(file)
         val sortedEvents = resolvedEvents
             .map { TimedNoteEvent(it.tick, it.midiNote, it.instrument) }
@@ -118,7 +114,7 @@ object MidiFilePlayer {
             .groupBy { NotePitch(it.midiNote, it.instrument) }
             .mapValues { it.value.size }
 
-        val midi = LoadedMidi(
+        return LoadedMidi(
             file = file,
             sequence = sequence,
             ticksPerBeat = sequence.resolution,
@@ -128,6 +124,10 @@ object MidiFilePlayer {
             noteUsageCounts = usageCounts,
             tempoMap = tempoMap
         )
+    }
+
+    fun load(file: File): LoadedMidi {
+        val midi = parse(file)
         loadedMidi = midi
         currentTick = 0L
         return midi
@@ -166,12 +166,10 @@ object MidiFilePlayer {
 
                     currentTick = event.tick
                     onTickUpdate?.invoke(currentTick, midi.events.lastOrNull()?.tick ?: 0L)
-                    // instrument is passed through so ArpeggioScheduler.resolvePos can
-                    // look up the (midiNote, instrument) assignment built at tuning time
-                    // (see MainScreen.startTuning) instead of falling back to a
-                    // pitch-only live lookup that ignores which instrument this note
-                    // was authored for.
-                    ArpeggioScheduler.enqueue(NoteRequest(event.midiNote, instrument = event.instrument))
+                    // Unpitched instruments (SNARE, HAT, BASEDRUM) collapse to midiBase so the
+                    // lookup in ArpeggioScheduler matches the single canonical assignment entry.
+                    val noteToEnqueue = if (!event.instrument.isPitched) event.instrument.midiBase else event.midiNote
+                    ArpeggioScheduler.enqueue(NoteRequest(noteToEnqueue, instrument = event.instrument))
                 }
                 isPlaying = false
                 onFinished?.invoke()

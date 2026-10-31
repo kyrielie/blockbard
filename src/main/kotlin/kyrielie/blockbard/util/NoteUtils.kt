@@ -77,11 +77,11 @@ val NoteBlockInstrument.isPitched: Boolean
 
 /**
  * Returns whether a MIDI note falls within this instrument's native range (0–24 semitones
- * from midiBase). Always false for unpitched instruments — they cannot be tuned to any
- * specific pitch, so no MIDI note should be "covered" by them in the assignment sense.
+ * from midiBase). Unpitched instruments (BASEDRUM, SNARE, HAT) always return true because
+ * all pitches produce the same audible drum sample, so any block of that instrument covers it.
  */
 fun NoteBlockInstrument.coversNatively(midiNote: Int): Boolean {
-    if (!isPitched) return false
+    if (!isPitched) return true
     val min = midiBase
     val max = midiBase + 24
     return midiNote in min..max

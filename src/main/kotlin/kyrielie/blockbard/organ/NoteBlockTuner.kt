@@ -46,6 +46,8 @@ class NoteBlockTuner(
 
     var state: TunerState = TunerState.IDLE
         private set
+    var failureReason: String? = null
+        private set
 
     // Pos -> remaining clicks required to reach target note
     private val remainingClicks = mutableMapOf<BlockPos, Int>()
@@ -181,9 +183,13 @@ class NoteBlockTuner(
         }
 
         // Max clicks for this block this tick:
-        // When fastTuning: up to 2 clicks per tick (safe for anticheats and server packet processing)
-        // When fastTuning is off: 1 click per tick
-        val maxThisTick = if (fastTuning) needed.coerceAtMost(2).coerceAtMost(availableInteracts.toInt().coerceAtLeast(1)) else 1
+        // Initial pass with fastTuning: up to 2 clicks per tick.
+        // On retries (retryCount >= 1): automatically drop to 1 click per tick for reliable server processing.
+        val maxThisTick = if (fastTuning && retryCount == 0) {
+            needed.coerceAtMost(2).coerceAtMost(availableInteracts.toInt().coerceAtLeast(1))
+        } else {
+            1
+        }
 
         for (c in 0 until maxThisTick) {
             if (availableInteracts < 1f) break
@@ -193,6 +199,7 @@ class NoteBlockTuner(
                 logger.warn("NoteBlockTuner: $err")
                 BlockBardLogBuffer.error("Tuner", err)
                 state = TunerState.FAILED
+                failureReason = err
                 pendingRotationPos = null
                 onProgress(confirmedCount, total, err)
                 return
@@ -203,16 +210,17 @@ class NoteBlockTuner(
             val rem = (remainingClicks[pos] ?: 1) - 1
             if (rem <= 0) {
                 remainingClicks.remove(pos)
+                pendingRotationPos = null
                 break
             } else {
                 remainingClicks[pos] = rem
             }
         }
-        pendingRotationPos = null
     }
 
     private fun tickVerifying(now: Long) {
-        val pingWait = (pingMs() * 2 + 500L).coerceAtLeast(500L)
+        // Increase verification window on successive retries to ensure server sync
+        val pingWait = (pingMs() * 2 + 500L + (retryCount * 250L)).coerceAtLeast(500L)
         if (now - verifyStartedAt < pingWait) return
 
         var allGood = true
@@ -254,6 +262,7 @@ class NoteBlockTuner(
             if (retryCount > maxRetries) {
                 state = TunerState.FAILED
                 val failMsg = "Tuning failed after $maxRetries retries: ${mismatches.joinToString("; ")}"
+                failureReason = failMsg
                 logger.warn("NoteBlockTuner: $failMsg")
                 BlockBardLogBuffer.error("Tuner", failMsg)
                 onProgress(confirmedCount, total, "FAILED: ${mismatches.size} blocks did not tune")

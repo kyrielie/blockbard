@@ -40,41 +40,57 @@ normal block-interaction call — there is no packet manipulation.
 ```
 src/
   client/kotlin/kyrielie/blockbard/client/
-    BlockBardClient.kt          ← ClientModInitializer; wires all subsystems together
+    BlockBardClient.kt          ← ClientModInitializer; wires all subsystems and keybindings together
+    command/
+      BlockBardCommands.kt      ← Fabric client commands (/blockbard and /bb)
     config/
-      BlockBardConfig.kt        ← config data class + ConfigManager (plain Gson with fallback coalescing)
+      BlockBardConfig.kt        ← config data class + ConfigManager (Gson with InstanceCreator & fallback coalescing)
+      BlockBardYaclConfig.kt    ← Yet Another Config Lib (YACL) GUI configuration screen
     gui/
-      MainScreen.kt             ← primary GUI (file picker, organ overlay, controls, tuning, playback, settings)
+      MainScreen.kt             ← primary tabbed GUI (Files, Queue, Organ, Logs, playback transport & controls)
+      QueueListWidget.kt        ← upcoming playback queue list widget with shuffle removal controls
+      SongListWidget.kt         ← searchable song list widget with favorite stars and format badges
+      LogListWidget.kt          ← in-GUI log entry viewer with search and copy-to-clipboard
+      VirtualKeyboardWidget.kt  ← interactive on-screen piano keyboard widget for live note triggering
+      MaterialsShoppingOverlay.kt← survival materials item-stack HUD overlay (shows items needed/in inventory)
       PlaybackHud.kt            ← HUD overlay via HudElementRegistry (checks both MidiFilePlayer and NbsPlayer state)
-      BlockBardModMenuIntegration.kt
+      VisualizerState.kt        ← runtime note visualizer state for HUD/GUI rendering
+      BlockBardModMenuIntegration.kt ← ModMenu config screen entrypoint
     input/
       KeyboardInputHandler.kt   ← keys 1–9 → NoteRequest; direct dispatch from MainScreen.keyPressed()
-      MidiInputHandler.kt       ← javax.sound.midi device → NoteRequest (runs on a foreign thread — synchronized in ArpeggioScheduler)
-    midi/                       ← package declared as kyrielie.blockbard.midi (note directory vs package path)
-      MidiChannelResolver.kt    ← resolves each MIDI NOTE_ON to a NoteBlockInstrument via per-channel GM program tracking
+      MidiInputHandler.kt       ← javax.sound.midi device → NoteRequest (foreign thread synchronized in ArpeggioScheduler)
+    midi/                       ← package declared as kyrielie.blockbard.midi
+      InstrumentRemapper.kt     ← runtime instrument substitution and muting engine
+      MidiChannelResolver.kt    ← resolves each MIDI NOTE_ON to NoteBlockInstrument via per-channel GM program tracking
       MidiInstrumentMap.kt      ← GM program (0-127) + percussion → NoteBlockInstrument table
       OrganReadinessChecker.kt  ← coverage pre-flight check (MIDI requirements vs. NoteBlockRegistry)
     organ/
-      OrganScanner.kt           ← world scan → NoteBlockRegistry.update()
+      OrganScanner.kt           ← client world scan (cube or spherical) → NoteBlockRegistry.update()
     playback/
-      MidiFilePlayer.kt         ← loads .mid via MidiChannelResolver, timed dispatch via ArpeggioScheduler
+      MidiFilePlayer.kt         ← loads .mid via MidiChannelResolver, dynamic tempo tracking, timed dispatch
+      MidiTempoMap.kt           ← dynamic tempo map for handling accelerandos/ritardandos
       NbsFileLoader.kt          ← .nbs binary parser AND NbsPlayer; tick getters and live tempoMultiplier parity
+      SongMetadataCache.kt      ← async duration, tempo, and track summary metadata caching
+      SongAudioPreviewer.kt     ← client-side local sound auditioning without placing blocks or packets
     player/
-      PlayerController.kt       ← eased rotation + playNoteAt (left-click playback) / interactWith (right-click tuning)
+      PlayerController.kt       ← eased rotation, playNoteAt (left-click), interactWith (right-click tuning), dynamic retuning
       SoundVerifier.kt          ← zero-mixin playback verification via Minecraft SoundEventListener; logs hits/misses/timeouts
-      KickDiagnostics.kt        ← disconnect postmortem via ClientPlayConnectionEvents.DISCONNECT; correlates disconnect screen reason with recent interact dispatches and token bucket state
+      KickDiagnostics.kt        ← disconnect postmortem via ClientPlayConnectionEvents.DISCONNECT; correlates disconnect screen reason
+    util/
+      SongDownloader.kt         ← asynchronous HTTP/HTTPS song download utility with magic byte detection
 
   main/kotlin/kyrielie/blockbard/
     organ/
-      ArpeggioScheduler.kt      ← token-bucket rate-limited tick queue (Paper 8/310ms limiter); per-note rotation convergence gating; dispatchHistory ring buffer for post-disconnect diagnostics; synchronized thread safety
+      ArpeggioScheduler.kt      ← token-bucket rate-limited tick queue (Paper 8/310ms limiter); per-note rotation convergence gating; multi-voice round robin; dynamic retuning delegate; dispatchHistory ring buffer
       InstrumentShifter.kt      ← ShiftMode resolution (EXACT_ONLY/INSTRUMENT_SHIFT/OCTAVE_SHIFT/BEST_EFFORT)
-      MidiToOrganMapper.kt      ← (midiNote, instrument) → BlockPos assignment; defines NotePitch
+      MidiToOrganMapper.kt      ← (midiNote, instrument) → BlockPos assignment; defines NotePitch and multi-voice pools
       MobHeadBlocks.kt          ← MOB_HEAD_BLOCKS constant set
       NoteBlockEntry.kt         ← data class (pos, instrument, noteIndex, midiNote, status)
       NoteBlockRegistry.kt      ← singleton Map<BlockPos, NoteBlockEntry>
       NoteBlockTuner.kt         ← TuneTarget + stateful tuning state machine (TUNING/VERIFYING/DONE/FAILED), capped retries (maxRetries, default 3)
       OrganMap.kt               ← Map<BlockPos, ReachInfo> built by PlayerController.centerOnOrgan()
     util/
+      BlockBardLogBuffer.kt     ← in-memory circular buffer of log entries for in-game log viewer
       DebugLog.kt               ← hot-path conditional logger (routes to debug() when disabled, info() when enabled)
       InstrumentMaterials.kt    ← blockBelowHint mapping for noteblock instruments (dirt, wood, wool, copper, etc.)
       LittleEndianReader.kt     ← DataInputStream extensions for NBS parsing; throws field-specific EOFException on truncation
@@ -268,7 +284,8 @@ exactly which block to hit, skipping the `assignment`/`NoteBlockRegistry` lookup
 data class OrganAssignment(
     val assignment: Map<NotePitch, BlockPos>,
     val unplayable: List<NotePitch>,
-    val shifts: Map<NotePitch, Int>     // semitone shift applied per note, 0 if native match
+    val shifts: Map<NotePitch, Int>,     // semitone shift applied per note, 0 if native match
+    val voicePools: Map<NotePitch, List<BlockPos>> = assignment.mapValues { listOf(it.value) } // multi-voice round-robin pools
 )
 ```
 **Not** `Map<Int, BlockPos>` — this was the type before the instrument-threading work;
@@ -483,25 +500,27 @@ UI library, which is a different thing; verify against that doc's actual context
 distinction matters for your task).
 
 Current fields (`BlockBardConfig.kt`):
-`scanRadius: Int = 5`, `shiftMode: String = "BEST_EFFORT"`, `maxOctaveShift: Int = 1`,
-`reportShiftsInHud: Boolean = true`, `hudEnabled: Boolean = true`,
+`scanRadius: Int = 5`, `sphericalScan: Boolean = true`, `shiftMode: String = "BEST_EFFORT"`,
+`maxOctaveShift: Int = 1`, `reportShiftsInHud: Boolean = true`, `hudEnabled: Boolean = false`,
 `arpeggioStaleTimeoutMs: Long = 200L`, `defaultTempoMultiplier: Float = 1.0f`,
 `autoRescanIntervalSeconds: Int = 3`, `maxTuningClicksPerTick: Int = 1`,
 `lastPlayedTrack: String?`, `shuffleHistory: MutableList<String>`, `defaultOctave: Int = 4`,
 `midiDeviceName: String?`, `keyMappings: List<Int> = [54..62]` (MIDI notes for keys 1-9),
+`smoothCameraRotation: Boolean = false`, `fastTuning: Boolean = true`,
 `maxRotationDegreesPerTick: Float = 35f`, `rotationConvergenceThresholdDegrees: Float = 2f`,
 `rotationInProgressTimeoutMs: Long = 1500L`, `debugLogging: Boolean = false`,
-`maxNotesPerTick: Int = 1` (range 1–8 burst cap), `loopMode: String = "NONE"` (NONE, LOOP_ONE, LOOP_ALL, SHUFFLE_ALL).
+`maxNotesPerTick: Int = 8` (range 1–64 burst cap), `loopMode: String = "NONE"` (NONE, LOOP_ONE, LOOP_ALL, SHUFFLE_ALL),
+`instrumentRemap: MutableMap<String, String?>`, `favorites: MutableList<String>`,
+`activeFilter: String = "ALL"`, `dynamicRetuning: Boolean = false`, `dynamicRetuningMaxClicks: Int = 2`,
+`centerMovesPlayer: Boolean = false`, `enableChatFeedback: Boolean = false`.
 
 **Caveat affecting fields with non-trivial defaults:**
-This project uses plain `Gson` (`com.google.code.gson:gson:2.10.1`, no Kotlin-aware adapter)
-to deserialize `BlockBardConfig`. Plain Gson constructs Kotlin data classes via reflection/`Unsafe`,
-bypassing the primary constructor. To guard against zero-defaults from older `config.json` files,
+This project uses plain `Gson` (`com.google.code.gson:gson:2.10.1`, with an `InstanceCreator<BlockBardConfig>`)
+to deserialize `BlockBardConfig`. To guard against zero-defaults or missing keys from older `config.json` files,
 `ConfigManager.load()` explicitly coalesces `scanRadius`, `arpeggioStaleTimeoutMs`,
 `maxRotationDegreesPerTick`, `rotationConvergenceThresholdDegrees`, `rotationInProgressTimeoutMs`,
-`maxNotesPerTick`, and `shuffleHistory` back to safe defaults if loaded values are `<= 0` or null.
-A long-term architectural improvement would be migrating to `kotlinx.serialization` or providing a
-custom `InstanceCreator<BlockBardConfig>`.
+`maxNotesPerTick`, `shuffleHistory`, and `instrumentRemap` back to safe defaults if loaded values are `<= 0` or null.
+A planned architectural improvement is migrating to `kotlinx.serialization` with type-safe serializers.
 
 ---
 
@@ -515,20 +534,14 @@ missing EOF handling, the unconditional auto-rescan timer, and `ConfigManager` s
 parse exceptions silently) have been fixed — see the subsystem summaries above and
 `BLOCKBARD_ENGINEERING_PLAN.md` for the original fix rationale per item.
 
-**Still open:**
-- **Gson + Kotlin data class defaults** (see Config section above) — a pre-existing,
-  systemic risk affecting every `BlockBardConfig` field with a non-default-constructor
-  value, not introduced by any single fix in this pass.
-- **`OrganScanner.scan()` is still O((2r+1)³)** with a full cube iteration — the
-  engineering plan's optional sphere-distance-check optimization (skip cube corners
-  outside the actual scan radius) was deliberately **not** applied: it would change which
-  blocks are detected (a noteblock at a cube corner, e.g. `(r, r, 0)`, has Euclidean
-  distance `r√2 > r` and would be excluded even though the unmodified cube scan finds it
-  today), not just how many iterations it costs. Applying it would need an explicit
-  decision about whether that detection-volume change is acceptable, not just a
-  performance call. The unconditional-rescan-during-playback issue (the higher-value half
-  of the original performance concern) is fixed; the cube-vs-sphere shape itself is
-  unchanged.
+**Current Architectural Nuances:**
+- **Gson + Kotlin data class defaults** (see Config section above) — guarded at runtime via
+  `InstanceCreator` and explicit coalescing fallback in `ConfigManager.load()`.
+- **Spherical vs. Cubical Scan Optimization**:
+  `OrganScanner.scan()` supports configurable `sphericalScan: Boolean = true` (default). When enabled,
+  it checks Euclidean distance `x² + y² + z² <= r²`, reducing blockstate inspect iterations by ~48%
+  compared to the full cube scan. Players who deliberately place organ blocks in cube corners outside
+  the sphere can toggle `sphericalScan = false` in settings.
 
 ---
 

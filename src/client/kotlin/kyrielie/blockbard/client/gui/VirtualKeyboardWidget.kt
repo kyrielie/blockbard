@@ -16,7 +16,6 @@ import net.minecraft.client.gui.narration.NarrationElementOutput
 import net.minecraft.client.input.MouseButtonEvent
 import net.minecraft.network.chat.Component
 import net.minecraft.world.level.block.state.properties.NoteBlockInstrument
-import org.lwjgl.glfw.GLFW
 
 class VirtualKeyboardWidget(
     x: Int,
