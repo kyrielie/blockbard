@@ -420,9 +420,10 @@ object PlayerController {
     /**
      * Aims at [pos] -- shared by interactWith() (tuning, right-click) and
      * playNoteAt() (playback, left-click). Returns the BlockHitResult, or null if
-     * the block is out of reach.
+     * the block is out of reach. [caller] is only a log label; [isTuning] selects the
+     * rotation setting (rotateDuringTuning vs smoothCameraRotation).
      */
-    private fun aimAt(pos: BlockPos, caller: String): BlockHitResult? {
+    private fun aimAt(pos: BlockPos, caller: String, isTuning: Boolean): BlockHitResult? {
         val mc = Minecraft.getInstance()
         val player = mc.player ?: run {
             logger.warn("$caller $pos: no player")
@@ -497,7 +498,6 @@ object PlayerController {
         primedRotation = null
 
         // Snap or ease rotation and send to server so server raycast validation matches
-        val isTuning = caller == "interactWith"
         val shouldRotate = if (isTuning) {
             kyrielie.blockbard.client.config.ConfigManager.config.rotateDuringTuning
         } else {
@@ -568,7 +568,7 @@ object PlayerController {
             }
         }
 
-        val hitResult = aimAt(pos, "interactWith") ?: run {
+        val hitResult = aimAt(pos, "interactWith", isTuning = true) ?: run {
             val fail = diagnoseBlockInteractability(pos) ?: TuningFailState.OCCLUDED
             BlockBardLogBuffer.warn("PlayerController", "[${fail.tag}] Cannot aim at $pos: ${fail.description}")
             return false
@@ -641,7 +641,7 @@ object PlayerController {
             return false
         }
 
-        val hitResult = aimAt(pos, "playNoteAt") ?: return false
+        val hitResult = aimAt(pos, "playNoteAt", isTuning = false) ?: return false
 
         // Confirm live note value from world blockstate before attacking
         val level = mc.level
@@ -682,8 +682,12 @@ object PlayerController {
      */
     fun playNoteAt(pos: BlockPos, request: NoteRequest): Boolean {
         val expectedInstrument = request.instrument ?: NoteBlockRegistry.get(pos)?.instrument
+        // Registered before dispatch (the sound can arrive before playNoteAt returns in
+        // singleplayer), then withdrawn if nothing was dispatched so it is not a false miss.
         SoundVerifier.expectNote(pos, request.midiNote, expectedInstrument)
-        return playNoteAt(pos)
+        val dispatched = playNoteAt(pos)
+        if (!dispatched) SoundVerifier.cancelExpectation(pos, request.midiNote)
+        return dispatched
     }
 
     /**
@@ -697,6 +701,7 @@ object PlayerController {
         val expectedInstrument = request.instrument ?: entry.instrument
         SoundVerifier.expectNote(pos, request.midiNote, expectedInstrument)
         val success = interactWith(pos)
+        if (!success) SoundVerifier.cancelExpectation(pos, request.midiNote)
         if (success) {
             NoteBlockRegistry.updateTunedNote(pos, newNoteIndex)
             val level = Minecraft.getInstance().level

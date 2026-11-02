@@ -86,6 +86,14 @@ object SongDownloader {
                 val filename = determineFilename(urlStr, conn.getHeaderField("Content-Disposition"), customName, data)
                 val targetFile = midisDir.resolve(filename)
 
+                // Final guard independent of the sanitizer: the file must be a direct child of midisDir.
+                if (targetFile.canonicalFile.parentFile != midisDir.canonicalFile) {
+                    logger.warn("Rejected download: resolved path escapes midis directory ($filename)")
+                    notifyUser("§cDownload rejected: unsafe file name", false)
+                    callback(null, onComplete)
+                    return@Thread
+                }
+
                 targetFile.writeBytes(data)
                 logger.info("Downloaded ${targetFile.name} (${data.size} bytes)")
                 notifyUser("§aDownloaded: §f${targetFile.name} §7(${data.size / 1024} KB)", true)

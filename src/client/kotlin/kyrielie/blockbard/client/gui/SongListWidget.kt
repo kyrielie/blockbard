@@ -18,7 +18,8 @@ class SongListWidget(
     private val onSelect: (File) -> Unit,
     private val onDoubleClick: ((File) -> Unit)? = null,
     private val onToggleFavorite: ((File) -> Unit)? = null,
-    private val onAddToQueue: ((File) -> Unit)? = null
+    private val onQueueNext: ((File) -> Unit)? = null,
+    private val onQueueLast: ((File) -> Unit)? = null
 ) : ObjectSelectionList<SongListWidget.SongEntry>(minecraft, width, height, y, itemHeight) {
 
     private var isRefreshingFiles = false
@@ -113,21 +114,33 @@ class SongListWidget(
             val name = file.nameWithoutExtension.take(maxChars)
             graphics.text(font, name, x + 46, y + 2, nameColor)
 
-            // +Queue button
-            val qBtnX = x + w - 18
-            val qBtnHovered = mouseX >= qBtnX - 2 && mouseX <= qBtnX + 16 && mouseY >= y + 1 && mouseY <= y + 13
-            val qBtnColor = if (qBtnHovered) opaque(0x55FF55) else opaque(0x77AA77)
-            graphics.text(font, "+Q", qBtnX, y + 2, qBtnColor)
+            // Queue buttons: "Next" plays after the current song, "Last" goes to the end of the queue
+            val lastX = x + w - 26
+            val nextX = x + w - 54
+            val rowHovered = mouseY >= y + 1 && mouseY <= y + 13
+            val lastHovered = rowHovered && mouseX >= lastX - 2 && mouseX <= x + w
+            val nextHovered = rowHovered && mouseX >= nextX - 2 && mouseX < lastX - 2
+            graphics.text(font, "Next", nextX, y + 2, if (nextHovered) opaque(0x55FF55) else opaque(0x77AA77))
+            graphics.text(font, "Last", lastX, y + 2, if (lastHovered) opaque(0x55FF55) else opaque(0x77AA77))
 
             // File size
             val kb = file.length() / 1024
             val sizeStr = "${kb}KB"
-            graphics.text(font, sizeStr, qBtnX - font.width(sizeStr) - 6, y + 2, opaque(0x888888))
+            graphics.text(font, sizeStr, nextX - font.width(sizeStr) - 6, y + 2, opaque(0x888888))
 
-            // Metadata subtext
+            // Metadata subtext; replaced by a hint while a queue button is hovered
             val meta = SongMetadataCache.get(file)
-            val subtext = meta?.summaryString ?: "Analyzing..."
-            val subtextColor = if (meta != null) opaque(0xAAAAAA) else opaque(0x666666)
+            val hint = when {
+                nextHovered -> "Next: play this right after the current song"
+                lastHovered -> "Last: add this to the end of your queue"
+                else -> null
+            }
+            val subtext = hint ?: meta?.summaryString ?: "Analyzing..."
+            val subtextColor = when {
+                hint != null -> opaque(0x88DD88)
+                meta != null -> opaque(0xAAAAAA)
+                else -> opaque(0x666666)
+            }
             graphics.text(font, subtext, x + 46, y + 14, subtextColor)
         }
 
@@ -139,8 +152,12 @@ class SongListWidget(
                     onToggleFavorite?.invoke(file)
                     return true
                 }
-                if (event.x() >= entryX + entryW - 22) {
-                    onAddToQueue?.invoke(file)
+                if (event.x() >= entryX + entryW - 28) {
+                    onQueueLast?.invoke(file)
+                    return true
+                }
+                if (event.x() >= entryX + entryW - 56) {
+                    onQueueNext?.invoke(file)
                     return true
                 }
                 this@SongListWidget.setSelected(this)

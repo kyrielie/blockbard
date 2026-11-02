@@ -5,6 +5,8 @@ import kyrielie.blockbard.client.gui.MainScreen
 import kyrielie.blockbard.client.gui.PlaybackHud
 import kyrielie.blockbard.client.input.KeyboardInputHandler
 import kyrielie.blockbard.client.input.MidiInputHandler
+import kyrielie.blockbard.client.playback.ClientPlayQueue
+import kyrielie.blockbard.client.playback.PlaybackCoordinator
 import kyrielie.blockbard.client.player.KickDiagnostics
 import kyrielie.blockbard.client.player.MAX_ROTATION_DEGREES_PER_TICK
 import kyrielie.blockbard.client.player.PlayerController
@@ -63,6 +65,9 @@ object BlockBardClient : ClientModInitializer {
             PlayerController.playNoteAt(pos, request)
         }
         ArpeggioScheduler.dynamicRetuningEnabled = cfg.dynamicRetuning
+        ClientPlayQueue.applyConfig(cfg)
+        // Playback-thread song-end callbacks; the decision itself runs from the END_CLIENT_TICK below.
+        PlaybackCoordinator.install()
         ArpeggioScheduler.dynamicRetuneDelegate = { pos, request ->
             logger.debug("dynamicRetuneDelegate: -> $pos (MIDI ${request.midiNote})")
             PlayerController.retuneAndPlayNoteAt(pos, request)
@@ -98,9 +103,12 @@ object BlockBardClient : ClientModInitializer {
 
         // Prime rotation in START_CLIENT_TICK -- fires before LocalPlayer.tick() calls
         // sendPosition(), so each tick's eased rotation step is included in that tick's
-        // movement packet. Drives playback rotation only; tuning does not use rotation
-        // gating (see NoteBlockTuner for rationale).
+        // movement packet. Drives playback rotation only. Tuning primes its own rotation
+        // through MainScreen's primeRotation lambda (isTuning = true); both write the single
+        // PlayerController.primedRotation field, so while a tuner is active it owns rotation
+        // and this handler stays out of the way.
         ClientTickEvents.START_CLIENT_TICK.register { _ ->
+            if (MainScreen.activeTuner?.isActive == true) return@register
             ArpeggioScheduler.peekNextPos()?.let { PlayerController.primeRotation(it) }
         }
 
@@ -139,6 +147,8 @@ object BlockBardClient : ClientModInitializer {
                 logger.info("O pressed -- Organ overlay visible=$on")
             }
             MainScreen.onClientTick(mc)
+            // Song end and auto-advance, with or without the GUI open.
+            PlaybackCoordinator.tick()
             ArpeggioScheduler.onTick()
         }
 

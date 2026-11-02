@@ -6,6 +6,7 @@ import net.minecraft.client.resources.sounds.SoundInstance
 import net.minecraft.client.sounds.SoundEventListener
 import net.minecraft.client.sounds.WeighedSoundEvents
 import net.minecraft.core.BlockPos
+import net.minecraft.util.Mth
 import net.minecraft.world.level.block.state.properties.NoteBlockInstrument
 import org.slf4j.LoggerFactory
 import kotlin.math.ln
@@ -92,6 +93,17 @@ object SoundVerifier : SoundEventListener {
         pending.addLast(Expectation(pos, midiNote, instrument, System.currentTimeMillis()))
     }
 
+    /**
+     * Withdraws the newest pending expectation for ([pos], [midiNote]). Used when the
+     * interaction it was registered for never dispatched, so no sound will arrive and
+     * the entry would otherwise age out as a false miss. No-op if a sound already
+     * consumed it.
+     */
+    fun cancelExpectation(pos: BlockPos, midiNote: Int) = synchronized(lock) {
+        val idx = pending.indexOfLast { it.pos == pos && it.midiNote == midiNote }
+        if (idx >= 0) pending.removeAt(idx)
+    }
+
     // SoundEventListener — see kdoc above for why this is the right hook (public API,
     // no mixin, fires for every sound with a subtitle, which includes every vanilla
     // note_block instrument sound).
@@ -108,7 +120,7 @@ object SoundVerifier : SoundEventListener {
             pruneExpired(now)
 
             // Position-aware matching: chords emit sounds simultaneously; match by block coordinate
-            val soundPos = BlockPos(sound.x.toInt(), sound.y.toInt(), sound.z.toInt())
+            val soundPos = BlockPos(Mth.floor(sound.x), Mth.floor(sound.y), Mth.floor(sound.z))
             val matchIndex = pending.indexOfFirst { it.pos.distManhattan(soundPos) <= 1 }
             val expectation = if (matchIndex >= 0) pending.removeAt(matchIndex) else pending.removeFirstOrNull()
             if (expectation == null) {

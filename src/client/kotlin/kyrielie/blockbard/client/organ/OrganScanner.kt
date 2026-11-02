@@ -60,38 +60,41 @@ object OrganScanner {
                     val state = world.getBlockState(pos)
                     if (state.block != Blocks.NOTE_BLOCK) continue
 
-            val instrument: NoteBlockInstrument = state.getValue(NoteBlock.INSTRUMENT)
-            val noteIndex: Int = state.getValue(NoteBlock.NOTE)
-            val midiNote = noteIndexToMidi(instrument, noteIndex)
+                    val instrument: NoteBlockInstrument = state.getValue(NoteBlock.INSTRUMENT)
+                    val noteIndex: Int = state.getValue(NoteBlock.NOTE)
+                    val midiNote = noteIndexToMidi(instrument, noteIndex)
 
-            val blockCenter = net.minecraft.world.phys.Vec3(pos.x + 0.5, pos.y + 0.5, pos.z + 0.5)
-            val distance = eyePos.distanceTo(blockCenter)
+                    val blockCenter = net.minecraft.world.phys.Vec3(pos.x + 0.5, pos.y + 0.5, pos.z + 0.5)
+                    val distance = eyePos.distanceTo(blockCenter)
 
-            val aboveBlock = world.getBlockState(pos.above()).block
-            val (status, mobHead) = when {
-                aboveBlock in MOB_HEAD_BLOCKS -> Pair(NoteBlockStatus.MOB_HEAD, aboveBlock)
-                !world.getBlockState(pos.above()).isAir -> Pair(NoteBlockStatus.SILENCED, null)
-                else -> Pair(NoteBlockStatus.PLAYABLE, null)
+                    val aboveState = world.getBlockState(pos.above())
+                    val aboveBlock = aboveState.block
+                    val (status, mobHead) = when {
+                        aboveBlock in MOB_HEAD_BLOCKS -> Pair(NoteBlockStatus.MOB_HEAD, aboveBlock)
+                        !aboveState.isAir -> Pair(NoteBlockStatus.SILENCED, null)
+                        else -> Pair(NoteBlockStatus.PLAYABLE, null)
+                    }
+
+                    logger.debug(
+                        "scan: found NoteBlock at $pos -- instrument=${instrument.name} " +
+                        "noteIndex=$noteIndex midi=$midiNote (${midiNoteToName(midiNote)}) " +
+                        "status=$status dist=${"%.1f".format(distance)}"
+                    )
+
+                    found.add(
+                        NoteBlockEntry(
+                            pos = pos,
+                            instrument = instrument,
+                            noteIndex = noteIndex,
+                            midiNote = midiNote,
+                            distanceFromPlayer = distance,
+                            status = status,
+                            mobHeadType = mobHead
+                        )
+                    )
+                }
             }
-
-            logger.debug(
-                "scan: found NoteBlock at $pos -- instrument=${instrument.name} " +
-                "noteIndex=$noteIndex midi=$midiNote (${midiNoteToName(midiNote)}) " +
-                "status=$status dist=${"%.1f".format(distance)}"
-            )
-
-            found.add(
-                NoteBlockEntry(
-                    pos = pos,
-                    instrument = instrument,
-                    noteIndex = noteIndex,
-                    midiNote = midiNote,
-                    distanceFromPlayer = distance,
-                    status = status,
-                    mobHeadType = mobHead
-                )
-            )
-        } } }
+        }
 
         NoteBlockRegistry.update(found)
 

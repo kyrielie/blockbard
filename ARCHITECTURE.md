@@ -48,7 +48,7 @@ src/
       BlockBardYaclConfig.kt    ← Yet Another Config Lib (YACL) GUI configuration screen
     gui/
       MainScreen.kt             ← primary tabbed GUI (Files, Queue, Organ, Logs, playback transport & controls)
-      QueueListWidget.kt        ← upcoming playback queue list widget with shuffle removal controls
+      QueueListWidget.kt        ← "up next" list: single click highlights, double-click plays now; Top, up, down and remove apply to user-queued rows, "+Q" copies a playlist row into the user queue
       SongListWidget.kt         ← searchable song list widget with favorite stars and format badges
       LogListWidget.kt          ← in-GUI log entry viewer with search and copy-to-clipboard
       VirtualKeyboardWidget.kt  ← interactive on-screen piano keyboard widget for live note triggering
@@ -69,6 +69,9 @@ src/
     playback/
       MidiFilePlayer.kt         ← loads .mid via MidiChannelResolver, dynamic tempo tracking, timed dispatch
       MidiTempoMap.kt           ← dynamic tempo map for handling accelerandos/ritardandos
+      PlaybackClock.kt          ← tempo-continuous wall-clock mapping shared by MidiFilePlayer and NbsPlayer
+      ClientPlayQueue.kt        ← the one live PlayQueue (outlives MainScreen), applyConfig(), and songIdOf(File)
+      PlaybackCoordinator.kt    ← song-end and auto-advance decisions, ticked from END_CLIENT_TICK (works with the GUI closed); PlaybackHost interface
       NbsFileLoader.kt          ← .nbs binary parser AND NbsPlayer; tick getters and live tempoMultiplier parity
       SongMetadataCache.kt      ← async duration, tempo, and track summary metadata caching
       SongAudioPreviewer.kt     ← client-side local sound auditioning without placing blocks or packets
@@ -89,11 +92,15 @@ src/
       NoteBlockRegistry.kt      ← singleton Map<BlockPos, NoteBlockEntry>
       NoteBlockTuner.kt         ← TuneTarget + stateful tuning state machine (TUNING/VERIFYING/DONE/FAILED), capped retries (maxRetries, default 3)
       OrganMap.kt               ← Map<BlockPos, ReachInfo> built by PlayerController.centerOnOrgan()
+    playback/
+      LoopSettings.kt           ← pure repeat/shuffle rules: migration from the old loopMode, parsing, labels
+      PlayQueue.kt              ← pure play-order model (context, shuffle, repeat, user queue, history); no Minecraft types; driven by MainScreen through ClientPlayQueue (see "PlayQueue" below)
     util/
       BlockBardLogBuffer.kt     ← in-memory circular buffer of log entries for in-game log viewer
       DebugLog.kt               ← hot-path conditional logger (routes to debug() when disabled, info() when enabled)
       InstrumentMaterials.kt    ← blockBelowHint mapping for noteblock instruments (dirt, wood, wool, copper, etc.)
       LittleEndianReader.kt     ← DataInputStream extensions for NBS parsing; throws field-specific EOFException on truncation
+      ConfigSanitizing.kt       ← pure value rules behind BlockBardConfig.sanitize() (positive-or-fallback, NaN/infinity guards, notes-per-tick and tempo clamps)
       NoteUtils.kt              ← midiBase per instrument (including 26.x copper trumpet variants), noteIndex↔MIDI conversions, clicksNeeded
       VecMath.kt                ← vecToYawPitch (direction vector → yaw/pitch degrees)
 ```
@@ -156,7 +163,7 @@ NoteBlockRegistry        (singleton, Map<BlockPos, NoteBlockEntry>)
 ```
 MidiFilePlayer.load(file)
       │  reads tempo via raw MetaMessage scan (0x51)
-      │  reads notes via MidiChannelResolver.resolve(file) — re-parses the file independently
+      │  reads notes via MidiChannelResolver.resolve(sequence, name) — reuses the parsed Sequence
       │  for instrument resolution (tracks PROGRAM_CHANGE per channel; channel 10 = percussion)
       ▼
 List<TimedNoteEvent>(tick, midiNote, instrument)   ← instrument is non-null, always resolved
@@ -368,7 +375,7 @@ Tick-driven queue (`kotlin.collections.ArrayDeque<NoteRequest>`, guarded by a pr
 client thread). Called every tick from `BlockBardClient`'s `ClientTickEvents.END_CLIENT_TICK`.
 Key responsibilities:
 - **Token-bucket rate limiter:** refills continuously at Paper's standard limit (8 tokens per
-  310ms). Burst capped per tick by `maxNotesPerTick` (configurable 1–8, default 1).
+  310ms). Burst capped per tick by `maxNotesPerTick` (configurable 1–64, default 8; above 8 only enlarges the post-idle burst).
 - **Per-note rotation convergence gating:** applies `rotationConvergedDelegate` to *every* note,
   not just the first. If rotation is still in flight, dispatch halts for the tick and resumes
   next tick so the server always receives a rotation packet between successive interacts.
@@ -424,13 +431,34 @@ via `onProgress`, instead of cycling `TUNING ↔ VERIFYING` forever.
 
 ### `MidiFilePlayer` (client)
 Loads `.mid` files. Tempo read via a direct `MetaMessage` (0x51) scan; notes resolved via
-`MidiChannelResolver.resolve(file)`, which independently re-parses the file (a small
-deliberate duplicate parse, traded for keeping `MidiChannelResolver`'s signature
-self-contained). Every `TimedNoteEvent` carries a resolved `NoteBlockInstrument` —
+`MidiChannelResolver.resolve(sequence, label)` on the `Sequence` that `parse()` already
+read, so a file is read once per `parse()` (`resolve(file)` remains as a wrapper for callers
+without a sequence). Every `TimedNoteEvent` carries a resolved `NoteBlockInstrument` —
 this is not optional/best-effort; channel 10 is always treated as percussion regardless of
 program, and any unset channel defaults to GM program 0 (piano → HARP). Tempo scaling is
-read live per-event during playback (`tickToScaledMs(..., tempoMultiplier)`), so changing
-the tempo slider has immediate effect on a song already playing.
+read live during playback through `PlaybackClock` (same file package), which anchors
+song position to wall time and re-anchors when `tempoMultiplier` changes, so changing the
+tempo slider takes effect immediately without shifting time already elapsed.
+`tempoMultiplier`, `isPaused` and the play flags are `@Volatile` (GUI thread writes, playback
+thread reads). A `seekToTick()` while paused records a pending resume tick; `resume()` then
+starts a new playback thread there.
+
+Run identity (both `MidiFilePlayer` and `NbsPlayer`): each `play()` starts a thread tied to a
+`runId`; `stop()` bumps `runId` before interrupting. A thread whose id is stale exits without
+touching `isPlaying`, `currentTick`, the scheduler or `onFinished`, so an interrupted old
+thread cannot stop the run that replaced it (seek while playing is `stop()` then `play()`).
+Lifecycle changes, and each check-then-enqueue on the playback thread, run under a private
+`lock`. Lock order is player lock, then `ArpeggioScheduler`'s lock; the scheduler never
+calls into the players. `onFinished` and `onTickUpdate` run outside the lock, and
+`onFinished` fires only for a run that reached its natural end (a stop or seek never
+reports completion).
+
+Rotation ownership: `BlockBardClient`'s `START_CLIENT_TICK` handler primes playback rotation
+from `ArpeggioScheduler.peekNextPos()` only while no tuner is active
+(`MainScreen.activeTuner?.isActive`). While a tuner runs it is the sole writer of
+`PlayerController.primedRotation`. `/bb play` does not check for an active tuner, so notes
+queued meanwhile may be delayed by the rotation gate (unverified); the gate in the GUI paths
+already prevents this case.
 
 ### `NbsFileLoader` / `NbsPlayer` (client — same file)
 `NbsFileLoader` parses `.nbs` binary format via `LittleEndianReader`. Version-gated fields
@@ -446,8 +474,7 @@ here, not for a file named `NbsPlayer.kt`. It now has feature parity with `MidiF
 `PlaybackHud`), and `play()` no longer takes a `tempoMultiplier` parameter — it reads
 `MidiFilePlayer.tempoMultiplier` live inside the playback loop each tick (the same single
 shared value `MainScreen`'s tempo +/- buttons mutate), so the tempo slider has live effect
-on NBS playback already in progress, matching `MidiFilePlayer`'s
-`tickToScaledMs(..., tempoMultiplier)` behavior. `selectFile()`/`startPlayback()` in
+on NBS playback already in progress, using the same `PlaybackClock` as `MidiFilePlayer`. `selectFile()`/`startPlayback()` in
 `MainScreen` wrap `NbsFileLoader.load()` in try/catch, surfacing a chat warning on a
 malformed file rather than propagating an unhandled exception.
 
@@ -455,8 +482,8 @@ malformed file rather than propagating an unhandled exception.
 `MidiChannelResolver` and `MidiInstrumentMap` are live and load-bearing — they're what
 `MidiFilePlayer` actually uses to resolve instrument per note (see above).
 `OrganReadinessChecker` is wired into `MainScreen.selectFile()`: on selecting a `.mid`/
-`.midi` file, `MidiChannelResolver.resolveRequirements(file)` builds the
-`Set<MidiNoteRequirement>` passed to `OrganReadinessChecker.check()`, and the result is
+`.midi` file, `LoadedMidi.noteUsageCounts.keys` (already normalised by `parse()`, unpitched
+instruments collapsed to `midiBase`) is the `Set<NotePitch>` passed to `OrganReadinessChecker.check()`, and the result is
 shown as a single-line `readinessMessage` in the organ panel (plus a chat warning if
 coverage is incomplete) — before the user clicks Tune, not just after.
 
@@ -466,6 +493,77 @@ grep, zero callers anywhere, including no usage in `MainScreen`'s GUI despite wh
 documentation once claimed). It implemented an overlapping but different fallback
 strategy from `InstrumentShifter`/`MidiToOrganMapper`, which is the one actually wired in
 and remains unchanged.
+
+---
+
+## PlayQueue (`playback/PlayQueue.kt`, `main` source set)
+
+Pure model of what plays next. `MainScreen` drives it through `client/playback/ClientPlayQueue.kt`,
+which holds the one live instance (it outlives the screen) and `songIdOf(File)`, the single
+file-to-`SongId` mapping (the file name until the folder-playlist pass). Only the client thread may touch an instance.
+
+Concepts: a **context** (the song ids of the selected playlist, in caller-supplied order),
+an **order** (that list, or a stored shuffle permutation), a **cursor** (index of the last
+context song played, -1 before the first), a **user queue** (explicit "up next", always before
+the context), the **now playing** song and its source, and a bounded **history** (cap 50).
+`RepeatMode { OFF, ALL, ONE }` and `shuffle` are independent.
+
+Rules (tested in `PlayQueueTest`):
+1. The order is rebuilt only by `setContext`, `setShuffle`, `reshuffle`, `refreshContext`, and `startFromContext` under shuffle.
+   Queue edits, `upcoming`, skips, and anything the UI does with selection or search never reorder it.
+2. `onSongFinished`: user queue head, else Repeat ONE replays the current song, else the next context song (`cursor + 1`);
+   at the end Repeat ALL wraps (new permutation under shuffle, never starting with the song that just ended when there are two or more), Repeat OFF returns null.
+3. `skipNext` is the same with Repeat ONE treated as ALL. A null result changes no state.
+4. A song played from the user queue never moves the cursor, so the context resumes at `cursor + 1` when the queue drains.
+5. `startFromContext(id)`: cursor = index of `id`; under shuffle the order becomes `[id] + shuffled(rest)`. `startFromUser(i)` removes and plays that entry.
+   `startFromUpcoming(offset)` jumps the cursor to an upcoming context row without reordering anything (double-click on a context row).
+6. `skipPrev` pops the history. Each history entry remembers the context song the cursor sat on while it played, and the cursor goes back to it
+   (an anchor no longer in the context leaves the cursor alone). Going back to a queued song and then forward therefore replays the context song after it, not the one after that.
+7. `setContext` and `setShuffle` rebuild around the current song (cursor on it, or -1 when it is not in the context).
+   `refreshContext` drops missing ids and keeps the cursor on the same song; under shuffle survivors keep their relative order and new ids are shuffled onto the tail.
+8. `upcoming(limit)` lists user rows then context rows after the cursor; it never invents the order after a wrap. `wrapsAtEnd` and `repeatingCurrent` flag those cases for display.
+9. Coordinator duties, not `PlayQueue` duties: skipping songs that fail to load (cap 5 in a row), calling `stop()` on a null result, and persisting settings.
+
+Additions beyond the plan's API sketch: `stop()`, `startFromUpcoming`, `contextOrder`, `contextCursor`, `HISTORY_CAP`.
+
+### How `MainScreen` uses it
+
+- **Context** is the whole library (`midiFiles`), pushed with `refreshContext` from `refreshFiles()`. The filter buttons and the
+  search box only change what the Files tab shows; they never change what plays next.
+- **Settings** (`repeatMode`, `shuffle`) reach the live queue through `ClientPlayQueue.applyConfig`, called at client init, from the
+  YACL save lambda, from `/bb repeat` and `/bb shuffle`, and from the two GUI buttons (Loop cycles OFF, ALL, ONE; Shuf toggles shuffle).
+  `setShuffle` ignores an unchanged value, so saving settings without touching shuffle does not reorder the queue.
+- **Starting songs:** Tune & Play and a double-click on a library row call `startFromContext` (unless that song is already the now-playing one);
+  Next and Prev call `skipNext` and `skipPrev`; a double-click on a queue row calls `startFromUser` or `startFromUpcoming`.
+  Skip and queue starts reach `playSelectedSong(fromQueue = true)` so the queue is not told twice.
+- **Song end:** see "PlaybackCoordinator" below. The screen no longer decides what plays next; it only acts when the coordinator asks it to start a song.
+- **Queue actions:** library rows have **Next** (`enqueueNext`) and **Last** (`enqueueLast`); the Files tab has **Queue view** (every song in `displayedFiles`, in view order, appended).
+  User rows have Top (`moveUserToFront`), up, down and remove; playlist rows have "+Q" (`promote`, a copy appended to the user queue). Playlist rows cannot be removed or reordered.
+  Hover hints replace the row's subtext line (rows have no tooltip API in use here).
+- **Display:** a single click on a queue row only highlights it. Only user-queued rows have reorder and remove controls; context rows follow the playlist order.
+  `updateQueueDisplay()` caches the rows and counts so the per-frame renderers do not copy the queue.
+
+### `PlaybackCoordinator` (`client/playback/PlaybackCoordinator.kt`)
+
+Decides what happens when a song ends, whether or not the GUI is open. It is installed once at client init (`install()` wires the playback-thread
+callbacks) and ticked from `END_CLIENT_TICK` in `BlockBardClient`, right after `MainScreen.onClientTick`.
+
+- **Thread rule:** `MidiFilePlayer.onFinished` and `NbsPlayer.onFinished` (playback thread) only set `songEnded`. `tick()` (client thread) consumes it and is the only
+  place the `PlayQueue` is asked what follows a finished song.
+- **Song end:** `handleSongEnded()` asks `queue.onSongFinished()` (skipping up to 5 files that no longer exist, then going idle) and arms an advance. The armed advance waits
+  until no tuner is active and both players are idle, then calls the host: `beginAdvance(file)` (select, retune, then play) for a different song, or `replayCurrent()`
+  for the same song again (Repeat ONE or a one-song playlist), which needs no retune.
+- **Host:** the work of loading, tuning and playing still lives in `MainScreen`, which implements `PlaybackHost` and registers itself in `init()`.
+  The registration is kept after the screen closes, so auto-advance works with the GUI closed (the same way the companion `onClientTick` already finishes a tune-then-play
+  with the screen closed). Until a screen has been opened once in a session there is no host: a song that ends then simply goes idle. The tuner lifecycle and the
+  screen-owned load state move out of `MainScreen` in the next pass, after which the host dependency goes away.
+- **`pendingAutoPlay`** in `MainScreen` now means only "start playback when the current tuner run finishes" (the tune-then-play chain). It is no longer used to arm an advance.
+- **Stop** (Stop button and `/bb stop`) calls `PlaybackCoordinator.stop()`: cancels a pending advance, aborts any tuner run (so `/bb stop` now really stops tuning, as its message says), stops both players
+  and clears now-playing.
+- **`/bb play`** calls `beginExternalPlay(file)` first. It refuses while a tuner is running (starting playback mid-tune would fight the tuner for rotation and block interactions), and otherwise registers the song with the queue
+  (`startFromContext`) so its end, Next and Prev follow the play order. If the song is not in the playlist (the screen has not listed the library yet) the queue's now-playing is cleared instead of left stale.
+- **`lastPlayedTrack`** is written when playback starts (`onPlaybackStarted`, from `startPlayback` and `/bb play`), not when a row is merely selected. On opening the screen the Files tab selects the last song that was played.
+- Not yet moved (still `MainScreen` methods, because they need its selection and tuner state): library double-click and Tune & Play (`startFromContext` plus the tune chain), Next and Prev (`skipNext` / `skipPrev`), queue row play-now.
 
 ---
 
@@ -483,8 +581,9 @@ and remains unchanged.
 5. `KeyboardInputHandler.register()`, `PlaybackHud.register()`
 6. `ClientTickEvents.START_CLIENT_TICK` — primes rotation toward the next pending note
    (`ArpeggioScheduler.peekNextPos()?.let { PlayerController.primeRotation(it) }`)
-7. `ClientTickEvents.END_CLIENT_TICK` — polls the GUI/HUD keybindings, calls
-   `ArpeggioScheduler.onTick()` (the actual dispatch-gated-on-convergence step)
+7. `PlaybackCoordinator.install()` — wires the playback-thread song-end callbacks
+   `ClientTickEvents.END_CLIENT_TICK` — polls the GUI/HUD keybindings, ticks the closed-screen tuner (`MainScreen.onClientTick`),
+   `PlaybackCoordinator.tick()` (song end and auto-advance), then `ArpeggioScheduler.onTick()` (the actual dispatch-gated-on-convergence step)
 8. `MidiInputHandler.autoConnect()` — attempts to open a saved MIDI device; its receiver
    callback runs on a foreign (non-Minecraft) thread, synchronized against
    `ArpeggioScheduler`'s queue (see `ArpeggioScheduler` subsystem summary above)
@@ -504,22 +603,27 @@ Current fields (`BlockBardConfig.kt`):
 `maxOctaveShift: Int = 1`, `reportShiftsInHud: Boolean = true`, `hudEnabled: Boolean = false`,
 `arpeggioStaleTimeoutMs: Long = 200L`, `defaultTempoMultiplier: Float = 1.0f`,
 `autoRescanIntervalSeconds: Int = 3`, `maxTuningClicksPerTick: Int = 1`,
-`lastPlayedTrack: String?`, `shuffleHistory: MutableList<String>`, `defaultOctave: Int = 4`,
+`lastPlayedTrack: String?`, `shuffleHistory: MutableList<String>` (no longer read or written; kept so old files load), `defaultOctave: Int = 4`,
 `midiDeviceName: String?`, `keyMappings: List<Int> = [54..62]` (MIDI notes for keys 1-9),
 `smoothCameraRotation: Boolean = false`, `fastTuning: Boolean = true`,
 `maxRotationDegreesPerTick: Float = 35f`, `rotationConvergenceThresholdDegrees: Float = 2f`,
 `rotationInProgressTimeoutMs: Long = 1500L`, `debugLogging: Boolean = false`,
-`maxNotesPerTick: Int = 8` (range 1–64 burst cap), `loopMode: String = "NONE"` (NONE, LOOP_ONE, LOOP_ALL, SHUFFLE_ALL),
+`maxNotesPerTick: Int = 8` (range 1–64 burst cap), `repeatMode: String?` (OFF, ALL, ONE; `null` = file predates the field), `shuffle: Boolean = false`,
+`loopMode: String = "NONE"` (DEPRECATED, kept one release for downgrades: read once to migrate, never rewritten),
 `instrumentRemap: MutableMap<String, String?>`, `favorites: MutableList<String>`,
 `activeFilter: String = "ALL"`, `dynamicRetuning: Boolean = false`, `dynamicRetuningMaxClicks: Int = 2`,
 `centerMovesPlayer: Boolean = false`, `enableChatFeedback: Boolean = false`.
 
 **Caveat affecting fields with non-trivial defaults:**
 This project uses plain `Gson` (`com.google.code.gson:gson:2.10.1`, with an `InstanceCreator<BlockBardConfig>`)
-to deserialize `BlockBardConfig`. To guard against zero-defaults or missing keys from older `config.json` files,
-`ConfigManager.load()` explicitly coalesces `scanRadius`, `arpeggioStaleTimeoutMs`,
-`maxRotationDegreesPerTick`, `rotationConvergenceThresholdDegrees`, `rotationInProgressTimeoutMs`,
-`maxNotesPerTick`, `shuffleHistory`, and `instrumentRemap` back to safe defaults if loaded values are `<= 0` or null.
+to deserialize `BlockBardConfig`. Missing keys keep the constructor default, which is why `repeatMode` defaults to `null`:
+`null` is the only way to tell an old file from a new one.
+`ConfigManager.load()` then runs `BlockBardConfig.sanitize()` (zero, negative, NaN, infinite or null values become safe ones; rules are the pure
+helpers in `util/ConfigSanitizing.kt`: positive-or-fallback for `scanRadius`, `arpeggioStaleTimeoutMs`, `maxRotationDegreesPerTick`,
+`rotationConvergenceThresholdDegrees`, `rotationInProgressTimeoutMs`, `autoRescanIntervalSeconds`, `maxTuningClicksPerTick`;
+`maxNotesPerTick` 1-64 with 8 as the fallback; `defaultTempoMultiplier` non-finite or <= 0 → 1.0, then clamped 0.5–2.0; null `shuffleHistory` and `instrumentRemap` replaced by empty collections)
+and `migrateLoopSettings()` (see `LoopSettings.resolve`), saving the file once when a migration happened.
+Repeat and shuffle are two settings (`repeatMode`, `shuffle`) that feed the live `PlayQueue` through `ClientPlayQueue.applyConfig`.
 A planned architectural improvement is migrating to `kotlinx.serialization` with type-safe serializers.
 
 ---
@@ -550,7 +654,34 @@ parse exceptions silently) have been fixed — see the subsystem summaries above
 ```bash
 ./gradlew build          # full build → build/libs/
 ./gradlew runClient      # dev client with mod loaded
+./gradlew test           # unit tests (src/test/kotlin); also run by `build`
 ```
+
+### Unit tests
+
+JUnit 6.1.2 (`junit_version` in `gradle.properties`, BOM-pinned in `build.gradle`) runs on the
+JUnit Platform; `test { }` logs passed, skipped and failed tests and standard output.
+
+Result of the first run (`TestClasspathProbeTest`, owner-reported output from `./gradlew clean test`):
+
+| Probe | Result |
+|---|---|
+| `main` pure Kotlin (`NoteUtilsKt`) | loads |
+| `main` organ package (`NoteBlockEntry`) | loads |
+| client `PlaybackClock` (`internal`), `MidiTempoMap` | load at runtime |
+| Minecraft `NoteBlockInstrument` | on the classpath, but its static initializer fails (`NoClassDefFoundError: Could not initialize class`; root cause not captured on that run) |
+
+What follows from it:
+
+- Pure `main` code is unit-testable (`PlayQueue`, `NoteUtils` functions that do not touch an instrument).
+- The client source set is on the test runtime classpath, so `PlaybackClock` and `MidiTempoMap` did not need to move to `main`.
+  Not verified: whether test source can compile against the client set's `internal` symbols. The probe only loads classes by name.
+- Code that touches `NoteBlockInstrument` (the `midiBase`, `isPitched` and `coversNatively` extensions in `NoteUtils.kt`, `NoteBlockEntry` instances) cannot be exercised until the failure is explained;
+  the probe now prints the full cause chain, so the next run records it. A likely cause is that Minecraft needs bootstrap before registry-backed types initialize (**Unverified**).
+  Until then the Minecraft-dependent assertion in the probe is skipped, not failed, and allocator tests that need `NoteBlockEntry` stay blocked.
+
+Rule of thumb: keep every unit under test free of Minecraft types and place it in the `main` source set
+(see `blockbard-roadmap-plan.md` section 8).
 
 CI: `.github/workflows/build.yml` — check this file directly for the current trigger
 branches and steps rather than assuming; it has not been re-verified in this pass.
@@ -568,6 +699,7 @@ branches and steps rather than assuming; it has not been re-verified in this pas
 | Change player movement / rotation | `PlayerController.kt` — read the Rotation & Anti-Cheat section above first |
 | Change GUI | `MainScreen.kt`, `PlaybackHud.kt` |
 | Change instrument ranges | `NoteUtils.kt` (`midiBase` extension) |
+| Change play order, repeat, shuffle or the queue | `playback/PlayQueue.kt` and `PlayQueueTest.kt` (pure), then `client/playback/ClientPlayQueue.kt` and the queue methods in `MainScreen.kt` |
 | Add a config option | `BlockBardConfig.kt`, then wire it in `BlockBardClient.onInitializeClient()` |
 | Debug MIDI file issues | `MidiFilePlayer.kt`, `midi/MidiChannelResolver.kt`, `midi/OrganReadinessChecker.kt` (wired into `MainScreen.selectFile()`) |
 | Debug NBS file issues | `NbsFileLoader.kt` (parser + `NbsPlayer`), `LittleEndianReader.kt` (throws field-specific `EOFException` on truncation) |

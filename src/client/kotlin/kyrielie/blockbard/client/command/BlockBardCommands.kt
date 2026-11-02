@@ -3,11 +3,11 @@ package kyrielie.blockbard.client.command
 import com.mojang.brigadier.arguments.FloatArgumentType
 import com.mojang.brigadier.arguments.StringArgumentType
 import kyrielie.blockbard.client.config.ConfigManager
-import kyrielie.blockbard.client.config.LoopMode
 import kyrielie.blockbard.client.gui.MaterialsShoppingOverlay
 import kyrielie.blockbard.client.midi.InstrumentRemapper
-import kyrielie.blockbard.client.midi.MidiChannelResolver
 import kyrielie.blockbard.client.organ.OrganScanner
+import kyrielie.blockbard.client.playback.ClientPlayQueue
+import kyrielie.blockbard.client.playback.PlaybackCoordinator
 import kyrielie.blockbard.client.playback.MidiFilePlayer
 import kyrielie.blockbard.client.playback.NbsFileLoader
 import kyrielie.blockbard.client.playback.NbsPlayer
@@ -18,6 +18,8 @@ import kyrielie.blockbard.client.player.PlayerController
 import kyrielie.blockbard.client.player.SoundVerifier
 import kyrielie.blockbard.client.util.SongDownloader
 import kyrielie.blockbard.organ.ArpeggioScheduler
+import kyrielie.blockbard.playback.LoopSettings
+import kyrielie.blockbard.playback.RepeatMode
 import kyrielie.blockbard.organ.NotePitch
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback
 import net.fabricmc.fabric.api.client.command.v2.ClientCommands
@@ -61,8 +63,8 @@ object BlockBardCommands {
 
             // /blockbard stop
             root.then(ClientCommands.literal("stop").executes { ctx ->
-                MidiFilePlayer.stop()
-                NbsPlayer.stop()
+                // Also cancels any tuner run and a pending auto-advance, and clears now-playing.
+                PlaybackCoordinator.stop()
                 SongAudioPreviewer.stopPreview()
                 ArpeggioScheduler.clear()
                 ctx.source.sendFeedback(Component.literal("§b[BlockBard] §fStopped all playback, tuning, and previews."))
@@ -109,20 +111,39 @@ object BlockBardCommands {
                 )
             )
 
-            // /blockbard loop <mode>
-            val loopModes = LoopMode.entries.map { it.name.lowercase() }
-            root.then(ClientCommands.literal("loop")
+            // /blockbard repeat <off|all|one>
+            val repeatNames = RepeatMode.entries.map { it.name.lowercase() }
+            root.then(ClientCommands.literal("repeat")
                 .then(ClientCommands.argument("mode", StringArgumentType.word())
-                    .suggests { _, builder -> SharedSuggestionProvider.suggest(loopModes, builder) }
+                    .suggests { _, builder -> SharedSuggestionProvider.suggest(repeatNames, builder) }
                     .executes { ctx ->
-                        val modeStr = StringArgumentType.getString(ctx, "mode").uppercase()
-                        try {
-                            val mode = LoopMode.valueOf(modeStr)
-                            ConfigManager.config.loopMode = mode.name
+                        val mode = LoopSettings.parseRepeat(StringArgumentType.getString(ctx, "mode"))
+                        if (mode == null) {
+                            ctx.source.sendError(Component.literal("§b[BlockBard] §cUnknown repeat mode. Valid: ${repeatNames.joinToString()}"))
+                        } else {
+                            ConfigManager.config.repeatMode = mode.name
                             ConfigManager.save()
-                            ctx.source.sendFeedback(Component.literal("§b[BlockBard] §fLoop mode set to §a${mode.name}§f."))
-                        } catch (_: IllegalArgumentException) {
-                            ctx.source.sendError(Component.literal("§b[BlockBard] §cUnknown loop mode. Valid: ${loopModes.joinToString()}"))
+                            ClientPlayQueue.applyConfig(ConfigManager.config)
+                            ctx.source.sendFeedback(Component.literal("§b[BlockBard] §fRepeat set to §a${mode.name}§f."))
+                        }
+                        1
+                    }
+                )
+            )
+
+            // /blockbard shuffle <on|off>
+            root.then(ClientCommands.literal("shuffle")
+                .then(ClientCommands.argument("state", StringArgumentType.word())
+                    .suggests { _, builder -> SharedSuggestionProvider.suggest(listOf("on", "off"), builder) }
+                    .executes { ctx ->
+                        val on = LoopSettings.parseOnOff(StringArgumentType.getString(ctx, "state"))
+                        if (on == null) {
+                            ctx.source.sendError(Component.literal("§b[BlockBard] §cUse on or off."))
+                        } else {
+                            ConfigManager.config.shuffle = on
+                            ConfigManager.save()
+                            ClientPlayQueue.applyConfig(ConfigManager.config)
+                            ctx.source.sendFeedback(Component.literal("§b[BlockBard] §fShuffle turned §a${if (on) "ON" else "OFF"}§f."))
                         }
                         1
                     }
@@ -166,6 +187,12 @@ object BlockBardCommands {
                             return@executes 0
                         }
 
+                        // Refuse while a tuner is running, then register the song with the play queue.
+                        PlaybackCoordinator.beginExternalPlay(file)?.let { refusal ->
+                            ctx.source.sendError(Component.literal("§b[BlockBard] §c$refusal"))
+                            return@executes 0
+                        }
+
                         SongAudioPreviewer.stopPreview()
                         SoundVerifier.reset()
 
@@ -180,6 +207,7 @@ object BlockBardCommands {
                                 MaterialsShoppingOverlay.updateRequirements(reqs)
                                 ctx.source.sendFeedback(Component.literal("§b[BlockBard] §fPlaying NBS: §a${file.name}"))
                                 NbsPlayer.play(nbs)
+                                PlaybackCoordinator.onPlaybackStarted(file)
                             } catch (e: Exception) {
                                 ctx.source.sendError(Component.literal("§b[BlockBard] §cFailed to load NBS: ${e.message}"))
                                 return@executes 0
@@ -187,10 +215,11 @@ object BlockBardCommands {
                         } else {
                             try {
                                 val midi = MidiFilePlayer.load(file)
-                                val reqs = MidiChannelResolver.resolveRequirements(file)
+                                val reqs = midi.noteUsageCounts.keys
                                 MaterialsShoppingOverlay.updateRequirements(reqs)
                                 ctx.source.sendFeedback(Component.literal("§b[BlockBard] §fPlaying MIDI: §a${file.name}"))
                                 MidiFilePlayer.play()
+                                PlaybackCoordinator.onPlaybackStarted(file)
                             } catch (e: Exception) {
                                 ctx.source.sendError(Component.literal("§b[BlockBard] §cFailed to load MIDI: ${e.message}"))
                                 return@executes 0

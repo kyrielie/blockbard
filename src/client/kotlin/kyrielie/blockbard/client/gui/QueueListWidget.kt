@@ -1,6 +1,8 @@
 package kyrielie.blockbard.client.gui
 
 import kyrielie.blockbard.client.playback.SongMetadataCache
+import kyrielie.blockbard.playback.QueueRow
+import kyrielie.blockbard.playback.QueueSource
 import net.minecraft.client.Minecraft
 import net.minecraft.client.gui.GuiGraphicsExtractor
 import net.minecraft.client.gui.components.ObjectSelectionList
@@ -8,20 +10,32 @@ import net.minecraft.client.input.MouseButtonEvent
 import net.minecraft.network.chat.Component
 import java.io.File
 
+/**
+ * One displayed queue row. [index] is the row's position in the full "up next" list (user rows
+ * first, then context rows) and is what the action callbacks receive, so it stays correct even
+ * when a file is missing and only a placeholder [file] is shown.
+ */
+data class QueueItem(val index: Int, val row: QueueRow, val file: File)
+
+/**
+ * The "up next" list. A single click only highlights a row; nothing is selected into the
+ * player and the list is never recomputed by clicking. Double-click means "play now".
+ * User-queued rows have move-to-top, up, down and remove. Context rows (the playlist order)
+ * cannot be removed or reordered, but "+Q" copies one into the user queue.
+ */
 class QueueListWidget(
     minecraft: Minecraft,
     width: Int,
     height: Int,
     y: Int,
     itemHeight: Int = 26,
-    private val onSelect: (File) -> Unit,
-    private val onDoubleClick: ((File) -> Unit)? = null,
-    private val onRemove: ((Int) -> Unit)? = null,
-    private val onMoveUp: ((Int) -> Unit)? = null,
-    private val onMoveDown: ((Int) -> Unit)? = null
+    private val onPlayNow: ((QueueItem) -> Unit)? = null,
+    private val onRemove: ((QueueItem) -> Unit)? = null,
+    private val onMoveUp: ((QueueItem) -> Unit)? = null,
+    private val onMoveDown: ((QueueItem) -> Unit)? = null,
+    private val onMoveToTop: ((QueueItem) -> Unit)? = null,
+    private val onPromote: ((QueueItem) -> Unit)? = null
 ) : ObjectSelectionList<QueueListWidget.QueueEntry>(minecraft, width, height, y, itemHeight) {
-
-    private var isRefreshing = false
 
     override fun isMouseOver(mouseX: Double, mouseY: Double): Boolean {
         return visible && super.isMouseOver(mouseX, mouseY)
@@ -37,43 +51,31 @@ class QueueListWidget(
         return super.mouseScrolled(mouseX, mouseY, horizontalAmount, verticalAmount)
     }
 
-    fun setQueue(files: List<File>, currentPlaying: File?, userQueueCount: Int = 0) {
-        isRefreshing = true
-        try {
-            clearEntries()
-            var selectedEntry: QueueEntry? = null
-            files.forEachIndexed { idx, file ->
-                val isCurrent = (currentPlaying != null && file.name.equals(currentPlaying.name, ignoreCase = true) && idx == 0)
-                val isUserQueued = idx < userQueueCount
-                val entry = QueueEntry(idx + 1, file, isCurrent, isUserQueued)
-                addEntry(entry)
-                if (isCurrent && selectedEntry == null) {
-                    selectedEntry = entry
-                }
+    /**
+     * Rebuilds the rows. The highlighted row stays highlighted when the same song is still at
+     * the same index, so a refresh caused by another action does not lose the highlight.
+     */
+    fun setQueue(items: List<QueueItem>) {
+        val previous = selected?.item
+        clearEntries()
+        var restored: QueueEntry? = null
+        for (item in items) {
+            val entry = QueueEntry(item)
+            addEntry(entry)
+            if (previous != null && previous.index == item.index && previous.row.id == item.row.id) {
+                restored = entry
             }
-            if (selectedEntry != null) {
-                setSelected(selectedEntry)
-            }
-        } finally {
-            isRefreshing = false
         }
-    }
-
-    override fun setSelected(entry: QueueEntry?) {
-        super.setSelected(entry)
-        if (!isRefreshing && entry != null) {
-            onSelect(entry.file)
-        }
+        if (restored != null) super.setSelected(restored)
     }
 
     override fun getRowWidth(): Int = (width - 24).coerceAtLeast(100)
 
-    inner class QueueEntry(
-        val queuePos: Int,
-        val file: File,
-        val isCurrent: Boolean,
-        val isUserQueued: Boolean = false
-    ) : ObjectSelectionList.Entry<QueueEntry>() {
+    inner class QueueEntry(val item: QueueItem) : ObjectSelectionList.Entry<QueueEntry>() {
+
+        private val file: File get() = item.file
+        private val queuePos: Int get() = item.index + 1
+        private val isUserQueued: Boolean get() = item.row.source == QueueSource.USER
 
         override fun getNarration(): Component = Component.literal("#$queuePos ${file.name}")
 
@@ -92,24 +94,16 @@ class QueueListWidget(
             val h = getContentHeight()
 
             // Entry backdrop
-            if (isCurrent) {
-                graphics.fill(x - 2, y - 1, x + w + 2, y + h + 1, opaque(0x225533))
-                graphics.fill(x - 1, y, x + w + 1, y + h, opaque(0x2E6B40))
-            } else if (isSelected) {
+            if (isSelected) {
                 graphics.fill(x - 2, y - 1, x + w + 2, y + h + 1, opaque(0x3A3A4A))
                 graphics.fill(x - 1, y, x + w + 1, y + h, opaque(0x4A4A5E))
             } else if (hovered) {
                 graphics.fill(x - 2, y - 1, x + w + 2, y + h + 1, opaque(0x26262E))
             }
 
-            // Queue number badge: e.g. "#1" or "▶"
-            val numStr = if (isCurrent) "▶" else "#$queuePos"
-            val numColor = when {
-                isCurrent -> opaque(0x55FF77)
-                isUserQueued -> opaque(0x55FFFF)
-                else -> opaque(0xFFD700)
-            }
-            graphics.text(font, numStr, x + 4, y + 3, numColor)
+            // Queue number badge: cyan for user-queued rows, gold for the context
+            val numColor = if (isUserQueued) opaque(0x55FFFF) else opaque(0xFFD700)
+            graphics.text(font, "#$queuePos", x + 4, y + 3, numColor)
 
             // Format badge: [MID] or [NBS]
             val isNbs = file.extension.equals("nbs", true)
@@ -118,7 +112,7 @@ class QueueListWidget(
             graphics.text(font, badge, x + 24, y + 3, badgeColor)
 
             // Track name
-            val nameColor = if (isCurrent) opaque(0xAAFFAA) else if (hovered) opaque(0xFFFFFF) else opaque(0xDDDDDD)
+            val nameColor = if (hovered) opaque(0xFFFFFF) else opaque(0xDDDDDD)
             val maxChars = ((w - 110) / 6).coerceIn(15, 65)
             val name = file.nameWithoutExtension.take(maxChars)
             graphics.text(font, name, x + 58, y + 3, nameColor)
@@ -132,11 +126,25 @@ class QueueListWidget(
             } ?: (file.length() / 1024).let { "${it}KB" }
 
             val durW = font.width(durationText)
-            val rightOffset = if (isUserQueued) 46 else 22
+            val rightOffset = if (isUserQueued) 70 else 30
             graphics.text(font, durationText, x + w - durW - rightOffset, y + 3, opaque(0xAAAAAA))
 
-            // Reorder controls for user-queued items: ▲ and ▼
+            val rowHovered = mouseY >= y + 2 && mouseY <= y + 12
+            var hint: String? = null
+            if (!isUserQueued) {
+                val promoteX = x + w - 22
+                val promoteHovered = rowHovered && mouseX >= promoteX - 2 && mouseX <= x + w
+                graphics.text(font, "+Q", promoteX, y + 3, if (promoteHovered) opaque(0x55FF55) else opaque(0x77AA77))
+                if (promoteHovered) hint = "Copy to your queue so it plays before the playlist"
+            }
             if (isUserQueued) {
+                // Move to top
+                val topX = x + w - 64
+                val topHovered = rowHovered && mouseX >= topX - 2 && mouseX <= topX + 18
+                graphics.text(font, "Top", topX, y + 3, if (topHovered) opaque(0xFFFF55) else opaque(0x888888))
+                if (topHovered) hint = "Move to the top of your queue"
+
+                // Reorder controls: up and down
                 val upX = x + w - 38
                 val upHovered = mouseX >= upX - 2 && mouseX <= upX + 8 && mouseY >= y + 2 && mouseY <= y + 12
                 val upColor = if (upHovered) opaque(0xFFFF55) else opaque(0x888888)
@@ -146,49 +154,62 @@ class QueueListWidget(
                 val downHovered = mouseX >= downX - 2 && mouseX <= downX + 8 && mouseY >= y + 2 && mouseY <= y + 12
                 val downColor = if (downHovered) opaque(0xFFFF55) else opaque(0x888888)
                 graphics.text(font, "▼", downX, y + 3, downColor)
-            }
 
-            // Remove button [✕]
-            val removeX = x + w - 14
-            val removeHovered = mouseX >= removeX && mouseX <= removeX + 10 && mouseY >= y + 2 && mouseY <= y + 12
-            val removeColor = if (removeHovered) opaque(0xFF5555) else opaque(0x666666)
-            graphics.text(font, "✕", removeX, y + 3, removeColor)
+                // Remove button. Context rows have none: they come from the playlist order.
+                val removeX = x + w - 14
+                val removeHovered = mouseX >= removeX && mouseX <= removeX + 10 && mouseY >= y + 2 && mouseY <= y + 12
+                val removeColor = if (removeHovered) opaque(0xFF5555) else opaque(0x666666)
+                graphics.text(font, "✕", removeX, y + 3, removeColor)
+            }
 
             // Subtext: summary (notes / channels / tempo)
-            val sub = when {
-                isCurrent -> "Currently playing"
-                isUserQueued -> "Custom queue: #${queuePos} • ${meta?.summaryString ?: "Queued track"}"
-                else -> meta?.summaryString ?: "Queued track"
+            val sub = if (isUserQueued) {
+                "Custom queue: #$queuePos • ${meta?.summaryString ?: "Queued track"}"
+            } else {
+                meta?.summaryString ?: "Queued track"
             }
-            val subColor = if (isCurrent) opaque(0x77DD99) else if (isUserQueued) opaque(0x88CCFF) else opaque(0x777777)
-            graphics.text(font, sub, x + 58, y + 14, subColor)
+            val subColor = when {
+                hint != null -> opaque(0x88DD88)
+                isUserQueued -> opaque(0x88CCFF)
+                else -> opaque(0x777777)
+            }
+            graphics.text(font, hint ?: sub, x + 58, y + 14, subColor)
         }
 
         override fun mouseClicked(event: MouseButtonEvent, doubleClick: Boolean): Boolean {
             if (event.button() == 0) {
                 val entryX = getContentX()
                 val entryW = getContentWidth()
+                if (!isUserQueued && event.x() >= entryX + entryW - 24) {
+                    onPromote?.invoke(item)
+                    return true
+                }
                 if (isUserQueued) {
+                    val topX = entryX + entryW - 64
+                    if (event.x() >= topX - 2 && event.x() <= topX + 18) {
+                        onMoveToTop?.invoke(item)
+                        return true
+                    }
                     val upX = entryX + entryW - 38
                     if (event.x() >= upX - 2 && event.x() <= upX + 9) {
-                        onMoveUp?.invoke(queuePos - 1)
+                        onMoveUp?.invoke(item)
                         return true
                     }
                     val downX = entryX + entryW - 26
                     if (event.x() >= downX - 2 && event.x() <= downX + 9) {
-                        onMoveDown?.invoke(queuePos - 1)
+                        onMoveDown?.invoke(item)
+                        return true
+                    }
+                    val removeX = entryX + entryW - 14
+                    if (event.x() >= removeX - 2 && event.x() <= removeX + 12) {
+                        onRemove?.invoke(item)
                         return true
                     }
                 }
-                val removeX = entryX + entryW - 14
-                if (event.x() >= removeX - 2 && event.x() <= removeX + 12) {
-                    onRemove?.invoke(queuePos - 1)
-                    return true
-                }
+                // Single click only highlights. Double-click plays this row now.
                 this@QueueListWidget.setSelected(this)
-                onSelect(file)
                 if (doubleClick) {
-                    onDoubleClick?.invoke(file)
+                    onPlayNow?.invoke(item)
                 }
                 return true
             }

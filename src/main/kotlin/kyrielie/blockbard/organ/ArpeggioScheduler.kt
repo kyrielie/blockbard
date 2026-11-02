@@ -95,6 +95,13 @@ object ArpeggioScheduler {
      *   bucket has accrued enough tokens. Every note still goes through the rotation
      *   convergence gate, unlike the old "notes 2-N skip the gate" behaviour.
      *
+     * Above 8: the sustained rate is unchanged (the refill rate is fixed at 8 tokens
+     *   per 310 ms), but the bucket ceiling equals this value, so after an idle period
+     *   a burst of up to this many interacts can be sent at once. That exceeds the
+     *   8-per-310 ms limit this limiter is modelled on and can trigger server kicks.
+     *   The config accepts up to 64; values above 8 are only for servers known to have
+     *   no interact rate limit.
+     *
      * Set from BlockBardConfig.maxNotesPerTick at init in BlockBardClient.
      */
     var maxNotesPerTick: Int = 8
@@ -388,7 +395,7 @@ object ArpeggioScheduler {
         logger.info("queue cleared (had ${queue.size} items, ${lookaheadRetunes.size} retune tasks)")
         queue.clear()
         lookaheadRetunes.clear()
-        interactBudget = 1f
+        interactBudget = maxNotesPerTick.toFloat()
         lastTickMs = -1L
         dispatchHistory.clear()
         voiceIndices.clear()
