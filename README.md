@@ -25,7 +25,7 @@ BlockBard is an advanced client-side Minecraft mod designed to turn physical not
 - 🔁 **Playback Modes & HUD**:
   - **Client-Side Audio Preview**: Audition tracks client-side with Minecraft's sound engine without placing blocks or sending packets.
   - **Survival Materials Shopping Overlay**: In-game HUD overlay displaying item icons and fractional counts (`inInventory/needed`) for required blocks.
-  - **Loop Modes**: Support for `NONE`, `LOOP_ONE`, `LOOP_ALL`, and `SHUFFLE_ALL` (with duplicate avoidance history).
+  - **Repeat and Shuffle**: Repeat Off, All or One, and an independent Shuffle toggle (config screen, the in-GUI loop button, or `/bb repeat` and `/bb shuffle`). Existing `loopMode` settings are migrated automatically on first load.
   - **HUD Overlay**: On-screen overlay rendered via Fabric's `HudElementRegistry` (`H` to toggle) showing song progress, ticks, tempo, and organ coverage.
   - **Dynamic Tempo Scaling**: Live `0.5×`–`2.0×` tempo slider affecting both MIDI and NBS playback in real time.
 - ⚡ **Client Commands & Web Downloads**:
@@ -51,13 +51,14 @@ BlockBard provides full Fabric client commands registered under `/blockbard` (or
 
 | Command | Description |
 |:---|:---|
-| `/bb play <song>` | Starts playing the specified song (supports tab-completion). |
+| `/bb play <song>` | Starts playing the specified song (supports tab-completion). Refused while tuning is in progress. |
 | `/bb preview <song>` | Auditions the song locally using client sound without placing blocks. |
 | `/bb stop` | Halts world playback, tuning, and previews. |
 | `/bb scan` | Scans surrounding blocks and reports playable noteblocks. |
 | `/bb center` | Centers standing position on organ and reports reachability. |
 | `/bb tempo <0.1–5.0>` | Sets live playback tempo scale. |
-| `/bb loop <none\|loop_one\|loop_all\|shuffle_all>` | Sets loop playback mode. |
+| `/bb repeat <off\|all\|one>` | Sets what happens when the playlist ends (replaces `/bb loop`). |
+| `/bb shuffle <on\|off>` | Turns shuffle on or off. |
 | `/bb download <url> [name]` | Downloads a `.mid` or `.nbs` file from the web asynchronously. |
 | `/bb materials` | Toggles the Survival Materials shopping list HUD overlay. |
 | `/bb remap <source> <target\|mute\|reset>` | Remaps or mutes note block instruments. |
@@ -79,8 +80,8 @@ BlockBard provides full Fabric client commands registered under `/blockbard` (or
    - Click **Tune & Play** (or double-click any song). BlockBard calculates the minimal delta clicks, aims and right-clicks blocks to tune them, verifies pitches against the server, and immediately transitions to left-click world playback.
    - For complete chromatic organs (25 blocks per instrument covering notes 0–24), tuning is skipped entirely and playback starts instantly.
 6. **Playback & Queue Management**:
-   - Manage playback with the bottom transport bar: **▶ Play / ❚❚ Pause** (freezes and resumes at exact millisecond), **⏹ Stop** (terminates playback, resets position to 0:00, clears scheduler queue and cancels auto-advance), **|◀ Prev / ▶| Next**, **Tempo - / +**, and **Loop mode** (`NONE`, `LOOP_ONE`, `LOOP_ALL`, `SHUFFLE_ALL`).
-   - Switch to the **Queue** tab to view upcoming tracks, durations, and summaries. In Shuffle mode, click `[✕]` on any track to remove it from the upcoming shuffle list, or click **🔀 Reshuffle** to re-randomize.
+   - Manage playback with the bottom transport bar: **▶ Play / ❚❚ Pause** (freezes and resumes at exact millisecond), **⏹ Stop** (terminates playback, resets position to 0:00, clears scheduler queue and cancels auto-advance), **|◀ Prev / ▶| Next**, **Tempo - / +**, the **Loop** button (cycles Repeat Off, All, One) and the **Shuf** button (shuffle on or off).
+   - Switch to the **Queue** tab to view upcoming tracks, durations, and summaries. In the Files tab, **Next** puts a track right after the current song and **Last** adds it to the end of your queue; **Queue view** adds everything shown in the list. Tracks you queue always play first, in every repeat mode, and can be moved to the top (**Top**), reordered with the arrows or removed with `[✕]`. The rest of the list is the playlist order (random when Shuffle is on); **+Q** on one of those rows copies it into your queue, and **🔀 Reshuffle** gives a new random order. A single click on a row only highlights it; double-click plays it now.
    - Press <kbd>H</kbd> in-game to toggle the on-screen HUD overlay showing song progress, ticks, tempo, and notes played.
 
 ---

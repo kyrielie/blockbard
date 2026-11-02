@@ -146,12 +146,34 @@ object NbsFileLoader {
 
 object NbsPlayer {
     private var playbackThread: Thread? = null
+
+    /**
+     * Guards the lifecycle fields (isPlaying, isPaused, playbackThread, currentTick,
+     * totalTick, pendingResumeTick) and the enqueue of each tick's notes. Lock order is
+     * always this lock, then ArpeggioScheduler's lock; the scheduler never calls back
+     * into the player. onFinished is invoked outside the lock.
+     */
+    private val lock = Any()
+
+    /**
+     * Identity of the current playback run. stop() bumps it, so a thread whose captured
+     * id no longer matches is stale: it must exit without touching isPlaying,
+     * currentTick, the scheduler or onFinished. See MidiFilePlayer.runId.
+     */
+    @Volatile
+    private var runId: Int = 0
+
+    private fun isCurrent(run: Int): Boolean = runId == run
+    @Volatile
     var isPlaying: Boolean = false
         private set
+    @Volatile
     var isPaused: Boolean = false
         private set
-    private var pausedAtMs: Long = 0L
-    private var startWallMs: Long = 0L
+
+    /** Set by a paused seekToTick(); resume() restarts playback from this tick. */
+    @Volatile
+    private var pendingResumeTick: Long = -1L
 
     // Mirrors MidiFilePlayer.getCurrentTick()/getTotalTicks() — updated inside the
     // playback loop each time a tick's notes are dispatched, plus public getters
@@ -161,6 +183,7 @@ object NbsPlayer {
     // (currentTick only increases during jump-decoding for a well-formed file); a
     // malformed file could violate that, but that case is guarded separately by
     // LittleEndianReader's EOF handling rather than re-sorting here on every play().
+    @Volatile
     private var currentTick: Long = 0L
     private var totalTick: Long = 0L
     var currentNbs: NbsFile? = null
@@ -176,115 +199,145 @@ object NbsPlayer {
      * whichever format is currently playing.
      */
     fun play(nbs: NbsFile, startFromTick: Long = 0L) {
-        stop()
-        isPlaying = true
-        isPaused = false
-        currentNbs = nbs
-        currentTick = startFromTick
-        totalTick = nbs.notes.lastOrNull()?.tick?.toLong() ?: 0L
+        synchronized(lock) {
+            stop()
+            val run = runId  // bumped by stop(), so unique to this run
+            isPlaying = true
+            isPaused = false
+            pendingResumeTick = -1L
+            currentNbs = nbs
+            currentTick = startFromTick
+            totalTick = nbs.notes.lastOrNull()?.tick?.toLong() ?: 0L
 
-        val initialRealMs = (startFromTick / nbs.tempo * 1000.0).toLong()
-        val initialScaledMs = (initialRealMs / MidiFilePlayer.tempoMultiplier).toLong()
-        startWallMs = System.currentTimeMillis() - initialScaledMs
+            val clock = PlaybackClock(startFromTick / nbs.tempo * 1000.0, MidiFilePlayer.tempoMultiplier)
 
-        playbackThread = Thread({
-            try {
-                val notesByTick = nbs.notes.groupBy { it.tick }
-                val sortedTicks = notesByTick.keys.sorted()
+            val thread = Thread({
+                try {
+                    val notesByTick = nbs.notes.groupBy { it.tick }
+                    val sortedTicks = notesByTick.keys.sorted()
 
-                for (tick in sortedTicks) {
-                    if (!isPlaying) break
-                    if (tick < startFromTick) continue
+                    for (tick in sortedTicks) {
+                        if (!isCurrent(run)) return@Thread
+                        if (tick < startFromTick) continue
 
-                    // Recompute the scaled target time fresh from the live tempo
-                    // multiplier each tick, the same way MidiFilePlayer.play() calls
-                    // tickToScaledMs(..., tempoMultiplier) inside its loop, rather than
-                    // baking a fixed tickDurationMs once at play() start — that older
-                    // approach meant the tempo slider had no live effect on NBS playback
-                    // once started, unlike MIDI. MidiFilePlayer.tempoMultiplier is the
-                    // single shared value MainScreen's tempo +/- buttons mutate; reading
-                    // it here each tick (rather than the captured tempoMultiplier
-                    // parameter) means an in-progress NBS song picks up tempo changes
-                    // immediately, matching MIDI's behavior.
-                    val realMs = (tick / nbs.tempo * 1000.0).toLong()
-                    val scaledMs = (realMs / MidiFilePlayer.tempoMultiplier).toLong()
-                    val targetMs = startWallMs + scaledMs
+                        // Song position at 1x tempo. PlaybackClock converts it to wall time
+                        // using the live MidiFilePlayer.tempoMultiplier (the single tempo
+                        // control shared by both formats) and re-anchors when it changes, so
+                        // a mid-song tempo change does not shift already-elapsed time.
+                        val tickBaseMs = tick / nbs.tempo * 1000.0
 
-                    while (System.currentTimeMillis() < targetMs) {
-                        if (!isPlaying) return@Thread
-                        while (isPaused) {
-                            Thread.sleep(20)
-                            if (!isPlaying) return@Thread
+                        while (true) {
+                            if (!isCurrent(run)) return@Thread
+                            if (isPaused) {
+                                val pauseStart = System.currentTimeMillis()
+                                while (isPaused) {
+                                    Thread.sleep(20)
+                                    if (!isCurrent(run)) return@Thread
+                                }
+                                clock.shift(System.currentTimeMillis() - pauseStart)
+                            }
+                            val targetMs = clock.wallTimeFor(tickBaseMs, MidiFilePlayer.tempoMultiplier)
+                            if (System.currentTimeMillis() >= targetMs) break
+                            Thread.sleep(5)
                         }
-                        Thread.sleep(5)
-                    }
-                    if (!isPlaying) return@Thread
-                    currentTick = tick.toLong()
-                    notesByTick[tick]?.forEach { note ->
-                        val rawInstrument = nbsInstrumentToBlock(note.instrument)
-                        val instrument = rawInstrument?.let { kyrielie.blockbard.client.midi.InstrumentRemapper.remap(it) }
-                        if (rawInstrument != null && instrument == null) return@forEach // Muted by InstrumentRemapper
 
-                        // For vanilla instruments, keys 33..57 represent noteblock click indices 0..24.
-                        // The actual sounding Minecraft pitch is instrument.midiBase + (note.key - 33).
-                        // Unpitched instruments (SNARE, HAT, BASEDRUM) collapse to midiBase.
-                        val midiNote = if (instrument != null && !instrument.isPitched) {
-                            instrument.midiBase
-                        } else if (instrument != null) {
-                            instrument.midiBase + (note.key - 33)
-                        } else {
-                            note.key + 21
+                        val requests = notesByTick[tick].orEmpty().mapNotNull { note ->
+                            val rawInstrument = nbsInstrumentToBlock(note.instrument)
+                            val instrument = rawInstrument?.let { kyrielie.blockbard.client.midi.InstrumentRemapper.remap(it) }
+                            if (rawInstrument != null && instrument == null) return@mapNotNull null // Muted by InstrumentRemapper
+
+                            // For vanilla instruments, keys 33..57 represent noteblock click indices 0..24.
+                            // The actual sounding Minecraft pitch is instrument.midiBase + (note.key - 33).
+                            // Unpitched instruments (SNARE, HAT, BASEDRUM) collapse to midiBase.
+                            val midiNote = if (instrument != null && !instrument.isPitched) {
+                                instrument.midiBase
+                            } else if (instrument != null) {
+                                instrument.midiBase + (note.key - 33)
+                            } else {
+                                note.key + 21
+                            }
+                            NoteRequest(midiNote, instrument = instrument)
                         }
-                        ArpeggioScheduler.enqueue(NoteRequest(midiNote, instrument = instrument))
+
+                        // Check-and-enqueue is atomic with stop(), so a stale thread can never
+                        // enqueue notes after stop() cleared the scheduler.
+                        synchronized(lock) {
+                            if (!isCurrent(run)) return@Thread
+                            currentTick = tick.toLong()
+                            requests.forEach { ArpeggioScheduler.enqueue(it) }
+                        }
                     }
+                    // Only a run that is still current may report completion. A stopped or
+                    // replaced run must not touch isPlaying or fire onFinished.
+                    val finished = synchronized(lock) {
+                        if (isCurrent(run)) { isPlaying = false; true } else false
+                    }
+                    if (finished) onFinished?.invoke()
+                } catch (_: InterruptedException) {
+                    synchronized(lock) { if (isCurrent(run)) isPlaying = false }
                 }
-                isPlaying = false
-                onFinished?.invoke()
-            } catch (_: InterruptedException) {
-                isPlaying = false
-            }
-        }, "BlockBard-NBS-Playback")
-        playbackThread?.isDaemon = true
-        playbackThread?.start()
+            }, "BlockBard-NBS-Playback")
+            thread.isDaemon = true
+            playbackThread = thread
+            thread.start()
+        }
     }
 
     fun pause() {
-        if (!isPlaying || isPaused) return
-        isPaused = true
-        pausedAtMs = System.currentTimeMillis()
+        synchronized(lock) {
+            if (!isPlaying || isPaused) return
+            isPaused = true
+        }
     }
 
     fun resume() {
-        if (!isPaused) return
-        val paused = System.currentTimeMillis() - pausedAtMs
-        startWallMs += paused
-        isPaused = false
+        synchronized(lock) {
+            if (!isPaused) return
+            val resumeTick = pendingResumeTick
+            val nbs = currentNbs
+            if (resumeTick >= 0L && nbs != null) {
+                // Paused seek: no thread is running, so start one at the sought tick.
+                pendingResumeTick = -1L
+                isPaused = false
+                play(nbs, resumeTick)
+                return
+            }
+            isPaused = false
+        }
     }
 
     fun stop() {
-        isPlaying = false
-        isPaused = false
-        playbackThread?.interrupt()
-        playbackThread = null
-        ArpeggioScheduler.clear()
-        currentTick = 0L
+        synchronized(lock) {
+            runId++  // invalidates the running thread before it is interrupted
+            isPlaying = false
+            isPaused = false
+            pendingResumeTick = -1L
+            playbackThread?.interrupt()
+            playbackThread = null
+            ArpeggioScheduler.clear()
+            currentTick = 0L
+        }
     }
 
     fun getCurrentTick(): Long = currentTick
     fun getTotalTicks(): Long = totalTick
 
     fun seekToTick(tick: Long) {
-        val nbs = currentNbs ?: return
-        val clamped = tick.coerceIn(0L, totalTick.coerceAtLeast(0L))
-        val wasPlaying = isPlaying && !isPaused
-        val wasPaused = isPaused
-        stop()
-        currentNbs = nbs
-        currentTick = clamped
-        if (wasPlaying) {
-            play(nbs, clamped)
-        } else if (wasPaused) {
-            isPaused = true
+        synchronized(lock) {
+            val nbs = currentNbs ?: return
+            val clamped = tick.coerceIn(0L, totalTick.coerceAtLeast(0L))
+            val wasPlaying = isPlaying && !isPaused
+            val wasPaused = isPaused
+            stop()
+            currentNbs = nbs
+            currentTick = clamped
+            if (wasPlaying) {
+                play(nbs, clamped)
+            } else if (wasPaused) {
+                // Stay paused at the new position; resume() starts playback from here.
+                pendingResumeTick = clamped
+                isPaused = true
+            }
         }
     }
 

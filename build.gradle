@@ -43,6 +43,20 @@ dependencies {
 
 	// Gson — for config serialization (bundled in Minecraft, but declared explicitly)
 	implementation "com.google.code.gson:gson:2.10.1"
+
+	// Unit tests (JUnit Platform). The BOM aligns the jupiter and platform artifacts.
+	testImplementation platform("org.junit:junit-bom:${project.junit_version}")
+	testImplementation "org.junit.jupiter:junit-jupiter"
+	// Gradle 9 no longer supplies the launcher implicitly.
+	testRuntimeOnly "org.junit.platform:junit-platform-launcher"
+}
+
+test {
+	useJUnitPlatform()
+	testLogging {
+		events "passed", "skipped", "failed"
+		showStandardStreams = true
+	}
 }
 
 processResources {

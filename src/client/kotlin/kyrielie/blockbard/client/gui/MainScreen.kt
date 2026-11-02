@@ -3,16 +3,17 @@ package kyrielie.blockbard.client.gui
 import kyrielie.blockbard.client.BlockBardClient
 import kyrielie.blockbard.client.config.BlockBardConfig
 import kyrielie.blockbard.client.config.ConfigManager
-import kyrielie.blockbard.client.config.LoopMode
 import kyrielie.blockbard.client.playback.MidiFilePlayer
 import kyrielie.blockbard.client.playback.NbsFile
 import kyrielie.blockbard.client.playback.NbsFileLoader
 import kyrielie.blockbard.client.playback.NbsPlayer
 import kyrielie.blockbard.client.playback.SongAudioPreviewer
-import kyrielie.blockbard.client.playback.UserPlayQueue
+import kyrielie.blockbard.client.playback.ClientPlayQueue
+import kyrielie.blockbard.client.playback.PlaybackCoordinator
+import kyrielie.blockbard.client.playback.PlaybackHost
+import kyrielie.blockbard.client.playback.songIdOf
 import kyrielie.blockbard.client.playback.nbsInstrumentToBlock
 import kyrielie.blockbard.client.input.KeyboardInputHandler
-import kyrielie.blockbard.client.midi.MidiChannelResolver
 import kyrielie.blockbard.client.midi.OrganReadinessChecker
 import kyrielie.blockbard.organ.*
 import kyrielie.blockbard.client.organ.OrganScanner
@@ -20,6 +21,11 @@ import kyrielie.blockbard.client.player.CenterResult
 import kyrielie.blockbard.client.player.PlayerController
 import kyrielie.blockbard.client.player.SoundVerifier
 import kyrielie.blockbard.organ.ArpeggioScheduler
+import kyrielie.blockbard.playback.LoopSettings
+import kyrielie.blockbard.playback.QueueRow
+import kyrielie.blockbard.playback.QueueSource
+import kyrielie.blockbard.playback.RepeatMode
+import kyrielie.blockbard.playback.SongId
 import kyrielie.blockbard.util.BlockBardLogBuffer
 import kyrielie.blockbard.util.DebugLog
 import kyrielie.blockbard.util.LogLevel
@@ -56,7 +62,7 @@ import kyrielie.blockbard.client.playback.SongMetadataCache
  */
 fun opaque(rgb: Int): Int = rgb or (0xFF shl 24)
 
-class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Screen(Component.literal("BlockBard")) {
+class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Screen(Component.literal("BlockBard")), PlaybackHost {
 
     private val logger = LoggerFactory.getLogger("BlockBard/MainScreen")
 
@@ -76,6 +82,7 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
     private val jukeboxWidgets: MutableList<AbstractWidget> = mutableListOf()
     private lateinit var playPauseBtn: Button
     private lateinit var loopBtn: Button
+    private lateinit var shuffleBtn: Button
 
     // Dynamic list of all tunable instruments (includes all 20 instruments including Trumpet variants)
     private val playableInstruments = NoteBlockInstrument.entries.filter { it.isTunable }
@@ -99,7 +106,14 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
     private lateinit var songListWidget: SongListWidget
     private lateinit var queueListWidget: QueueListWidget
     private lateinit var logListWidget: LogListWidget
-    private val shuffleQueue = mutableListOf<File>()
+    // The live play queue (user queue, context order, history). It outlives this screen.
+    private val queue get() = ClientPlayQueue.queue
+
+    // Cached by updateQueueDisplay() so the per-frame renderers do not copy the queue.
+    private var upcomingRows: List<QueueRow> = emptyList()
+    private var queueUserCount: Int = 0
+    private var queueContextRemaining: Int = 0
+    private var nextUpTitle: String? = null
 
     // ── File list ──────────────────────────────────────────────────────────────
     private val midisDir: File by lazy {
@@ -147,11 +161,10 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
     private var loadedNbs: NbsFile? = null
 
     // ── Loop / auto-advance (Tier 4) ───────────────────────────────────────────
-    // Both flags are only ever written from the game tick thread (tick()), so no
-    // synchronization is needed beyond @Volatile for the visibility of onSongFinished()
-    // writes from the playback thread.
+    // What comes after a song ends is decided by PlaybackCoordinator (client thread). Here,
+    // pendingAutoPlay only means "when the current tuner run finishes, start playback"
+    // (the tune-then-play chain). Only written from the client thread.
     @Volatile private var pendingAutoPlay: Boolean = false
-    @Volatile private var pendingNextFile: File? = null
 
     // ── Status messages ────────────────────────────────────────────────────────
     private var organScanMessage: String = "Press Scan to detect noteblocks"
@@ -166,6 +179,8 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
     private val scaleTickInterval = 4
 
     override fun init() {
+        // Stays registered after this screen closes, so auto-advance keeps working with the GUI closed.
+        PlaybackCoordinator.host = this
         super.init()
         logger.info("MainScreen: init()")
         tabContent.values.forEach { it.clear() }
@@ -212,7 +227,7 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
         // ── Tab 0: Files ──────────────────────────────────────────────────────
         fun <T : AbstractWidget> tab0(w: T): T { tabContent[0]!!.add(w); return w }
 
-        val searchBox = EditBox(font, 10, 26, width - 150, 16, Component.literal("Search"))
+        val searchBox = EditBox(font, 10, 26, width - 236, 16, Component.literal("Search"))
         searchBox.setHint(Component.literal("Search tracks..."))
         searchBox.value = searchQuery
         searchBox.setResponder { text ->
@@ -222,6 +237,11 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
             }
         }
         tab0(addRenderableWidget(searchBox))
+
+        tab0(addRenderableWidget(Button.builder(Component.literal("Queue view")) {
+            queueView()
+        }.tooltip(Tooltip.create(Component.literal("Add every song shown in the list (after filter and search) to the end of your queue")))
+            .pos(width - 222, 26).size(76, 16).build()))
 
         val pillY = 26
         val allBtn = tab0(addRenderableWidget(Button.builder(Component.literal(if (activeFilter == "ALL") "[All]" else "All")) {
@@ -264,8 +284,13 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
                 ConfigManager.save()
                 songListWidget.setFiles(displayedFiles, selectedFile)
             },
-            onAddToQueue = { file ->
-                UserPlayQueue.add(file)
+            onQueueNext = { file ->
+                queue.enqueueNext(songIdOf(file))
+                updateQueueDisplay()
+                chat("Playing next: ${file.nameWithoutExtension}")
+            },
+            onQueueLast = { file ->
+                queue.enqueueLast(songIdOf(file))
                 updateQueueDisplay()
                 chat("Added to queue: ${file.nameWithoutExtension}")
             }
@@ -279,21 +304,13 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
 
         tab1(addRenderableWidget(Button.builder(Component.literal("🔀 Reshuffle")) {
             reshuffleQueue()
-            chat("Queue reshuffled")
-        }.pos(10, qBtnY).size(74, 16).build()))
-
-        tab1(addRenderableWidget(Button.builder(Component.literal("Clear History")) {
-            ConfigManager.config.shuffleHistory.clear()
-            ConfigManager.save()
-            updateQueueDisplay()
-            chat("Shuffle history cleared")
-        }.pos(88, qBtnY).size(78, 16).build()))
+        }.tooltip(Tooltip.create(Component.literal("New random order for the playlist (needs Shuffle on)"))).pos(10, qBtnY).size(74, 16).build()))
 
         tab1(addRenderableWidget(Button.builder(Component.literal("Clear Queue")) {
-            UserPlayQueue.clear()
+            queue.clearUser()
             updateQueueDisplay()
             chat("Play queue cleared")
-        }.pos(170, qBtnY).size(74, 16).build()))
+        }.tooltip(Tooltip.create(Component.literal("Remove the songs you queued; the playlist order is kept"))).pos(88, qBtnY).size(74, 16).build()))
 
         queueListWidget = QueueListWidget(
             minecraft = minecraft,
@@ -301,14 +318,12 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
             height = listHeight,
             y = listTop,
             itemHeight = 26,
-            onSelect = { file -> selectFile(file) },
-            onDoubleClick = { file ->
-                selectFile(file)
-                playSelectedSong()
-            },
-            onRemove = { idx -> removeFromQueue(idx) },
-            onMoveUp = { idx -> moveQueueItem(idx, -1) },
-            onMoveDown = { idx -> moveQueueItem(idx, 1) }
+            onPlayNow = { item -> playQueueRow(item) },
+            onRemove = { item -> removeFromQueue(item) },
+            onMoveUp = { item -> moveQueueItem(item, -1) },
+            onMoveDown = { item -> moveQueueItem(item, 1) },
+            onMoveToTop = { item -> moveQueueItemToTop(item) },
+            onPromote = { item -> promoteQueueRow(item) }
         )
         tab1(addRenderableWidget(queueListWidget))
 
@@ -443,13 +458,11 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
         }.tooltip(Tooltip.create(Component.literal("Play or Pause playback without resetting progress"))).pos(jbX + 42, row1Y).size(56, 16).build()))
 
         jb(addRenderableWidget(Button.builder(Component.literal("⏹")) {
-            MidiFilePlayer.stop()
-            NbsPlayer.stop()
+            PlaybackCoordinator.stop()
             stopScale()
-            abortTuning()
             pendingAutoPlay = false
-            pendingNextFile = null
             tuningError = null
+            updateQueueDisplay()
             chat("Stopped")
         }.tooltip(Tooltip.create(Component.literal("Stop playback, clear queue schedule, and reset to 0:00"))).pos(jbX + 102, row1Y).size(28, 16).build()))
 
@@ -493,18 +506,25 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
         }.pos(jbX + 60, row2Y).size(48, 16).build()))
 
         loopBtn = jb(addRenderableWidget(Button.builder(Component.literal(loopModeLabel())) { btn ->
-            val next = nextLoopMode()
-            ConfigManager.config.loopMode = next.name
+            val modes = RepeatMode.entries
+            val next = modes[(modes.indexOf(ConfigManager.config.repeatModeEnum()) + 1) % modes.size]
+            ConfigManager.config.repeatMode = next.name
             ConfigManager.save()
+            ClientPlayQueue.applyConfig(ConfigManager.config)
             btn.message = Component.literal(loopModeLabel())
             chat("Loop: ${loopModeLabel()}")
             updateQueueDisplay()
-        }.pos(jbX + 112, row2Y).size(92, 16).build()))
+        }.tooltip(Tooltip.create(Component.literal("Repeat OFF, ALL or ONE. Songs you queued always play first."))).pos(jbX + 112, row2Y).size(92, 16).build()))
 
-        jb(addRenderableWidget(Button.builder(Component.literal("🔀 Shuffle")) {
-            reshuffleQueue()
-            shuffle()
-        }.pos(jbX + 208, row2Y).size(66, 16).build()))
+        shuffleBtn = jb(addRenderableWidget(Button.builder(Component.literal(shuffleLabel())) { btn ->
+            ConfigManager.config.shuffle = !ConfigManager.config.shuffle
+            ConfigManager.save()
+            ClientPlayQueue.applyConfig(ConfigManager.config)
+            btn.message = Component.literal(shuffleLabel())
+            loopBtn.message = Component.literal(loopModeLabel())
+            chat("Shuffle ${if (ConfigManager.config.shuffle) "on" else "off"}")
+            updateQueueDisplay()
+        }.tooltip(Tooltip.create(Component.literal("Play the playlist in random order"))).pos(jbX + 208, row2Y).size(66, 16).build()))
 
         jb(addRenderableWidget(Button.builder(Component.literal("Refresh")) {
             refreshFiles()
@@ -550,18 +570,10 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
 
     // ── Label helpers ──────────────────────────────────────────────────────────
 
-    private fun loopModeLabel(): String = when (ConfigManager.config.loopModeEnum()) {
-        LoopMode.NONE        -> "Loop: OFF"
-        LoopMode.LOOP_ONE    -> "Loop: ONE"
-        LoopMode.LOOP_ALL    -> "Loop: ALL"
-        LoopMode.SHUFFLE_ALL -> "Loop: SHUFFLE"
-    }
+    private fun loopModeLabel(): String =
+        LoopSettings.label(ConfigManager.config.repeatModeEnum(), ConfigManager.config.shuffle)
 
-    private fun nextLoopMode(): LoopMode {
-        val modes = LoopMode.entries
-        val cur = ConfigManager.config.loopModeEnum()
-        return modes[(modes.indexOf(cur) + 1) % modes.size]
-    }
+    private fun shuffleLabel(): String = if (ConfigManager.config.shuffle) "Shuf: ON" else "Shuf: OFF"
 
     // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -583,6 +595,9 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
         midiFiles = (midisDir.listFiles { f ->
             f.extension.lowercase() in listOf("mid", "midi", "nbs")
         } ?: emptyArray()).toList().sortedBy { it.name }
+        // The context is the whole library, not the filtered view. refreshContext keeps the
+        // current song and the shuffle order when only some files changed.
+        queue.refreshContext(midiFiles.map(::songIdOf))
 
         // If a track is already playing or paused, preserve it as the active selection without stopping playback
         val activePlayingFile = MidiFilePlayer.loadedMidi?.file ?: loadedNbs?.file ?: NbsPlayer.currentNbs?.file
@@ -613,101 +628,33 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
 
     // ── Loop / auto-advance (Tier 4) & Queue ───────────────────────────────────
 
-    private fun getUpcomingQueue(): List<File> {
-        val userQ = UserPlayQueue.getAll()
-        val files = displayedFiles.ifEmpty { midiFiles }
-        if (files.isEmpty() && userQ.isEmpty()) return emptyList()
+    /** Library file for a song id; a placeholder path when the file is gone so the row still shows. */
+    override fun fileForId(id: SongId): File =
+        midiFiles.firstOrNull { songIdOf(it) == id } ?: midisDir.resolve(id)
 
-        val fallback = when (ConfigManager.config.loopModeEnum()) {
-            LoopMode.NONE -> {
-                val curIdx = selectedFile?.let { sf -> files.indexOfFirst { it.name.equals(sf.name, true) } } ?: -1
-                if (curIdx >= 0 && curIdx < files.size - 1) {
-                    files.subList(curIdx + 1, files.size)
-                } else emptyList()
-            }
-            LoopMode.LOOP_ONE -> {
-                val cur = selectedFile ?: files.firstOrNull() ?: return userQ
-                List(minOf(8, files.size.coerceAtLeast(4))) { cur }
-            }
-            LoopMode.LOOP_ALL -> {
-                val curIdx = selectedFile?.let { sf -> files.indexOfFirst { it.name.equals(sf.name, true) } } ?: 0
-                val queue = mutableListOf<File>()
-                for (i in 1 until files.size) {
-                    queue.add(files[(curIdx + i) % files.size])
-                }
-                queue
-            }
-            LoopMode.SHUFFLE_ALL -> {
-                ensureShuffleQueue()
-                shuffleQueue.toList()
-            }
+    /** Starts [id] as the next track. Returns false and warns when the file no longer exists. */
+    override fun startQueuedSong(id: SongId): Boolean {
+        val file = fileForId(id)
+        if (!file.isFile) {
+            chatWarn("File not found: $id")
+            updateQueueDisplay()
+            return false
         }
-        return userQ + fallback
-    }
-
-    private fun ensureShuffleQueue(forceReshuffle: Boolean = false) {
-        val all = midiFiles
-        if (all.isEmpty()) {
-            shuffleQueue.clear()
-            return
-        }
-        if (forceReshuffle || shuffleQueue.isEmpty()) {
-            shuffleQueue.clear()
-            val remaining = all.filter { it != selectedFile }.shuffled().toMutableList()
-            shuffleQueue.addAll(remaining)
-            if (shuffleQueue.isEmpty() && selectedFile != null) {
-                shuffleQueue.add(selectedFile!!)
-            }
-        }
-    }
-
-    private fun getNextSongInQueue(): File? {
-        val userSong = UserPlayQueue.popNext()
-        if (userSong != null) return userSong
-
-        val files = displayedFiles.ifEmpty { midiFiles }
-        if (files.isEmpty()) return null
-
-        return when (ConfigManager.config.loopModeEnum()) {
-            LoopMode.NONE -> {
-                val curIdx = selectedFile?.let { sf -> files.indexOfFirst { it.name.equals(sf.name, true) } } ?: -1
-                if (curIdx >= 0 && curIdx < files.size - 1) files[curIdx + 1] else null
-            }
-            LoopMode.LOOP_ONE -> selectedFile ?: files.firstOrNull()
-            LoopMode.LOOP_ALL -> {
-                val curIdx = selectedFile?.let { sf -> files.indexOfFirst { it.name.equals(sf.name, true) } } ?: 0
-                files[(curIdx + 1) % files.size]
-            }
-            LoopMode.SHUFFLE_ALL -> {
-                ensureShuffleQueue()
-                if (shuffleQueue.isNotEmpty()) {
-                    val pick = shuffleQueue.removeAt(0)
-                    if (shuffleQueue.isEmpty()) ensureShuffleQueue()
-                    pick
-                } else nextShuffle()
-            }
-        }
-    }
-
-    private fun getPrevSongInQueue(): File? {
-        val files = displayedFiles.ifEmpty { midiFiles }
-        if (files.isEmpty()) return null
-        val curIdx = selectedFile?.let { sf -> files.indexOfFirst { it.name.equals(sf.name, true) } } ?: 0
-        val prevIdx = if (curIdx - 1 < 0) files.size - 1 else curIdx - 1
-        return files[prevIdx]
-    }
-
-    private fun playNextSong() {
-        val next = getNextSongInQueue() ?: run {
-            chatWarn("End of queue")
-            return
-        }
-        selectFile(next)
+        selectFile(file)
         if (::songListWidget.isInitialized) {
             songListWidget.setFiles(displayedFiles, selectedFile)
         }
         updateQueueDisplay()
-        playSelectedSong()
+        playSelectedSong(fromQueue = true)
+        return true
+    }
+
+    private fun playNextSong() {
+        val id = queue.skipNext() ?: run {
+            chatWarn("End of queue")
+            return
+        }
+        startQueuedSong(id)
     }
 
     private fun playPrevSong() {
@@ -717,51 +664,116 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
             chat("Restarted track")
             return
         }
-        val prev = getPrevSongInQueue() ?: return
-        selectFile(prev)
-        if (::songListWidget.isInitialized) {
-            songListWidget.setFiles(displayedFiles, selectedFile)
-        }
-        updateQueueDisplay()
-        playSelectedSong()
-    }
-
-    private fun reshuffleQueue() {
-        ensureShuffleQueue(forceReshuffle = true)
-        updateQueueDisplay()
-    }
-
-    private fun removeFromQueue(idx: Int) {
-        val userQSize = UserPlayQueue.size
-        if (idx < userQSize) {
-            val removed = UserPlayQueue.removeAt(idx)
-            if (removed != null) {
-                chat("Removed from queue: ${removed.nameWithoutExtension}")
-                updateQueueDisplay()
+        val id = queue.skipPrev()
+        if (id == null) {
+            // No earlier song in the history: restart the current one if there is one.
+            if (queue.nowPlaying != null) {
+                seekToFraction(0.0)
+                chat("Restarted track")
+            } else {
+                chatWarn("No previous track")
             }
             return
         }
-        val fallbackIdx = idx - userQSize
-        if (ConfigManager.config.loopModeEnum() == LoopMode.SHUFFLE_ALL) {
-            if (fallbackIdx in 0 until shuffleQueue.size) {
-                val removed = shuffleQueue.removeAt(fallbackIdx)
-                chat("Removed from queue: ${removed.nameWithoutExtension}")
-                updateQueueDisplay()
-            }
-        }
+        startQueuedSong(id)
     }
 
-    private fun moveQueueItem(idx: Int, delta: Int) {
-        val targetIdx = idx + delta
-        if (UserPlayQueue.move(idx, targetIdx)) {
+    private fun reshuffleQueue() {
+        if (!ConfigManager.config.shuffle) {
+            chatWarn("Shuffle is off. Turn it on with the Shuf button first.")
+            return
+        }
+        queue.reshuffle()
+        updateQueueDisplay()
+        chat("Queue reshuffled")
+    }
+
+    /** Play now from a queue row (double-click). A user row is removed; a context row moves the cursor. */
+    private fun playQueueRow(item: QueueItem) {
+        // The list may be stale if something changed the queue since it was drawn.
+        if (queue.upcoming(item.index + 1).getOrNull(item.index) != item.row) {
+            updateQueueDisplay()
+            return
+        }
+        val id = when (item.row.source) {
+            QueueSource.USER -> queue.startFromUser(item.index)
+            QueueSource.CONTEXT -> queue.startFromUpcoming(item.index - queue.userQueue.size)
+        }
+        if (id == null) {
+            updateQueueDisplay()
+            return
+        }
+        startQueuedSong(id)
+    }
+
+    /** Only songs the player queued can be removed; the rest of the list is the playlist order. */
+    private fun removeFromQueue(item: QueueItem) {
+        if (item.row.source != QueueSource.USER || queue.userQueue.getOrNull(item.index) != item.row.id) {
+            updateQueueDisplay()
+            return
+        }
+        val removed = queue.removeUser(item.index)
+        if (removed != null) {
+            chat("Removed from queue: ${fileForId(removed).nameWithoutExtension}")
+        }
+        updateQueueDisplay()
+    }
+
+    private fun moveQueueItem(item: QueueItem, delta: Int) {
+        if (item.row.source != QueueSource.USER || queue.userQueue.getOrNull(item.index) != item.row.id) {
+            updateQueueDisplay()
+            return
+        }
+        if (queue.moveUser(item.index, item.index + delta)) {
             updateQueueDisplay()
         }
     }
 
+    private fun moveQueueItemToTop(item: QueueItem) {
+        if (item.row.source != QueueSource.USER || queue.userQueue.getOrNull(item.index) != item.row.id) {
+            updateQueueDisplay()
+            return
+        }
+        queue.moveUserToFront(item.index)
+        updateQueueDisplay()
+    }
+
+    /** "+Q" on a playlist row: copies it to the end of the user queue. The playlist is unchanged. */
+    private fun promoteQueueRow(item: QueueItem) {
+        if (item.row.source != QueueSource.CONTEXT || queue.upcoming(item.index + 1).getOrNull(item.index) != item.row) {
+            updateQueueDisplay()
+            return
+        }
+        if (queue.promote(item.index - queue.userQueue.size)) {
+            chat("Added to queue: ${fileForId(item.row.id).nameWithoutExtension}")
+        }
+        updateQueueDisplay()
+    }
+
+    /** Queues every song currently shown in the Files tab, in view order, after anything already queued. */
+    private fun queueView() {
+        val files = displayedFiles
+        if (files.isEmpty()) {
+            chatWarn("Nothing in the list to queue")
+            return
+        }
+        files.forEach { queue.enqueueLast(songIdOf(it)) }
+        updateQueueDisplay()
+        chat("Queued ${files.size} track${if (files.size == 1) "" else "s"} from the current list")
+    }
+
+    /** Re-reads the queue into the cached display state and the list widget. */
     private fun updateQueueDisplay() {
-        val q = getUpcomingQueue()
+        val rows = queue.upcoming(QUEUE_DISPLAY_LIMIT)
+        upcomingRows = rows
+        queueUserCount = queue.userQueue.size
+        queueContextRemaining = (queue.contextOrder.size - (queue.contextCursor + 1)).coerceAtLeast(0)
+        val byId = midiFiles.associateBy { songIdOf(it) }
+        nextUpTitle = rows.firstOrNull()?.let { (byId[it.id] ?: midisDir.resolve(it.id)).nameWithoutExtension }
         if (::queueListWidget.isInitialized) {
-            queueListWidget.setQueue(q, selectedFile, UserPlayQueue.size)
+            queueListWidget.setQueue(
+                rows.mapIndexed { index, row -> QueueItem(index, row, byId[row.id] ?: midisDir.resolve(row.id)) }
+            )
         }
     }
 
@@ -775,41 +787,28 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
         }
     }
 
-    /**
-     * Called by MidiFilePlayer.onFinished and NbsPlayer.onFinished -- may run on the
-     * playback thread. Only sets flags; all MC API calls happen in tick() on the game
-     * thread.
-     */
-    private fun onSongFinished() {
-        when (ConfigManager.config.loopModeEnum()) {
-            LoopMode.NONE        -> { /* stay idle */ }
-            LoopMode.LOOP_ONE    -> { pendingAutoPlay = true }
-            LoopMode.LOOP_ALL,
-            LoopMode.SHUFFLE_ALL -> {
-                pendingNextFile = getNextSongInQueue()
-                pendingAutoPlay = true
-            }
-        }
-        logger.info("onSongFinished: loopMode=${ConfigManager.config.loopMode} pendingNext=${pendingNextFile?.name}")
+    // ── PlaybackHost ───────────────────────────────────────────────────────────
+
+    override val isTuning: Boolean
+        get() = tuner?.isActive == true || activeTuner?.isActive == true
+
+    override fun beginAdvance(file: File) {
+        selectFile(file)
+        // NoteBlockTuner skips blocks already at their target note, so for songs sharing most
+        // pitches this is fast (mostly verification passes).
+        startTuning(thenPlay = true)
     }
 
-    private fun nextShuffle(): File? {
-        if (midiFiles.isEmpty()) return null
-        val cfg = ConfigManager.config
-        val history = cfg.shuffleHistory
-        val maxHistory = (midiFiles.size - 1).coerceAtLeast(1).coerceAtMost(5)
-        val candidates = midiFiles.filter { it.name !in history && it != selectedFile }
-        val pick = if (candidates.isNotEmpty()) {
-            candidates.random()
-        } else {
-            // All files have been played recently -- clear history and pick anything
-            history.clear()
-            midiFiles.filter { it != selectedFile }.randomOrNull() ?: midiFiles.random()
-        }
-        history.add(pick.name)
-        while (history.size > maxHistory) history.removeAt(0)
-        ConfigManager.save()
-        return pick
+    override fun replayCurrent() {
+        // The user may have browsed to another row since this song started; replay the song
+        // that is actually playing (its organ assignment is still the one in use).
+        val playing = queue.nowPlaying?.let { fileForId(it) }
+        if (playing != null && playing.isFile && playing != selectedFile) selectFile(playing)
+        startPlayback()
+    }
+
+    override fun onQueueChanged() {
+        updateQueueDisplay()
     }
 
     // ── Tuning ─────────────────────────────────────────────────────────────────
@@ -981,18 +980,18 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
         currentScreen = this
 
         pendingAutoPlay = thenPlay
-        if (thenPlay) pendingNextFile = null
 
         newTuner.start()
     }
 
-    private fun abortTuning() {
+    override fun abortTuning() {
         if (tuner?.isActive == true || activeTuner?.isActive == true) {
             chat("Tuning cancelled")
             logger.info("abortTuning: tuner cancelled")
         }
         tuner = null
         activeTuner = null
+        pendingAutoPlay = false
         tuneStatusMsg = ""
         kyrielie.blockbard.client.render.OrganOverlayRenderer.activeTargets = emptyMap()
     }
@@ -1087,7 +1086,12 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
 
     // ── Playback ───────────────────────────────────────────────────────────────
 
-    private fun playSelectedSong() {
+    /**
+     * Starts or resumes the selected song. [fromQueue] is true when the play queue already
+     * decided what plays (skip, play-now from a queue row); otherwise a manual start registers
+     * the song with the queue as playing from the playlist.
+     */
+    private fun playSelectedSong(fromQueue: Boolean = false) {
         val file = (if (::songListWidget.isInitialized) songListWidget.getSelectedFile() else null)
             ?: selectedFile
             ?: run {
@@ -1120,6 +1124,11 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
                 if (!hasOrgan) {
                     chatWarn("No playable noteblocks found in reach around player.")
                     return
+                }
+                if (!fromQueue) {
+                    val id = songIdOf(file)
+                    if (queue.nowPlaying != id) queue.startFromContext(id)
+                    updateQueueDisplay()
                 }
                 updateOrganInfo()
                 startTuning(thenPlay = true)
@@ -1208,28 +1217,17 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
                 chatWarn("Failed to load ${file.name}: ${e.message}")
                 return
             }
-            // Wire onFinished for loop/auto-advance (Tier 4)
-            NbsPlayer.onFinished = { onSongFinished() }
             chat("Playing: ${file.name}")
             NbsPlayer.play(nbs)
+            PlaybackCoordinator.onPlaybackStarted(file)
         } else {
             if (MidiFilePlayer.loadedMidi?.file != file) {
                 MidiFilePlayer.load(file)
             }
-            // Wire onFinished for loop/auto-advance (Tier 4)
-            MidiFilePlayer.onFinished = { onSongFinished() }
             chat("Playing: ${file.name}")
             MidiFilePlayer.play()
+            PlaybackCoordinator.onPlaybackStarted(file)
         }
-    }
-
-    private fun shuffle() {
-        val next = nextShuffle() ?: return
-        selectFile(next)
-        if (::songListWidget.isInitialized) {
-            songListWidget.setFiles(displayedFiles, selectedFile)
-        }
-        playSelectedSong()
     }
 
     private fun selectFile(file: File, stopPlayback: Boolean = false) {
@@ -1261,7 +1259,8 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
 
                 // Tier 6b (MIDI): pre-flight readiness check with full instrument list and
                 // block-below material hints -- no .take(4) truncation (Tier 6a).
-                val requirements = MidiChannelResolver.resolveRequirements(file)
+                // Already normalised by parse(): unpitched instruments collapsed to midiBase.
+                val requirements = midi.noteUsageCounts.keys
                 MaterialsShoppingOverlay.updateRequirements(requirements)
                 val report = OrganReadinessChecker.check(requirements)
                 readinessMessage = if (report.isFullyCovered) {
@@ -1341,7 +1340,6 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
             loadedNbs = null
         }
 
-        ConfigManager.config.lastPlayedTrack = file.name
         organScanMessage = if (loadFailed) {
             "Failed to load ${file.name}"
         } else {
@@ -1384,7 +1382,7 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
 
                 // Tier 4: if startTuning() was called via selectiveRetuneAndPlay chain,
                 // start playback now that tuning is verified.
-                if (pendingAutoPlay && pendingNextFile == null) {
+                if (pendingAutoPlay) {
                     pendingAutoPlay = false
                     startPlayback()
                 }
@@ -1395,29 +1393,8 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
                 activeTuner = null
                 tuneStatusMsg = ""
                 pendingAutoPlay = false
-                pendingNextFile = null
                 chatWarn("Tuning: $reason. Highlighted in world for manual tuning.")
                 logger.warn("tick: tuning finished with manual tuning required: $reason")
-            }
-        }
-
-        // Tier 4: auto-advance handler -- runs after tuner so a thenPlay=true tuning
-        // completion above is handled first and doesn't race with this branch.
-        if (pendingAutoPlay && tuner == null && !MidiFilePlayer.isActive() && !NbsPlayer.isPlaying) {
-            pendingAutoPlay = false
-            val next = pendingNextFile
-            if (next != null) {
-                pendingNextFile = null
-                logger.info("auto-advance: selecting ${next.name} and retuning")
-                selectFile(next)
-                // startTuning(thenPlay=true): retune, then startPlayback() when done.
-                // NoteBlockTuner skips blocks already at their target note, so for
-                // songs sharing most pitches this is fast (mostly verification passes).
-                startTuning(thenPlay = true)
-            } else {
-                // LOOP_ONE: same file, already tuned -- just replay
-                logger.info("auto-advance: looping current file")
-                startPlayback()
             }
         }
 
@@ -1473,18 +1450,19 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
     }
 
     private fun renderQueueTab(graphics: GuiGraphicsExtractor, font: net.minecraft.client.gui.Font) {
-        val q = getUpcomingQueue()
-        if (q.isEmpty()) {
-            val emptyMsg = when (ConfigManager.config.loopModeEnum()) {
-                LoopMode.NONE -> "(Queue is empty -- click '+Q' on tracks in Library to enqueue)"
-                else -> "(Queue is empty -- select a track or add files to midis directory)"
-            }
+        val total = queueUserCount + queueContextRemaining
+        val emptyMsg = when {
+            queue.repeatingCurrent -> "(Repeating the current track. Queue a song to play something else next.)"
+            queue.wrapsAtEnd && queue.nowPlaying != null -> "(End of the playlist. Repeat ALL loops back to the start.)"
+            else -> "(Queue is empty -- use Next or Last on tracks in the Library to queue them)"
+        }
+        if (upcomingRows.isEmpty()) {
             graphics.text(font, emptyMsg, 14, 54, opaque(0xAAAAAA))
         } else {
-            val countStr = if (UserPlayQueue.isNotEmpty()) {
-                "${UserPlayQueue.size} custom, ${q.size} total queued"
-            } else {
-                "${q.size} tracks queued"
+            val countStr = buildString {
+                append(if (queueUserCount > 0) "$queueUserCount queued, $total up next" else "$total up next")
+                if (queue.repeatingCurrent) append(" | repeating current")
+                else if (queue.wrapsAtEnd) append(" | loops to start")
             }
             graphics.text(font, countStr, width - font.width(countStr) - 16, 30, opaque(0xAAAAAA))
         }
@@ -1569,15 +1547,14 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
 
         // 3. Sub-Marquee (Up Next / Queue Preview) (jbY + 28, h = 11)
         val subY = jbY + 28
-        val upcoming = getUpcomingQueue()
-        val nextSong = upcoming.firstOrNull()
         val nextTitle = when {
-            ConfigManager.config.loopModeEnum() == LoopMode.LOOP_ONE && trackFile != null -> "Repeat Current Track"
-            nextSong != null -> nextSong.nameWithoutExtension.take(28)
+            queue.repeatingCurrent && trackFile != null -> "Repeat Current Track"
+            nextUpTitle != null -> nextUpTitle!!.take(28)
+            queue.wrapsAtEnd && queue.nowPlaying != null -> "Start of playlist"
             else -> "End of queue"
         }
         val modeStr = loopModeLabel()
-        val nextLine = "UP NEXT: $nextTitle  [$modeStr] (${upcoming.size} queued)"
+        val nextLine = "UP NEXT: $nextTitle  [$modeStr] (${queueUserCount + queueContextRemaining} queued)"
         graphics.text(font, nextLine, scrX + 4, subY, opaque(0xD4AF37))
 
         // 4. Jukebox Seek Bar (jbY + 41, h = 5)
@@ -1903,6 +1880,9 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
     override fun isPauseScreen(): Boolean = false
 
     companion object {
+        /** Most rows read from the queue for display; counts are taken from the full queue. */
+        private const val QUEUE_DISPLAY_LIMIT = 500
+
         var activeTuner: NoteBlockTuner? = null
         var currentScreen: MainScreen? = null
 
@@ -1916,7 +1896,7 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
                     mc.player?.sendSystemMessage(Component.literal("§b[BlockBard] §fTuning complete!"))
                     OrganScanner.scan()
                     currentScreen?.let { screen ->
-                        if (screen.pendingAutoPlay && screen.pendingNextFile == null) {
+                        if (screen.pendingAutoPlay) {
                             screen.pendingAutoPlay = false
                             screen.startPlayback()
                         }
@@ -1925,7 +1905,6 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
                     activeTuner = null
                     currentScreen?.let {
                         it.pendingAutoPlay = false
-                        it.pendingNextFile = null
                     }
                     mc.player?.sendSystemMessage(Component.literal("§b[BlockBard] §cTuning failed -- check logs for details"))
                 }

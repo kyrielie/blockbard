@@ -118,8 +118,9 @@ fun noteIndexToFullName(index: Int, instrument: NoteBlockInstrument): String {
 /** Returns the note name + octave for a raw MIDI note number, e.g. MIDI 60 → "C4". */
 fun midiNoteToName(midiNote: Int): String {
     val names = arrayOf("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
-    val octave = (midiNote / 12) - 1
-    val name = names[midiNote % 12]
+    // floorDiv/floorMod keep out-of-range (negative) input from indexing the array negatively.
+    val octave = Math.floorDiv(midiNote, 12) - 1
+    val name = names[Math.floorMod(midiNote, 12)]
     return "$name$octave"
 }
 

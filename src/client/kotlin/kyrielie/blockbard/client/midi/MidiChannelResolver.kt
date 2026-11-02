@@ -2,13 +2,11 @@ package kyrielie.blockbard.client.midi
 
 import kyrielie.blockbard.client.playback.LoadedMidi
 import kyrielie.blockbard.client.playback.TimedNoteEvent
-import kyrielie.blockbard.organ.NotePitch
-import kyrielie.blockbard.util.isPitched
-import kyrielie.blockbard.util.midiBase
 import net.minecraft.world.level.block.state.properties.NoteBlockInstrument
 import org.slf4j.LoggerFactory
 import javax.sound.midi.MetaMessage
 import javax.sound.midi.MidiSystem
+import javax.sound.midi.Sequence
 import javax.sound.midi.ShortMessage
 import java.io.File
 
@@ -34,11 +32,18 @@ object MidiChannelResolver {
 
     /**
      * Reads [file] and returns every NOTE_ON event with its instrument resolved.
-     * Program-change events are tracked per-channel and applied from the point
-     * they appear; notes before the first program change use program 0 (piano → harp).
+     * Thin wrapper over [resolve] for a [Sequence]; callers that already hold a parsed
+     * sequence should call that overload to avoid reading the file again.
      */
-    fun resolve(file: File): List<ResolvedNoteEvent> {
-        val sequence = MidiSystem.getSequence(file)
+    fun resolve(file: File): List<ResolvedNoteEvent> =
+        resolve(MidiSystem.getSequence(file), file.name)
+
+    /**
+     * Resolves every NOTE_ON event of [sequence] to its instrument. [label] is used for
+     * logging only. Program-change events are tracked per-channel and applied from the
+     * point they appear; notes before the first program change use program 0 (piano → harp).
+     */
+    fun resolve(sequence: Sequence, label: String): List<ResolvedNoteEvent> {
         // channel -> current GM program (default 0)
         val channelProgram = IntArray(16) { 0 }
 
@@ -79,52 +84,7 @@ object MidiChannelResolver {
             }
         }
 
-        logger.info("MidiChannelResolver: ${resolved.size} events from ${file.name}")
+        logger.info("MidiChannelResolver: ${resolved.size} events from $label")
         return resolved
-    }
-
-    /**
-     * Returns the distinct (instrument, midiNote) pairs that [file] requires.
-     * This is the input to [OrganReadinessChecker.check].
-     * Unpitched instruments (BASEDRUM, SNARE, HAT) are collapsed to midiBase so that
-     * only 1 physical block is required for each drum type.
-     */
-    fun resolveRequirements(file: File): Set<NotePitch> =
-        resolve(file).map { event ->
-            val note = if (!event.instrument.isPitched) event.instrument.midiBase else event.midiNote
-            NotePitch(note, event.instrument)
-        }.toSet()
-
-    /**
-     * Returns per-channel program assignments as a human-readable summary for the GUI,
-     * e.g. "Ch1: piano 1 → HARP, Ch10: percussion".
-     */
-    fun channelSummary(file: File): List<String> {
-        val sequence = MidiSystem.getSequence(file)
-        val channelProgram = IntArray(16) { 0 }
-        val channelsSeen = mutableSetOf<Int>()
-
-        sequence.tracks.forEach { track ->
-            for (i in 0 until track.size()) {
-                val event = track.get(i)
-                val msg = event.message
-                if (msg is ShortMessage) {
-                    when (msg.command) {
-                        ShortMessage.PROGRAM_CHANGE -> channelProgram[msg.channel] = msg.data1
-                        ShortMessage.NOTE_ON -> if (msg.data2 > 0) channelsSeen.add(msg.channel)
-                    }
-                }
-            }
-        }
-
-        return channelsSeen.sorted().map { ch ->
-            if (ch == 9) {
-                "Ch10: percussion"
-            } else {
-                val prog = channelProgram[ch]
-                val instr = MidiInstrumentMap.primaryFor(prog)
-                "Ch${ch + 1}: prog $prog → ${instr.name}"
-            }
-        }
     }
 }

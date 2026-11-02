@@ -2,9 +2,11 @@ package kyrielie.blockbard.client.config
 
 import dev.isxander.yacl3.api.*
 import dev.isxander.yacl3.api.controller.*
+import kyrielie.blockbard.client.playback.ClientPlayQueue
 import kyrielie.blockbard.organ.ArpeggioScheduler
 import kyrielie.blockbard.organ.InstrumentShifter
 import kyrielie.blockbard.organ.ShiftMode
+import kyrielie.blockbard.playback.RepeatMode
 import kyrielie.blockbard.util.DebugLog
 import net.minecraft.client.gui.screens.Screen
 import net.minecraft.network.chat.Component
@@ -22,6 +24,8 @@ object BlockBardYaclConfig {
                 DebugLog.enabled = cfg.debugLogging
                 ArpeggioScheduler.maxNotesPerTick = cfg.maxNotesPerTick
                 InstrumentShifter.mode = cfg.shiftModeEnum()
+                // setShuffle ignores an unchanged value, so saving without touching shuffle keeps the order.
+                ClientPlayQueue.applyConfig(cfg)
             }
             .category(
                 ConfigCategory.createBuilder()
@@ -52,11 +56,23 @@ object BlockBardYaclConfig {
                             .build()
                     )
                     .option(
-                        Option.createBuilder<LoopMode>()
-                            .name(Component.literal("Loop Mode"))
-                            .description(OptionDescription.of(Component.literal("Playback progression behavior when a song completes.")))
-                            .binding(Binding.generic(LoopMode.NONE, { cfg.loopModeEnum() }, { cfg.loopMode = it.name }))
-                            .controller { opt -> EnumDropdownControllerBuilder.create(opt) }
+                        Option.createBuilder<RepeatMode>()
+                            .name(Component.literal("Repeat"))
+                            .description(OptionDescription.of(Component.literal("What happens when a song ends and nothing is left to play. Off: stop. All: start again from the top. One: keep replaying the current song.")))
+                            .binding(Binding.generic(RepeatMode.OFF, { cfg.repeatModeEnum() }, { cfg.repeatMode = it.name }))
+                            .controller { opt ->
+                                EnumControllerBuilder.create(opt)
+                                    .enumClass(RepeatMode::class.java)
+                                    .formatValue { mode -> Component.literal(mode.name.lowercase().replaceFirstChar(Char::uppercaseChar)) }
+                            }
+                            .build()
+                    )
+                    .option(
+                        Option.createBuilder<Boolean>()
+                            .name(Component.literal("Shuffle"))
+                            .description(OptionDescription.of(Component.literal("Play the songs in a random order. Each song plays once per pass; with Repeat All a new random order starts after the last song.")))
+                            .binding(Binding.generic(false, { cfg.shuffle }, { cfg.shuffle = it }))
+                            .controller(TickBoxControllerBuilder::create)
                             .build()
                     )
                     .option(
@@ -176,7 +192,7 @@ object BlockBardYaclConfig {
                     .option(
                         Option.createBuilder<Int>()
                             .name(Component.literal("Max Notes Per Tick"))
-                            .description(OptionDescription.of(Component.literal("Maximum note interactions sent per tick (1–64).")))
+                            .description(OptionDescription.of(Component.literal("Maximum note interactions sent per tick (1–64). Values above 8 allow bursts larger than most servers' interact limit.")))
                             .binding(Binding.generic(8, { cfg.maxNotesPerTick }, { cfg.maxNotesPerTick = it }))
                             .controller { opt -> IntegerSliderControllerBuilder.create(opt).range(1, 64).step(1) }
                             .build()

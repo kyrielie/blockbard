@@ -1,6 +1,12 @@
 package kyrielie.blockbard.client.config
 
 import kyrielie.blockbard.organ.ShiftMode
+import kyrielie.blockbard.playback.LoopSettings
+import kyrielie.blockbard.playback.RepeatMode
+import kyrielie.blockbard.util.positiveFiniteOr
+import kyrielie.blockbard.util.positiveOr
+import kyrielie.blockbard.util.sanitizeMaxNotesPerTick
+import kyrielie.blockbard.util.sanitizeTempoMultiplier
 import com.google.gson.Gson
 import com.google.gson.GsonBuilder
 import com.google.gson.InstanceCreator
@@ -8,7 +14,6 @@ import net.fabricmc.loader.api.FabricLoader
 import org.slf4j.LoggerFactory
 import java.io.File
 
-enum class LoopMode { NONE, LOOP_ONE, LOOP_ALL, SHUFFLE_ALL }
 
 data class BlockBardConfig(
     var scanRadius: Int = 5,
@@ -41,16 +46,19 @@ data class BlockBardConfig(
     // important events (scan summaries, tuning start/done, file load, errors).
     var debugLogging: Boolean = false,
     // Tier 2: multi-note dispatch
-    // Maximum notes dispatched per game tick. Default is 8. Can be set higher (up to 64)
-    // for high-density chords and complex multi-track songs.
+    // Maximum notes dispatched per game tick (and the token bucket ceiling). Default is 8.
+    // The refill rate is fixed at 8 tokens per 310 ms, so values above 8 only enlarge the
+    // burst allowed after idle time; they do not raise the sustained rate and can exceed
+    // strict servers' interact limits.
     var maxNotesPerTick: Int = 8,
-    // Tier 4: loop / auto-advance mode
-    // NONE        = stop after each song (current behavior)
-    // LOOP_ONE    = repeat the same song indefinitely (no retune needed)
-    // LOOP_ALL    = advance through all songs in sorted order, retuning between tracks
-    // SHUFFLE_ALL = advance randomly, avoiding recent repeats (see shuffleHistory),
-    //               retuning between tracks
-    var loopMode: String = LoopMode.NONE.name,
+    // DEPRECATED, kept for one release so a downgrade still reads a valid value: the old single
+    // loop setting (NONE, LOOP_ONE, LOOP_ALL, SHUFFLE_ALL). It is read once, to migrate files
+    // that have no repeatMode yet, and is not written afterwards (see migrateLoopSettings()).
+    var loopMode: String = LoopSettings.LEGACY_NONE,
+    // Repeat and shuffle, independent of each other. repeatMode is OFF, ALL or ONE; null means
+    // "file written before this field existed" and triggers the migration from loopMode.
+    var repeatMode: String? = null,
+    var shuffle: Boolean = false,
     // Instrument remapping: source instrument name -> target instrument name (or null/"MUTE" to silence)
     var instrumentRemap: MutableMap<String, String?> = mutableMapOf(),
     // Favorites & filter state
@@ -81,10 +89,38 @@ data class BlockBardConfig(
         ShiftMode.BEST_EFFORT
     }
 
-    fun loopModeEnum(): LoopMode = try {
-        LoopMode.valueOf(loopMode)
-    } catch (_: IllegalArgumentException) {
-        LoopMode.NONE
+    fun repeatModeEnum(): RepeatMode = LoopSettings.parseRepeat(repeatMode) ?: RepeatMode.OFF
+
+    /**
+     * Fills repeatMode and shuffle from loopMode when the file predates them, and normalises an
+     * unknown or oddly cased repeatMode. Returns true when the file should be saved again.
+     */
+    fun migrateLoopSettings(): Boolean {
+        val resolution = LoopSettings.resolve(repeatMode, shuffle, loopMode)
+        repeatMode = resolution.settings.repeat.name
+        shuffle = resolution.settings.shuffle
+        return resolution.changed
+    }
+
+    /**
+     * Replaces values that would break functionality (zero, negative, NaN, infinite, null) with
+     * safe ones. The value rules are pure helpers in `util/ConfigSanitizing.kt`.
+     */
+    fun sanitize() {
+        scanRadius = positiveOr(scanRadius, 5)
+        arpeggioStaleTimeoutMs = positiveOr(arpeggioStaleTimeoutMs, 200L)
+        maxRotationDegreesPerTick = positiveFiniteOr(maxRotationDegreesPerTick, 35f)
+        rotationConvergenceThresholdDegrees = positiveFiniteOr(rotationConvergenceThresholdDegrees, 2f)
+        rotationInProgressTimeoutMs = positiveOr(rotationInProgressTimeoutMs, 1500L)
+        maxNotesPerTick = sanitizeMaxNotesPerTick(maxNotesPerTick)
+        defaultTempoMultiplier = sanitizeTempoMultiplier(defaultTempoMultiplier)
+        autoRescanIntervalSeconds = positiveOr(autoRescanIntervalSeconds, 3)
+        maxTuningClicksPerTick = positiveOr(maxTuningClicksPerTick, 1)
+        // Gson can leave these null when the file holds an explicit null.
+        @Suppress("SENSELESS_COMPARISON")
+        if ((shuffleHistory as MutableList<String>?) == null) shuffleHistory = mutableListOf()
+        @Suppress("SENSELESS_COMPARISON")
+        if ((instrumentRemap as MutableMap<String, String?>?) == null) instrumentRemap = mutableMapOf()
     }
 }
 
@@ -104,27 +140,20 @@ object ConfigManager {
     fun load() {
         configFile.parentFile?.mkdirs()
         if (!configFile.exists()) {
+            config.migrateLoopSettings()
             save()
             return
         }
         try {
             config = gson.fromJson(configFile.readText(), BlockBardConfig::class.java)
                 ?: BlockBardConfig()
-            // Coalesce any zero/null that would break functionality back to a safe value
-            if (config.scanRadius <= 0) config.scanRadius = 5
-            if (config.arpeggioStaleTimeoutMs <= 0L) config.arpeggioStaleTimeoutMs = 200L
-            if (config.maxRotationDegreesPerTick <= 0f) config.maxRotationDegreesPerTick = 35f
-            if (config.rotationConvergenceThresholdDegrees <= 0f) config.rotationConvergenceThresholdDegrees = 2f
-            if (config.rotationInProgressTimeoutMs <= 0L) config.rotationInProgressTimeoutMs = 1500L
-            if (config.maxNotesPerTick <= 0) config.maxNotesPerTick = 8
-            if (config.maxNotesPerTick > 64) config.maxNotesPerTick = 64
-            @Suppress("SENSELESS_COMPARISON")
-            if ((config.shuffleHistory as MutableList<String>?) == null) config.shuffleHistory = mutableListOf()
-            @Suppress("SENSELESS_COMPARISON")
-            if ((config.instrumentRemap as MutableMap<String, String?>?) == null) config.instrumentRemap = mutableMapOf()
+            config.sanitize()
+            // Files from before repeat/shuffle existed carry only loopMode; migrate once and persist.
+            if (config.migrateLoopSettings()) save()
         } catch (e: Exception) {
             logger.warn("Config parse failed, resetting to defaults: ${e.message}", e)
             config = BlockBardConfig()
+            config.migrateLoopSettings()
             save()
         }
     }
