@@ -20,6 +20,9 @@ object OrganScanner {
 
     private val logger = LoggerFactory.getLogger("BlockBard/OrganScanner")
 
+    /** Signature of the last logged scan result, to suppress identical repeat log lines. */
+    private var lastScanLogSignature: String? = null
+
     /** Scan radius in blocks (1-10). Configurable via Settings tab. */
     var scanRadius: Int = 5
 
@@ -103,12 +106,20 @@ object OrganScanner {
         // automatically via MidiToOrganMapper.pruneOverflowBlocks(), so no action is needed
         // unless the player specifically wants more range from that instrument.
         val overflows = NoteBlockRegistry.detectInstrumentOverflows()
+        // Scans repeat (calibration, GUI open, auto-rescan); only write log lines when the scan
+        // result differs from the previous one. Chat feedback is unaffected.
+        val scanSignature = found.joinToString(",") { "${it.pos}:${it.status}:${it.midiNote}" } +
+            "|" + overflows.joinToString(",") { "${it.instrument}:${it.count}" }
+        val logChanged = scanSignature != lastScanLogSignature
+        lastScanLogSignature = scanSignature
         if (overflows.isNotEmpty()) {
             overflows.forEach { o ->
                 val msg = "${o.instrument.name} has ${o.count} blocks (max 25 unique pitches). " +
                     "${o.excess} excess will be ignored automatically -- no action needed."
-                logger.warn("scan: instrument overflow -- $msg")
-                BlockBardLogBuffer.warn("OrganScanner", msg)
+                if (logChanged) {
+                    logger.info("scan: instrument overflow -- $msg")
+                    BlockBardLogBuffer.info("OrganScanner", msg)
+                }
                 if (ConfigManager.config.enableChatFeedback) {
                     player.sendSystemMessage(Component.literal("§b[BlockBard] §e$msg"))
                 }
@@ -120,8 +131,10 @@ object OrganScanner {
         val mobHeads = found.count { it.status == NoteBlockStatus.MOB_HEAD }
 
         val summary = "Scan complete: ${found.size} total -- $playable playable, $silenced silenced, $mobHeads mob-head"
-        logger.info("scan: $summary")
-        BlockBardLogBuffer.info("OrganScanner", summary)
+        if (logChanged) {
+            logger.info("scan: $summary")
+            BlockBardLogBuffer.info("OrganScanner", summary)
+        }
         if (ConfigManager.config.enableChatFeedback) {
             player.sendSystemMessage(Component.literal("§b[BlockBard] §f$summary"))
         }
@@ -132,8 +145,10 @@ object OrganScanner {
             val low = midiNoteToName(noteRange.first().midiNote)
             val high = midiNoteToName(noteRange.last().midiNote)
             val rangeMsg = "Playable range: $low - $high"
-            logger.info("scan: playable MIDI range $low-$high")
-            BlockBardLogBuffer.info("OrganScanner", rangeMsg)
+            if (logChanged) {
+                logger.info("scan: playable MIDI range $low-$high")
+                BlockBardLogBuffer.info("OrganScanner", rangeMsg)
+            }
             if (ConfigManager.config.enableChatFeedback) {
                 player.sendSystemMessage(Component.literal("§b[BlockBard] §7$rangeMsg"))
             }
