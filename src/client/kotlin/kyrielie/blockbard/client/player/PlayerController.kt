@@ -195,16 +195,24 @@ object PlayerController {
         val unreachable = playableBlocks.filter { !map.isReachable(it.pos) }
 
         val statusMsg = "Reachable: $reachableCount/${playableBlocks.size} from $standPos"
-        logger.info("centerOnOrgan: $statusMsg")
-        BlockBardLogBuffer.info("PlayerController", statusMsg)
+        val unreachableKey = unreachable.map { it.pos.toString() }.sorted()
+        val logSignature = "$statusMsg|$unreachableKey"
+        // Calibration runs on every play, tune and GUI open; log only when the result changed so
+        // the bounded log buffer is not filled with identical (and long) lines.
+        if (logSignature != lastCenterLogSignature) {
+            lastCenterLogSignature = logSignature
+            logger.info("centerOnOrgan: $statusMsg")
+            BlockBardLogBuffer.info("PlayerController", statusMsg)
 
-        if (unreachable.isNotEmpty()) {
-            val unreachSummary = unreachable.joinToString("; ") { e ->
-                val dist = player.eyePosition.distanceTo(Vec3(e.pos.x + 0.5, e.pos.y + 0.5, e.pos.z + 0.5))
-                "${e.pos} (${e.instrument.name}, dist=${"%.2f".format(dist)})"
+            if (unreachable.isNotEmpty()) {
+                val shown = unreachable.take(UNREACHABLE_LOG_LIMIT)
+                val unreachSummary = shown.joinToString("; ") { e ->
+                    val dist = player.eyePosition.distanceTo(Vec3(e.pos.x + 0.5, e.pos.y + 0.5, e.pos.z + 0.5))
+                    "${e.pos} (${e.instrument.name}, dist=${"%.2f".format(dist)})"
+                } + if (unreachable.size > shown.size) "; and ${unreachable.size - shown.size} more" else ""
+                logger.warn("centerOnOrgan: ${unreachable.size} blocks out of reach: $unreachSummary")
+                BlockBardLogBuffer.warn("PlayerController", "${unreachable.size} blocks out of reach: $unreachSummary")
             }
-            logger.warn("centerOnOrgan: ${unreachable.size} blocks out of reach: $unreachSummary")
-            BlockBardLogBuffer.warn("PlayerController", "${unreachable.size} blocks out of reach: $unreachSummary")
         }
 
         return CenterResult.Centered(standPos, reachableCount, playableBlocks.size)
@@ -246,6 +254,10 @@ object PlayerController {
      * note is pending, eased toward the target. Consumed and cleared by aimAt().
      */
     private var primedRotation: Triple<BlockPos, Float, Float>? = null
+
+    /** Last logged calibration result, to suppress identical repeats (see centerOnOrgan). */
+    private var lastCenterLogSignature: String? = null
+    private const val UNREACHABLE_LOG_LIMIT = 3
 
     /**
      * Eases yaw/pitch toward [pos] by at most MAX_ROTATION_DEGREES_PER_TICK per call.

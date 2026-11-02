@@ -96,7 +96,7 @@ src/
       LoopSettings.kt           ← pure repeat/shuffle rules: migration from the old loopMode, parsing, labels
       PlayQueue.kt              ← pure play-order model (context, shuffle, repeat, user queue, history); no Minecraft types; driven by MainScreen through ClientPlayQueue (see "PlayQueue" below)
     util/
-      BlockBardLogBuffer.kt     ← in-memory circular buffer of log entries for in-game log viewer
+      BlockBardLogBuffer.kt     ← in-memory circular buffer (1000 entries) for the in-game log viewer; getTailText(maxBytes) returns the newest whole entries within a UTF-8 byte budget (clipboard copy is capped at 32 KB because SDL_SetClipboardText copies onto LWJGL's fixed-size thread stack); DEBUG entries stored only when DebugLog.enabled
       DebugLog.kt               ← hot-path conditional logger (routes to debug() when disabled, info() when enabled)
       InstrumentMaterials.kt    ← blockBelowHint mapping for noteblock instruments (dirt, wood, wool, copper, etc.)
       LittleEndianReader.kt     ← DataInputStream extensions for NBS parsing; throws field-specific EOFException on truncation

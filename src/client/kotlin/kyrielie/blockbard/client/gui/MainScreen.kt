@@ -413,9 +413,7 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
 
         val logBtnY = 26
         tab3(addRenderableWidget(Button.builder(Component.literal("Copy All")) {
-            val text = BlockBardLogBuffer.getAllText()
-            minecraft.keyboardHandler.clipboard = text
-            chat("Copied ${BlockBardLogBuffer.size} log entries to clipboard")
+            copyLogsToClipboard()
         }.pos(10, logBtnY).size(65, 16).build()))
 
         var errorFilterOnly = false
@@ -1879,7 +1877,39 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
 
     override fun isPauseScreen(): Boolean = false
 
+    /**
+     * Copies the newest log entries to the clipboard and writes the full buffer to a file.
+     * The clipboard text is size-capped: SDL_SetClipboardText allocates the whole UTF-8 string on
+     * LWJGL's fixed-size thread-local stack, so an unbounded string throws "Out of stack space".
+     */
+    private fun copyLogsToClipboard() {
+        val fullPath: Path? = try {
+            val p = FabricLoader.getInstance().gameDir.resolve("logs").resolve("blockbard-copy.txt")
+            java.nio.file.Files.createDirectories(p.parent)
+            java.nio.file.Files.writeString(p, BlockBardLogBuffer.getAllText())
+            p
+        } catch (t: Throwable) {
+            logger.warn("Could not write full log file", t)
+            null
+        }
+        try {
+            val text = BlockBardLogBuffer.getTailText(CLIPBOARD_MAX_BYTES)
+            minecraft.keyboardHandler.clipboard = text
+            val bytes = text.toByteArray(Charsets.UTF_8).size
+            chat(
+                "Copied newest log entries to clipboard ($bytes bytes of ${BlockBardLogBuffer.size} entries)" +
+                    (fullPath?.let { "; full log saved to $it" } ?: "")
+            )
+        } catch (t: Throwable) {
+            logger.warn("Copy to clipboard failed", t)
+            chat("Copy to clipboard failed" + (fullPath?.let { "; full log saved to $it" } ?: ""))
+        }
+    }
+
     companion object {
+        /** Clipboard budget in UTF-8 bytes; well under LWJGL's default 64 KB thread stack. */
+        private const val CLIPBOARD_MAX_BYTES = 32_000
+
         /** Most rows read from the queue for display; counts are taken from the full queue. */
         private const val QUEUE_DISPLAY_LIMIT = 500
 
