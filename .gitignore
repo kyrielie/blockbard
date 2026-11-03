@@ -123,6 +123,11 @@ logs/
 *.tar
 *.7z
 
-# Local development references
+# Local development references and private docs
 LOCAL_DEV_REFERENCES.md
 *.local.md
+BLOCKBARD_PLAN.md
+blockbard-engineering-plan.md
+docs/PLANS.md
+SKILL.md
+mod-links.md
