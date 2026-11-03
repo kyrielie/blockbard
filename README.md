@@ -1,5 +1,11 @@
 # BlockBard
 
+![Build](https://github.com/kyrielie/blockbard/actions/workflows/build.yml/badge.svg)
+![GitHub Release](https://img.shields.io/github/v/release/kyrielie/blockbard?label=release)
+![Minecraft](https://img.shields.io/badge/minecraft-26.x-green?logo=minecraft)
+![Fabric](https://img.shields.io/badge/loader-Fabric-blue)
+![License](https://img.shields.io/github/license/kyrielie/blockbard)
+
 Client side fabric mod.
 It plays noteblocks in minecraft. Inspired by Disc-Jockey and SongPlayer.
 
