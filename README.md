@@ -1,37 +1,17 @@
 # BlockBard
 
-> **Automated NoteBlock Organ Performer & Live Synthesizer for Minecraft Fabric 26.x (26.1, 26.2, 26.3+)**
-
-BlockBard is an advanced client-side Minecraft mod designed to turn physical noteblock arrangements into fully automated, concert-ready musical organs. Load standard MIDI (`.mid`/`.midi`) or Note Block Studio (`.nbs`) files, and BlockBard will scan your surrounding blocks, calculate optimal pitch assignments, automatically tune each block to the required pitch, and execute high-precision musical playback without altering block tunings.
+Client side fabric mod.
+It plays noteblocks in minecraft. Inspired by Disc-Jockey and SongPlayer.
 
 ---
 
 ## Key Features
 
-- 🎵 **MIDI & NBS File Playback**: Drop `.mid`, `.midi`, or `.nbs` files into `config/blockbard/midis/` and control playback directly from the in-game GUI.
-- 🔍 **Intelligent Organ Scanning**: Detects and catalogues all noteblocks within a configurable radius (1–10 blocks), classifying them into `PLAYABLE`, `SILENCED` (obstructed above), and `MOB_HEAD` (custom ambient heads).
-- 🎯 **Pre-Flight Readiness Checking**: Validates instrument and note coverage immediately upon selecting a file, providing material placement hints (e.g., gold block for Bell, bone block for Xylophone, copper for Trumpet) for missing instruments.
-- ⚙️ **Automated Non-Destructive Tuning**: Right-clicks each noteblock the exact number of times required to reach target pitch using an optimistic, latency-compensated tuning state machine with verification and retry limits.
-- 🛡️ **Anti-Cheat & Rate Limit Hardening**:
-  - **Left-Click (Attack) Playback**: Uses `startDestroyBlock()` and `stopDestroyBlock()` to trigger noteblock sounds without altering their tuned state (`NOTE` property cycle). Right-click is reserved strictly for tuning.
-  - **Eased Rotation Smoothing**: Progressively rotates player camera toward target blocks (capped at `35°/tick` by default) rather than snapping instantly, preventing anti-cheat rotation flags.
-  - **Token-Bucket Rate Limiter**: Implements an 8 interacts / 310ms token bucket matching Paper's server-side limits, with configurable burst caps (`1–8` notes/tick) and rotation convergence gates.
-- 🔊 **Sound Verification & Diagnostics**:
-  - **`SoundVerifier`**: Mixin-free verification via Minecraft's `SoundEventListener`, decoding sound pitch ($12 + 12 \cdot \log_2(\text{pitch})$) and matching audible sounds against scheduled note expectations.
-  - **`KickDiagnostics`**: Listens for disconnect events and correlates server disconnect reasons with recent interact timestamps, target blocks, and token budget states.
-- 🎹 **Live Performance & Input**:
-  - **Keyboard Play**: Trigger notes in real time using number keys `1`–`9` while in the BlockBard GUI.
-  - **USB MIDI Keyboard Input**: Connect physical MIDI instruments via `javax.sound.midi` with thread-safe queue synchronization.
-- 🔁 **Playback Modes & HUD**:
-  - **Client-Side Audio Preview**: Audition tracks client-side with Minecraft's sound engine without placing blocks or sending packets.
-  - **Survival Materials Shopping Overlay**: In-game HUD overlay displaying item icons and fractional counts (`inInventory/needed`) for required blocks.
-  - **Repeat and Shuffle**: Repeat Off, All or One, and an independent Shuffle toggle (config screen, the in-GUI loop button, or `/bb repeat` and `/bb shuffle`). Existing `loopMode` settings are migrated automatically on first load.
-  - **HUD Overlay**: On-screen overlay rendered via Fabric's `HudElementRegistry` (`H` to toggle) showing song progress, ticks, tempo, and organ coverage.
-  - **Dynamic Tempo Scaling**: Live `0.5×`–`2.0×` tempo slider affecting both MIDI and NBS playback in real time.
-- ⚡ **Client Commands & Web Downloads**:
-  - **Fabric Client Commands**: Full `/blockbard` and `/bb` command suite with tab completions for playback, previews, tuning, and scanning.
-  - **URL Song Downloader**: Download `.mid` or `.nbs` files directly in-game with auto-magic byte detection via `/bb download <url>`.
-  - **Instrument Remapping Engine**: Dynamically remap or mute instruments on the fly via `/bb remap`.
+- Supports MIDI and NBS files. Jukebox controls, change tempo, queue and skip songs, loop.
+- You place the noteblocks, it tries to tune and play them even if you didn't place enough of each instrument.
+- Client side mod, works on most servers. Not intended for use in Creative mode.
+- Could be considered 'hacking' or 'autoclicking' based on some server rules, please get permission to use, use at your own risk.
+- Virtual keyboard and MIDI keyboard input. There's no sustain and it sounds terrible, why would anyone want this.
 
 ---
 
@@ -66,7 +46,7 @@ BlockBard provides full Fabric client commands registered under `/blockbard` (or
 
 ---
 
-## Step-by-Step Workflow
+## Step-by-Step Workflow (This was written by an AI who has no idea how to play minecraft, just do what you think is best.)
 
 1. **Build Your Organ**: Place noteblocks with appropriate foundation blocks beneath them (e.g., wood planks for Bass, wool for Guitar, dirt for Harp, packed ice for Chime, copper for Trumpet). Ensure the space directly above each noteblock is air.
 2. **Open BlockBard**: Press <kbd>B</kbd> to open the mod interface.
@@ -163,6 +143,8 @@ src/
   - Fabric Language Kotlin ≥ `1.13.12+kotlin.2.4.0`
   - ModMenu (optional soft dependency) ≥ `20.0.0-beta.4`
   - Gson `2.10.1`
+
+I'm pretty sure you need YACL yet another config lib. Install that too.
 
 ---
 
