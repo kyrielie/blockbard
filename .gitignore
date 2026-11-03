@@ -95,6 +95,7 @@ bin/
 
 # macos
 
+.DS_Store
 *.DS_Store
 
 # fabric
@@ -107,10 +108,20 @@ hs_err_*.log
 replay_*.log
 *.hprof
 *.jfr
+
+# tool output / generated artifacts
 repomix-output.xml
-blockbard.xml
-blockbard.xml
-*.xml
+*.repomix.xml
+
+# logs
+logs/
+*.log
+
+# archives / zips (don't commit binary archives)
+*.zip
+*.tar.gz
+*.tar
+*.7z
 
 # Local development references
 LOCAL_DEV_REFERENCES.md
