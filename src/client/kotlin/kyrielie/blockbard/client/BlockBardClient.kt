@@ -146,6 +146,7 @@ object BlockBardClient : ClientModInitializer {
                 mc.player?.sendSystemMessage(net.minecraft.network.chat.Component.literal("§b[BlockBard] §fOrgan hologram overlay $status"))
                 logger.info("O pressed -- Organ overlay visible=$on")
             }
+            MidiInputHandler.tickRetry()
             MainScreen.onClientTick(mc)
             // Song end and auto-advance, with or without the GUI open.
             PlaybackCoordinator.tick()

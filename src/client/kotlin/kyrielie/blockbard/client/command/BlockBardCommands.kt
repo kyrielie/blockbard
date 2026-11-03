@@ -364,6 +364,70 @@ object BlockBardCommands {
                 })
             )
 
+            // /blockbard midi list | status | connect <name> | disconnect
+            val midiNames = { kyrielie.blockbard.client.input.MidiInputHandler.listInputDevices() }
+            root.then(ClientCommands.literal("midi")
+                .then(ClientCommands.literal("list").executes { ctx ->
+                    val ports = kyrielie.blockbard.client.input.MidiInputHandler.listPorts()
+                    if (ports.isEmpty()) {
+                        ctx.source.sendFeedback(Component.literal("§b[BlockBard] §eJava sees no MIDI devices at all."))
+                    } else {
+                        ctx.source.sendFeedback(Component.literal("§b[BlockBard] §fMIDI devices visible to Java (§aIN§f = can send notes):"))
+                        ports.forEach { p ->
+                            val tag = if (p.canSend) "§aIN" else "§7--"
+                            ctx.source.sendFeedback(Component.literal("  $tag §f${p.name} §7(${p.description})"))
+                        }
+                    }
+                    1
+                })
+                .then(ClientCommands.literal("status").executes { ctx ->
+                    val h = kyrielie.blockbard.client.input.MidiInputHandler
+                    val saved = ConfigManager.config.midiDeviceName ?: "(none)"
+                    if (h.isConnected) {
+                        ctx.source.sendFeedback(Component.literal("§b[BlockBard] §fConnected to §a${h.connectedDeviceName}§f. Messages: ${h.messageCount}, note-ons: ${h.noteOnCount}, last note: ${if (h.lastNote < 0) "-" else h.lastNote}"))
+                    } else {
+                        ctx.source.sendFeedback(Component.literal("§b[BlockBard] §cNot connected. §fSaved device: $saved. Use /bb midi list."))
+                    }
+                    1
+                })
+                .then(ClientCommands.literal("connect")
+                    .then(ClientCommands.argument("device", StringArgumentType.greedyString())
+                        .suggests { _, builder -> SharedSuggestionProvider.suggest(midiNames(), builder) }
+                        .executes { ctx ->
+                            val query = StringArgumentType.getString(ctx, "device")
+                            when (val r = kyrielie.blockbard.client.input.MidiInputHandler.connect(query)) {
+                                is kyrielie.blockbard.client.input.MidiConnectResult.Connected -> {
+                                    ConfigManager.config.midiDeviceName = r.name
+                                    ConfigManager.save()
+                                    ctx.source.sendFeedback(Component.literal("§b[BlockBard] §fConnected to §a${r.name}§f and saved it. Play a key, then /bb midi status."))
+                                    1
+                                }
+                                is kyrielie.blockbard.client.input.MidiConnectResult.NotFound -> {
+                                    val list = if (r.available.isEmpty()) "none" else r.available.joinToString()
+                                    ctx.source.sendError(Component.literal("§b[BlockBard] §cNo input device matches '$query'. Inputs: $list"))
+                                    0
+                                }
+                                is kyrielie.blockbard.client.input.MidiConnectResult.Ambiguous -> {
+                                    ctx.source.sendError(Component.literal("§b[BlockBard] §c'$query' matches several: ${r.candidates.joinToString()}"))
+                                    0
+                                }
+                                is kyrielie.blockbard.client.input.MidiConnectResult.Failed -> {
+                                    ctx.source.sendError(Component.literal("§b[BlockBard] §cCould not open ${r.name}: ${r.reason}"))
+                                    0
+                                }
+                            }
+                        }
+                    )
+                )
+                .then(ClientCommands.literal("disconnect").executes { ctx ->
+                    kyrielie.blockbard.client.input.MidiInputHandler.disconnect()
+                    ConfigManager.config.midiDeviceName = null
+                    ConfigManager.save()
+                    ctx.source.sendFeedback(Component.literal("§b[BlockBard] §fMIDI input disconnected and cleared."))
+                    1
+                })
+            )
+
             val registeredRoot = dispatcher.register(root)
             dispatcher.register(ClientCommands.literal("bb").redirect(registeredRoot))
             logger.info("Registered /blockbard and /bb client commands")
