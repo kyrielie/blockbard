@@ -58,7 +58,7 @@ src/
       BlockBardModMenuIntegration.kt ← ModMenu config screen entrypoint
     input/
       KeyboardInputHandler.kt   ← keys 1–9 → NoteRequest; direct dispatch from MainScreen.keyPressed()
-      MidiInputHandler.kt       ← javax.sound.midi device → NoteRequest (foreign thread synchronized in ArpeggioScheduler)
+      MidiInputHandler.kt       ← javax.sound.midi device → NoteRequest (foreign thread synchronized in ArpeggioScheduler); device chosen via /bb midi, name matching and input-port selection (a device listed twice under one name resolves to the entry with transmitters) in util/MidiDeviceMatcher.kt
     midi/                       ← package declared as kyrielie.blockbard.midi
       InstrumentRemapper.kt     ← runtime instrument substitution and muting engine
       MidiChannelResolver.kt    ← resolves each MIDI NOTE_ON to NoteBlockInstrument via per-channel GM program tracking
@@ -584,7 +584,9 @@ callbacks) and ticked from `END_CLIENT_TICK` in `BlockBardClient`, right after `
 7. `PlaybackCoordinator.install()` — wires the playback-thread song-end callbacks
    `ClientTickEvents.END_CLIENT_TICK` — polls the GUI/HUD keybindings, ticks the closed-screen tuner (`MainScreen.onClientTick`),
    `PlaybackCoordinator.tick()` (song end and auto-advance), then `ArpeggioScheduler.onTick()` (the actual dispatch-gated-on-convergence step)
-8. `MidiInputHandler.autoConnect()` — attempts to open a saved MIDI device; its receiver
+8. `MidiInputHandler.autoConnect()` — logs the input devices Java can see, then attempts to open the saved `midiDeviceName`
+   (no-op with an INFO line when unset; set it with `/bb midi connect <name>`). `MidiInputHandler.tickRetry()` runs from
+   `END_CLIENT_TICK` and retries a saved-but-unconnected device every 10 s. Its receiver
    callback runs on a foreign (non-Minecraft) thread, synchronized against
    `ArpeggioScheduler`'s queue (see `ArpeggioScheduler` subsystem summary above)
 
