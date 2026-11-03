@@ -28,7 +28,13 @@ data class NoteRequest(
      * Used by the scale test and any direct-play path that already knows which block to hit.
      */
     val resolvedPos: BlockPos? = null,
-    val isRetuneStep: Boolean = false
+    val isRetuneStep: Boolean = false,
+    /**
+     * True for notes played live (MIDI keyboard). They skip the song assignment maps and are
+     * resolved against the blocks currently tuned, with instrument preference and octave
+     * shifting (see [LiveNoteResolver]). [instrument] is then the preferred instrument.
+     */
+    val live: Boolean = false
 )
 
 /**
@@ -164,7 +170,8 @@ object ArpeggioScheduler {
     private const val RECENT_DISPATCH_CAPACITY = 200
     private val dispatchHistory: ArrayDeque<DispatchRecord> = ArrayDeque()
 
-    data class TargetResolution(val pos: BlockPos, val isRetuneStep: Boolean = false)
+    /** [adjusted] is the request as it will actually sound (shifted pitch, chosen instrument) for live notes. */
+    data class TargetResolution(val pos: BlockPos, val isRetuneStep: Boolean = false, val adjusted: NoteRequest? = null)
 
     /**
      * Resolves a request to a target BlockPos, trying in order:
@@ -178,6 +185,17 @@ object ArpeggioScheduler {
      */
     private fun resolveTarget(request: NoteRequest): TargetResolution? {
         if (request.resolvedPos != null) return TargetResolution(request.resolvedPos, request.isRetuneStep)
+
+        if (request.live) {
+            val allowOctave = InstrumentShifter.mode == ShiftMode.OCTAVE_SHIFT || InstrumentShifter.mode == ShiftMode.BEST_EFFORT
+            val choice = LiveNoteResolver.resolve(
+                request.midiNote, request.instrument, NoteBlockRegistry.allPlayable(),
+                allowOctave, InstrumentShifter.maxOctaveShift,
+                { it.instrument }, { it.midiNote }, { it.instrument.isPitched }, { it.distanceFromPlayer }
+            ) ?: return null
+            val e = choice.block
+            return TargetResolution(e.pos, adjusted = request.copy(midiNote = e.midiNote, instrument = e.instrument))
+        }
 
         // Unpitched instruments (SNARE, HAT, BASEDRUM) produce identical sounds across all notes;
         // normalize to midiBase so they match the single canonical block assignment.
@@ -286,6 +304,7 @@ object ArpeggioScheduler {
                 continue
             }
             val pos = target.pos
+            val dispatchRequest = target.adjusted ?: request
 
             // Rotation convergence gate applies to every note. If the player is not yet
             // facing this block, stop dispatching for this tick and wait. The next tick
@@ -306,9 +325,9 @@ object ArpeggioScheduler {
             queue.removeFirst()
             val budgetBefore = interactBudget
             val ok = if (target.isRetuneStep) {
-                dynamicRetuneDelegate?.invoke(pos, request) ?: interactDelegate?.invoke(pos, request) ?: false
+                dynamicRetuneDelegate?.invoke(pos, dispatchRequest) ?: interactDelegate?.invoke(pos, dispatchRequest) ?: false
             } else {
-                interactDelegate?.invoke(pos, request) ?: false
+                interactDelegate?.invoke(pos, dispatchRequest) ?: false
             }
             onNoteDispatched?.invoke(request.midiNote, request.instrument)
             interactBudget -= 1f

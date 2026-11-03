@@ -7,6 +7,7 @@ import kyrielie.blockbard.util.positiveFiniteOr
 import kyrielie.blockbard.util.positiveOr
 import kyrielie.blockbard.util.sanitizeMaxNotesPerTick
 import kyrielie.blockbard.util.sanitizeTempoMultiplier
+import kyrielie.blockbard.util.sanitizeTuningClickIntervalTicks
 import com.google.gson.Gson
 import com.google.gson.GsonBuilder
 import com.google.gson.InstanceCreator
@@ -25,7 +26,13 @@ data class BlockBardConfig(
     var arpeggioStaleTimeoutMs: Long = 200L,
     var defaultTempoMultiplier: Float = 1.0f,
     var autoRescanIntervalSeconds: Int = 3,
+    // DEPRECATED, kept for one release so a downgrade still reads a valid value: it was never read
+    // by the tuner. Replaced by tuningClickIntervalTicks.
     var maxTuningClicksPerTick: Int = 1,
+    // Minimum ticks between tuning clicks (1-20). The tuner also waits for the server to confirm
+    // each click. With fastTuning the gap is halved (rounded down, at least 1 tick) and two clicks
+    // per block may be in flight.
+    var tuningClickIntervalTicks: Int = 2,
     var lastPlayedTrack: String? = null,
     var shuffleHistory: MutableList<String> = mutableListOf(),
     var defaultOctave: Int = 4,
@@ -116,6 +123,7 @@ data class BlockBardConfig(
         defaultTempoMultiplier = sanitizeTempoMultiplier(defaultTempoMultiplier)
         autoRescanIntervalSeconds = positiveOr(autoRescanIntervalSeconds, 3)
         maxTuningClicksPerTick = positiveOr(maxTuningClicksPerTick, 1)
+        tuningClickIntervalTicks = sanitizeTuningClickIntervalTicks(tuningClickIntervalTicks)
         // Gson can leave these null when the file holds an explicit null.
         @Suppress("SENSELESS_COMPARISON")
         if ((shuffleHistory as MutableList<String>?) == null) shuffleHistory = mutableListOf()

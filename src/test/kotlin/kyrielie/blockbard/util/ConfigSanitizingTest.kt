@@ -33,6 +33,16 @@ class ConfigSanitizingTest {
     }
 
     @Test
+    fun sanitizeTuningClickIntervalTicks() {
+        assertEquals(2, sanitizeTuningClickIntervalTicks(0))
+        assertEquals(2, sanitizeTuningClickIntervalTicks(-4))
+        assertEquals(1, sanitizeTuningClickIntervalTicks(1))
+        assertEquals(7, sanitizeTuningClickIntervalTicks(7))
+        assertEquals(20, sanitizeTuningClickIntervalTicks(500))
+        assertEquals(20, sanitizeTuningClickIntervalTicks(Int.MAX_VALUE))
+    }
+
+    @Test
     fun sanitizeMaxNotesPerTick() {
         assertEquals(8, sanitizeMaxNotesPerTick(0))
         assertEquals(8, sanitizeMaxNotesPerTick(-4))

@@ -81,11 +81,14 @@ object BlockBardCommands {
 
             // /blockbard center
             root.then(ClientCommands.literal("center").executes { ctx ->
-                val res = PlayerController.centerOnOrgan()
-                val msg = when (res) {
-                    is CenterResult.Centered -> "Centered on organ. §a${res.reachableCount}§f/${res.totalFound} noteblocks reachable."
-                    CenterResult.NoBlocks   -> "§cNo playable noteblocks found. Run /bb scan first."
-                    CenterResult.NoPlayer   -> "§cPlayer unavailable."
+                val msg = if (kyrielie.blockbard.client.gui.MainScreen.isTuningActive()) {
+                    "§cCannot re-center while tuning."
+                } else {
+                    when (val res = PlayerController.centerOnOrgan()) {
+                        is CenterResult.Centered -> "Centered on organ. §a${res.reachableCount}§f/${res.totalFound} noteblocks reachable."
+                        CenterResult.NoBlocks   -> "§cNo playable noteblocks found. Run /bb scan first."
+                        CenterResult.NoPlayer   -> "§cPlayer unavailable."
+                    }
                 }
                 ctx.source.sendFeedback(Component.literal("§b[BlockBard] §f$msg"))
                 1

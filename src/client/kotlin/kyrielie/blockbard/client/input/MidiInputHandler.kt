@@ -1,6 +1,8 @@
 package kyrielie.blockbard.client.input
 
 import kyrielie.blockbard.client.config.ConfigManager
+import kyrielie.blockbard.client.midi.InstrumentRemapper
+import kyrielie.blockbard.client.midi.MidiInstrumentMap
 import kyrielie.blockbard.organ.ArpeggioScheduler
 import kyrielie.blockbard.organ.NoteRequest
 import kyrielie.blockbard.util.MidiDeviceMatch
@@ -102,7 +104,12 @@ object MidiInputHandler {
         if (message is ShortMessage && message.command == ShortMessage.NOTE_ON && message.data2 > 0) {
             noteOnCount++
             lastNote = message.data1
-            ArpeggioScheduler.enqueue(NoteRequest(message.data1))
+            // The keyboard acts as GM program 0 (piano), exactly as MidiChannelResolver treats a
+            // file's piano channel: the preferred instrument is HARP, passed through the user's
+            // instrument remap (a muted piano drops the note). Block choice, instrument fallback
+            // and octave shifting happen in the scheduler (see LiveNoteResolver).
+            val preferred = InstrumentRemapper.remap(MidiInstrumentMap.primaryFor(0)) ?: return
+            ArpeggioScheduler.enqueue(NoteRequest(message.data1, instrument = preferred, live = true))
         }
         // NOTE_OFF is ignored: live play fires a note-on click only.
     }

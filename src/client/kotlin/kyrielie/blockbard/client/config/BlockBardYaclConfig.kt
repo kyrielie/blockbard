@@ -107,9 +107,9 @@ object BlockBardYaclConfig {
                     )
                     .option(
                         Option.createBuilder<Int>()
-                            .name(Component.literal("Max Tuning Clicks Per Tick"))
-                            .description(OptionDescription.of(Component.literal("Rate limit for clicks dispatched in a single game tick.")))
-                            .binding(Binding.generic(1, { cfg.maxTuningClicksPerTick }, { cfg.maxTuningClicksPerTick = it }))
+                            .name(Component.literal("Tuning Click Interval (ticks)"))
+                            .description(OptionDescription.of(Component.literal("Minimum game ticks between tuning clicks. The tuner also waits for the server to confirm each click, so raise this on laggy servers that drop clicks. Fast Tuning halves it.")))
+                            .binding(Binding.generic(2, { cfg.tuningClickIntervalTicks }, { cfg.tuningClickIntervalTicks = it }))
                             .controller { opt -> IntegerSliderControllerBuilder.create(opt).range(1, 10).step(1) }
                             .build()
                     )
