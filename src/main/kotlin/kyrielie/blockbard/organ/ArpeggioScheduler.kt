@@ -84,6 +84,13 @@ object ArpeggioScheduler {
      */
     var rotationInProgressTimeoutMs: Long = 1500L
 
+    // Sliding 100ms packet budget circuit breaker (Disc-Jockey anticheat defense)
+    private var last100MsSpanAt: Long = -1L
+    private var packetsInCurrent100MsSpan: Int = 0
+    const val SOFT_PACKET_LIMIT_100MS: Int = 30
+    const val HARD_PACKET_LIMIT_100MS: Int = 45
+    private var pausePacketsUntilMs: Long = -1L
+
     /**
      * Burst cap for the token bucket: the maximum number of interact packets that
      * may be sent within a single onTick() call.
@@ -267,6 +274,17 @@ object ArpeggioScheduler {
 
         // Refill token bucket based on time elapsed since last tick.
         val now = System.currentTimeMillis()
+        if (now < pausePacketsUntilMs) {
+            DebugLog.info(logger) { "onTick: 100ms packet breaker active, pausing dispatch for ${pausePacketsUntilMs - now}ms" }
+            return@synchronized
+        }
+
+        // Rolling 100ms window tracking (Disc-Jockey anticheat circuit breaker)
+        if (last100MsSpanAt < 0L || now - last100MsSpanAt >= 100L) {
+            last100MsSpanAt = now
+            packetsInCurrent100MsSpan = 0
+        }
+
         if (lastTickMs >= 0L) {
             val elapsed = now - lastTickMs
             interactBudget += elapsed / (310f / 8f)   // 8 tokens per 310 ms
@@ -291,6 +309,13 @@ object ArpeggioScheduler {
 
         var dispatched = 0
         while (dispatched < maxNotesPerTick && interactBudget >= 1f && queue.isNotEmpty()) {
+            if (packetsInCurrent100MsSpan >= HARD_PACKET_LIMIT_100MS) {
+                val waitMs = (100L - (now - last100MsSpanAt)).coerceAtLeast(10L)
+                pausePacketsUntilMs = now + waitMs
+                logger.warn("Hard packet limit ($HARD_PACKET_LIMIT_100MS/100ms) reached! Pausing dispatches for ${waitMs}ms to prevent anticheat kick.")
+                break
+            }
+
             val request = queue.first()
             val age = now - request.enqueuedAtMs
 
@@ -338,6 +363,10 @@ object ArpeggioScheduler {
                 logger.warn("interactDelegate returned false for $pos (MIDI ${request.midiNote})")
             }
             dispatched++
+            packetsInCurrent100MsSpan++
+            if (packetsInCurrent100MsSpan >= SOFT_PACKET_LIMIT_100MS) {
+                DebugLog.info(logger) { "approaching 100ms soft packet ceiling: $packetsInCurrent100MsSpan/$SOFT_PACKET_LIMIT_100MS" }
+            }
         }
 
         // Rest-period lookahead dynamic retuning
@@ -418,6 +447,9 @@ object ArpeggioScheduler {
         lastTickMs = -1L
         dispatchHistory.clear()
         voiceIndices.clear()
+        last100MsSpanAt = -1L
+        packetsInCurrent100MsSpan = 0
+        pausePacketsUntilMs = -1L
     }
 
     fun isEmpty(): Boolean = synchronized(lock) { queue.isEmpty() }

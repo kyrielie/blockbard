@@ -173,6 +173,18 @@ object PlayerController {
             val moved = player.x != targetX || player.z != targetZ
             player.setPos(targetX, player.y, targetZ)
             player.setDeltaMovement(0.0, 0.0, 0.0)
+            if (moved) {
+                player.connection.connection.let { conn ->
+                    ProtocolMovementGuard.sendStageMovement(
+                        conn,
+                        bestPos,
+                        player.yRot,
+                        player.xRot,
+                        player.onGround(),
+                        player.horizontalCollision
+                    )
+                }
+            }
             standPos = bestPos
 
             val moveDesc = if (moved) "Centered player at ($targetX, ${player.y}, $targetZ)" else "Player already at center ($targetX, ${player.y}, $targetZ)"
@@ -551,7 +563,7 @@ object PlayerController {
             val sendRot = shouldSendRotationPacket(player, yaw, pitch)
             if (sendRot) {
                 player.connection.send(
-                    net.minecraft.network.protocol.game.ServerboundMovePlayerPacket.Rot(
+                    ProtocolMovementGuard.createSafeRotationPacket(
                         yaw,
                         pitch,
                         player.onGround(),
@@ -574,6 +586,20 @@ object PlayerController {
         } else {
             logger.debug("$caller $pos: using target face=$hitFace")
             BlockHitResult(target, hitFace, pos, false)
+        }
+    }
+
+    private var lastSwingSentAtMs: Long = -1L
+
+    /**
+     * Throttles arm swing packets to at most once per 50ms (one client tick),
+     * matching Disc-Jockey's anticheat defense against swing packet spam.
+     */
+    fun swingMainHandThrottled(player: net.minecraft.world.entity.player.Player) {
+        val now = System.currentTimeMillis()
+        if (now - lastSwingSentAtMs >= 50L) {
+            lastSwingSentAtMs = now
+            player.swing(InteractionHand.MAIN_HAND, net.minecraft.world.item.component.SwingAnimation.DEFAULT, false)
         }
     }
 
@@ -625,7 +651,7 @@ object PlayerController {
         }
         val result = gameModeController.useItemOn(player, InteractionHand.MAIN_HAND, hitResult)
         DebugLog.info(logger) { "interactWith $pos: useItemOn result=$result" }
-        player.swing(InteractionHand.MAIN_HAND, net.minecraft.world.item.component.SwingAnimation.DEFAULT, false)
+        swingMainHandThrottled(player)
         return true
     }
 

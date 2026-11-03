@@ -139,7 +139,8 @@ object NbsFileLoader {
                 }
             }
 
-            return NbsFile(file, version, tempo, notes, title)
+            val rawNbs = NbsFile(file, version, tempo, notes, title)
+            return SongResampler.resample(rawNbs)
         }
     }
 }

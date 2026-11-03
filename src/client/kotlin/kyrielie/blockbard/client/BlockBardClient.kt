@@ -151,6 +151,7 @@ object BlockBardClient : ClientModInitializer {
             // Song end and auto-advance, with or without the GUI open.
             PlaybackCoordinator.tick()
             ArpeggioScheduler.onTick()
+            kyrielie.blockbard.client.player.ProtocolMovementGuard.onClientTickEnd()
         }
 
         MidiInputHandler.autoConnect()
