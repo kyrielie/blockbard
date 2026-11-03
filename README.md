@@ -45,7 +45,6 @@ BlockBard provides full Fabric client commands registered under `/blockbard` (or
 | `/bb tempo <0.1–5.0>` | Sets live playback tempo scale. |
 | `/bb repeat <off\|all\|one>` | Sets what happens when the playlist ends (replaces `/bb loop`). |
 | `/bb shuffle <on\|off>` | Turns shuffle on or off. |
-| `/bb download <url> [name]` | Downloads a `.mid` or `.nbs` file from the web asynchronously. |
 | `/bb materials` | Toggles the Survival Materials shopping list HUD overlay. |
 | `/bb remap <source> <target\|mute\|reset>` | Remaps or mutes note block instruments. |
 | `/bb remap list` / `clear` | Views or resets active instrument remap rules. |
@@ -131,9 +130,10 @@ src/
     ├── player/
     │   ├── KickDiagnostics.kt      # Post-disconnect analysis & send history dumping
     │   ├── PlayerController.kt     # Rotation interpolation, left-click & right-click actions
+    │   ├── ProtocolMovementGuard.kt # 26.2+ single-position-per-tick protocol guard
     │   └── SoundVerifier.kt        # Game sound listener for runtime playback verification
     └── util/
-        └── SongDownloader.kt       # Asynchronous HTTP/HTTPS song download utility
+        └── TuningTraceFile.kt      # Tuning trace diagnostics export
 ```
 
 ---

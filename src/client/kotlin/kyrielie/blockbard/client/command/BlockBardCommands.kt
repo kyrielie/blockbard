@@ -16,7 +16,6 @@ import kyrielie.blockbard.client.playback.nbsInstrumentToBlock
 import kyrielie.blockbard.client.player.CenterResult
 import kyrielie.blockbard.client.player.PlayerController
 import kyrielie.blockbard.client.player.SoundVerifier
-import kyrielie.blockbard.client.util.SongDownloader
 import kyrielie.blockbard.organ.ArpeggioScheduler
 import kyrielie.blockbard.playback.LoopSettings
 import kyrielie.blockbard.playback.RepeatMode
@@ -230,27 +229,6 @@ object BlockBardCommands {
                         }
                         1
                     }
-                )
-            )
-
-            // /blockbard download <url> [filename]
-            root.then(ClientCommands.literal("download")
-                .then(ClientCommands.argument("url", StringArgumentType.string())
-                    .executes { ctx ->
-                        val url = StringArgumentType.getString(ctx, "url")
-                        ctx.source.sendFeedback(Component.literal("§b[BlockBard] §fDownloading §7$url§f..."))
-                        SongDownloader.download(url)
-                        1
-                    }
-                    .then(ClientCommands.argument("filename", StringArgumentType.greedyString())
-                        .executes { ctx ->
-                            val url = StringArgumentType.getString(ctx, "url")
-                            val filename = StringArgumentType.getString(ctx, "filename")
-                            ctx.source.sendFeedback(Component.literal("§b[BlockBard] §fDownloading §7$url §fas §a$filename§f..."))
-                            SongDownloader.download(url, filename)
-                            1
-                        }
-                    )
                 )
             )
 

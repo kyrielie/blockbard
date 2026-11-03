@@ -77,10 +77,11 @@ src/
       SongAudioPreviewer.kt     ← client-side local sound auditioning without placing blocks or packets
     player/
       PlayerController.kt       ← eased rotation, playNoteAt (left-click), interactWith (right-click tuning), dynamic retuning
+      ProtocolMovementGuard.kt  ← 26.2+ protocol guard enforcing single position packet per tick; safe look-only downgrading
       SoundVerifier.kt          ← zero-mixin playback verification via Minecraft SoundEventListener; logs hits/misses/timeouts
       KickDiagnostics.kt        ← disconnect postmortem via ClientPlayConnectionEvents.DISCONNECT; correlates disconnect screen reason
     util/
-      SongDownloader.kt         ← asynchronous HTTP/HTTPS song download utility with magic byte detection
+      TuningTraceFile.kt        ← JSON-lines tuning trace logging for diagnostic export
 
   main/kotlin/kyrielie/blockbard/
     organ/
