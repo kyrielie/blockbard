@@ -17,5 +17,8 @@ fun positiveFiniteOr(value: Float, fallback: Float): Float =
 /** Burst cap for notes per tick: 8 when unset or non-positive, at most 64. */
 fun sanitizeMaxNotesPerTick(value: Int): Int = positiveOr(value, 8).coerceAtMost(64)
 
+/** Ticks between tuning clicks: 2 when unset or non-positive, at most 20 (one second). */
+fun sanitizeTuningClickIntervalTicks(value: Int): Int = positiveOr(value, 2).coerceAtMost(20)
+
 /** Default tempo multiplier: 1.0 when unusable, then clamped to 0.5..2.0. */
 fun sanitizeTempoMultiplier(value: Float): Float = positiveFiniteOr(value, 1.0f).coerceIn(0.5f, 2.0f)

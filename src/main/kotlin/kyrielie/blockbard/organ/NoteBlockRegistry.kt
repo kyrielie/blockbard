@@ -39,6 +39,11 @@ object NoteBlockRegistry {
         untunableBlocks.clear()
     }
 
+    /** Clears the untunable mark of just [positions], leaving other marks in place. */
+    fun clearUntunable(positions: Collection<BlockPos>) {
+        positions.forEach { untunableBlocks.remove(it) }
+    }
+
     fun update(newEntries: List<NoteBlockEntry>) {
         entries.clear()
         newEntries.forEach { entries[it.pos] = it }

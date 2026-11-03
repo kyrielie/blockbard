@@ -58,7 +58,7 @@ src/
       BlockBardModMenuIntegration.kt ← ModMenu config screen entrypoint
     input/
       KeyboardInputHandler.kt   ← keys 1–9 → NoteRequest; direct dispatch from MainScreen.keyPressed()
-      MidiInputHandler.kt       ← javax.sound.midi device → NoteRequest (foreign thread synchronized in ArpeggioScheduler); device chosen via /bb midi, name matching and input-port selection (a device listed twice under one name resolves to the entry with transmitters) in util/MidiDeviceMatcher.kt
+      MidiInputHandler.kt       ← javax.sound.midi device → NoteRequest (foreign thread synchronized in ArpeggioScheduler); device chosen via /bb midi, live-note block choice in organ/LiveNoteResolver.kt (piano = HARP preferred, then any instrument tuned to the exact pitch, then octave shifts per Shift Mode / Max Octave Shift; no retuning); name matching and input-port selection (a device listed twice under one name resolves to the entry with transmitters) in util/MidiDeviceMatcher.kt
     midi/                       ← package declared as kyrielie.blockbard.midi
       InstrumentRemapper.kt     ← runtime instrument substitution and muting engine
       MidiChannelResolver.kt    ← resolves each MIDI NOTE_ON to NoteBlockInstrument via per-channel GM program tracking
@@ -90,12 +90,14 @@ src/
       MobHeadBlocks.kt          ← MOB_HEAD_BLOCKS constant set
       NoteBlockEntry.kt         ← data class (pos, instrument, noteIndex, midiNote, status)
       NoteBlockRegistry.kt      ← singleton Map<BlockPos, NoteBlockEntry>
-      NoteBlockTuner.kt         ← TuneTarget + stateful tuning state machine (TUNING/VERIFYING/DONE/FAILED), capped retries (maxRetries, default 3)
+      NoteBlockTuner.kt         ← TuneTarget + tuning state machine (TUNING/VERIFYING/DONE/FAILED); delegates pacing to TuningEngine
+      TuningEngine.kt           ← pure closed-loop click pacing (confirmation, timeout/backoff, stall guard, evidence); no MC types
       OrganMap.kt               ← Map<BlockPos, ReachInfo> built by PlayerController.centerOnOrgan()
     playback/
       LoopSettings.kt           ← pure repeat/shuffle rules: migration from the old loopMode, parsing, labels
       PlayQueue.kt              ← pure play-order model (context, shuffle, repeat, user queue, history); no Minecraft types; driven by MainScreen through ClientPlayQueue (see "PlayQueue" below)
     util/
+      AimOrdering.kt            ← orderByAngularProximity / wrapDegrees: greedy nearest-angle ordering used to sequence tuning targets
       BlockBardLogBuffer.kt     ← in-memory circular buffer (1000 entries) for the in-game log viewer; getTailText(maxBytes) returns the newest whole entries within a UTF-8 byte budget (clipboard copy is capped at 32 KB because SDL_SetClipboardText copies onto LWJGL's fixed-size thread stack); DEBUG entries stored only when DebugLog.enabled
       DebugLog.kt               ← hot-path conditional logger (routes to debug() when disabled, info() when enabled)
       InstrumentMaterials.kt    ← blockBelowHint mapping for noteblock instruments (dirt, wood, wool, copper, etc.)
@@ -417,17 +419,30 @@ Captures automated postmortems upon server disconnection:
 - Dumps packet send volume over 310ms and 1000ms windows, along with token budget states.
 - Instantly diagnoses whether disconnect was caused by packet rate limits or server anti-cheat.
 
-### `NoteBlockTuner` (main)
-Stateful (`TunerState`: `IDLE → TUNING → VERIFYING → DONE` or `FAILED`). Re-reads live
-world blockstate every tick for every target rather than trusting the scan-time snapshot;
-the snapshot (`TuneTarget.snapshotNote`) is only used for the initial click-count estimate.
-Skips blocks already at their target note (checked against live world state, not the
-snapshot). Token-bucket rate limiter (8 interacts / 310ms, matching Paper's server-side
-limit) and a verification phase that waits `ping*2 + 100ms` before declaring success.
-**On a verification mismatch it retries with a cap:**
-a block that never converges retries up to `maxRetries` (default 3, constructor
-parameter) times before transitioning to `FAILED` and reporting the specific mismatches
-via `onProgress`, instead of cycling `TUNING ↔ VERIFYING` forever.
+### `NoteBlockTuner` and `TuningEngine` (main)
+`NoteBlockTuner` (`TunerState`: `IDLE → TUNING → VERIFYING → DONE` or `FAILED`) is a closed loop:
+a click counts as applied only when the server's block update shows the note changed. Initial
+clicks come from live world reads (`TuneTarget.snapshotNote` is only a fallback). Blocks already
+at target are skipped.
+
+Pacing and bookkeeping live in `TuningEngine<K>` (no Minecraft types, unit-tested in
+`TuningEngineTest`):
+- One focused block at a time; the next click is sent after the previous one is confirmed
+  (two in flight with `fastTuning`), with a minimum gap (`clickGapMs` 100 ms, `fastClickGapMs`
+  50 ms). Remaining clicks = `clicksNeeded(lastSeen, target) - inFlight`.
+- A click unconfirmed after `max(250 ms, 2 * ping + 250 ms)` is a timeout: the block backs off
+  (250 ms doubling, capped at 2 s), moves to the back of the queue, and fails after
+  `maxTimeoutsPerBlock` (default 5) consecutive timeouts. Any confirmation resets the count.
+- A stall guard fails remaining blocks when nothing is clicked or confirmed for
+  `max(10 s, 4 * timeout)` (for example the camera never converges).
+- When every block reads at target, a confirmation window (`ping*2 + 150 ms`) re-reads all blocks;
+  regressions (for example a late-delivered click) are re-tuned up to `maxRetries` (default 3).
+- Failures are classified from per-block evidence (`TuningEvidence`): a block that ever advanced
+  is `DESYNC`; one that never responded goes through `diagnoseFailState` (geometry), else
+  `UNRESPONSIVE`; rejected interactions give `INTERACT_REJECTED`; missing blocks `BLOCK_MISSING`.
+- `onTrace` receives one line per event (SENT, CONFIRMED with latency, TIMEOUT, DONE, FAILED).
+  The old token bucket was removed: the click gap keeps the rate at or below ~6 interacts per
+  310 ms even with `fastTuning`.
 
 ### `MidiFilePlayer` (client)
 Loads `.mid` files. Tempo read via a direct `MetaMessage` (0x51) scan; notes resolved via
@@ -604,7 +619,8 @@ Current fields (`BlockBardConfig.kt`):
 `scanRadius: Int = 5`, `sphericalScan: Boolean = true`, `shiftMode: String = "BEST_EFFORT"`,
 `maxOctaveShift: Int = 1`, `reportShiftsInHud: Boolean = true`, `hudEnabled: Boolean = false`,
 `arpeggioStaleTimeoutMs: Long = 200L`, `defaultTempoMultiplier: Float = 1.0f`,
-`autoRescanIntervalSeconds: Int = 3`, `maxTuningClicksPerTick: Int = 1`,
+`autoRescanIntervalSeconds: Int = 3`, `maxTuningClicksPerTick: Int = 1` (deprecated, never read by the tuner, kept for one release),
+`tuningClickIntervalTicks: Int = 2` (minimum ticks between tuning clicks; `fastTuning` halves it and allows two clicks in flight per block),
 `lastPlayedTrack: String?`, `shuffleHistory: MutableList<String>` (no longer read or written; kept so old files load), `defaultOctave: Int = 4`,
 `midiDeviceName: String?`, `keyMappings: List<Int> = [54..62]` (MIDI notes for keys 1-9),
 `smoothCameraRotation: Boolean = false`, `fastTuning: Boolean = true`,
@@ -623,7 +639,7 @@ to deserialize `BlockBardConfig`. Missing keys keep the constructor default, whi
 `ConfigManager.load()` then runs `BlockBardConfig.sanitize()` (zero, negative, NaN, infinite or null values become safe ones; rules are the pure
 helpers in `util/ConfigSanitizing.kt`: positive-or-fallback for `scanRadius`, `arpeggioStaleTimeoutMs`, `maxRotationDegreesPerTick`,
 `rotationConvergenceThresholdDegrees`, `rotationInProgressTimeoutMs`, `autoRescanIntervalSeconds`, `maxTuningClicksPerTick`;
-`maxNotesPerTick` 1-64 with 8 as the fallback; `defaultTempoMultiplier` non-finite or <= 0 → 1.0, then clamped 0.5–2.0; null `shuffleHistory` and `instrumentRemap` replaced by empty collections)
+`tuningClickIntervalTicks` 1-20 with 2 as the fallback; `maxNotesPerTick` 1-64 with 8 as the fallback; `defaultTempoMultiplier` non-finite or <= 0 → 1.0, then clamped 0.5–2.0; null `shuffleHistory` and `instrumentRemap` replaced by empty collections)
 and `migrateLoopSettings()` (see `LoopSettings.resolve`), saving the file once when a migration happened.
 Repeat and shuffle are two settings (`repeatMode`, `shuffle`) that feed the live `PlayQueue` through `ClientPlayQueue.applyConfig`.
 A planned architectural improvement is migrating to `kotlinx.serialization` with type-safe serializers.

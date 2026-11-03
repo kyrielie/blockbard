@@ -258,6 +258,7 @@ object PlayerController {
     /** Last logged calibration result, to suppress identical repeats (see centerOnOrgan). */
     private var lastCenterLogSignature: String? = null
     private const val UNREACHABLE_LOG_LIMIT = 3
+    private const val ROTATION_PACKET_EPSILON_DEGREES = 0.01f
 
     /**
      * Eases yaw/pitch toward [pos] by at most MAX_ROTATION_DEGREES_PER_TICK per call.
@@ -429,6 +430,32 @@ object PlayerController {
         return null
     }
 
+    /** Last rotation sent to the server by [aimAt], with the player instance it was sent for. */
+    private var lastSentRotPlayer: java.lang.ref.WeakReference<Any>? = null
+    private var lastSentYaw: Float = 0f
+    private var lastSentPitch: Float = 0f
+
+    private fun shouldSendRotationPacket(player: Any, yaw: Float, pitch: Float): Boolean {
+        val same = lastSentRotPlayer?.get() === player &&
+            abs(yaw - lastSentYaw) < ROTATION_PACKET_EPSILON_DEGREES &&
+            abs(pitch - lastSentPitch) < ROTATION_PACKET_EPSILON_DEGREES
+        return !same
+    }
+
+    private fun rememberSentRotation(player: Any, yaw: Float, pitch: Float) {
+        lastSentRotPlayer = java.lang.ref.WeakReference(player)
+        lastSentYaw = yaw
+        lastSentPitch = pitch
+    }
+
+    /** Yaw/pitch that [aimAt] uses for [pos] from the current organ map, or null if unmapped. */
+    fun aimAnglesFor(pos: BlockPos): Pair<Float, Float>? =
+        organMap?.getReachInfo(pos)?.let { it.yaw to it.pitch }
+
+    /** The player's current look direction (yaw, pitch), or null with no player. */
+    fun currentLookAngles(): Pair<Float, Float>? =
+        Minecraft.getInstance().player?.let { it.yRot to it.xRot }
+
     /**
      * Aims at [pos] -- shared by interactWith() (tuning, right-click) and
      * playNoteAt() (playback, left-click). Returns the BlockHitResult, or null if
@@ -519,14 +546,21 @@ object PlayerController {
         if (shouldRotate) {
             player.setYRot(yaw)
             player.setXRot(pitch)
-            player.connection.send(
-                net.minecraft.network.protocol.game.ServerboundMovePlayerPacket.Rot(
-                    yaw,
-                    pitch,
-                    player.onGround(),
-                    player.horizontalCollision
+            // The server already has this rotation if we sent it on a previous click; repeat clicks on
+            // one block (the common tuning case) then add no extra packet.
+            val sendRot = shouldSendRotationPacket(player, yaw, pitch)
+            if (sendRot) {
+                player.connection.send(
+                    net.minecraft.network.protocol.game.ServerboundMovePlayerPacket.Rot(
+                        yaw,
+                        pitch,
+                        player.onGround(),
+                        player.horizontalCollision
+                    )
                 )
-            )
+                rememberSentRotation(player, yaw, pitch)
+            }
+            DebugLog.info(logger) { "aimAt $pos: rotPacketSent=$sendRot yaw=$yaw pitch=$pitch" }
         }
 
         val liveHit = mc.hitResult
@@ -585,7 +619,12 @@ object PlayerController {
             BlockBardLogBuffer.warn("PlayerController", "[${fail.tag}] Cannot aim at $pos: ${fail.description}")
             return false
         }
-        val result = mc.gameMode?.useItemOn(player, InteractionHand.MAIN_HAND, hitResult)
+        val gameModeController = mc.gameMode ?: run {
+            logger.warn("interactWith $pos: no game mode controller")
+            return false
+        }
+        val result = gameModeController.useItemOn(player, InteractionHand.MAIN_HAND, hitResult)
+        DebugLog.info(logger) { "interactWith $pos: useItemOn result=$result" }
         player.swing(InteractionHand.MAIN_HAND, net.minecraft.world.item.component.SwingAnimation.DEFAULT, false)
         return true
     }
@@ -731,5 +770,6 @@ object PlayerController {
     fun clearOrganMap() {
         logger.info("clearOrganMap: organ map cleared")
         organMap = null
+        lastSentRotPlayer = null
     }
 }

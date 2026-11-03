@@ -26,6 +26,7 @@ import kyrielie.blockbard.playback.QueueRow
 import kyrielie.blockbard.playback.QueueSource
 import kyrielie.blockbard.playback.RepeatMode
 import kyrielie.blockbard.playback.SongId
+import kyrielie.blockbard.client.util.TuningTraceFile
 import kyrielie.blockbard.util.BlockBardLogBuffer
 import kyrielie.blockbard.util.DebugLog
 import kyrielie.blockbard.util.LogLevel
@@ -34,6 +35,7 @@ import kyrielie.blockbard.util.clicksNeeded
 import kyrielie.blockbard.util.isPitched
 import kyrielie.blockbard.util.midiBase
 import kyrielie.blockbard.util.midiNoteToName
+import kyrielie.blockbard.util.orderByAngularProximity
 import net.fabricmc.loader.api.FabricLoader
 import net.minecraft.client.gui.GuiGraphicsExtractor
 import net.minecraft.client.gui.components.AbstractWidget
@@ -360,13 +362,18 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
 
         tab2(addRenderableWidget(Button.builder(Component.literal("Center")) {
             logger.info("Center clicked")
-            val result = PlayerController.centerOnOrgan()
-            organScanMessage = when (result) {
-                is CenterResult.Centered -> "${result.reachableCount}/${result.totalFound} reachable."
-                CenterResult.NoBlocks   -> "No playable noteblocks found."
-                CenterResult.NoPlayer   -> "No player found."
+            if (isTuningActive()) {
+                // Re-centering rebuilds the organ map and may move the player mid-tune.
+                chat("Cannot re-center while tuning; wait for it to finish or cancel it.")
+            } else {
+                val result = PlayerController.centerOnOrgan()
+                organScanMessage = when (result) {
+                    is CenterResult.Centered -> "${result.reachableCount}/${result.totalFound} reachable."
+                    CenterResult.NoBlocks   -> "No playable noteblocks found."
+                    CenterResult.NoPlayer   -> "No player found."
+                }
+                chat(organScanMessage)
             }
-            chat(organScanMessage)
         }.pos(194, organBtnY).size(48, 16).build()))
 
         tab2(addRenderableWidget(Button.builder(Component.literal("Tune")) {
@@ -942,8 +949,26 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
         chat("Tuning ${targets.size} blocks (~$totalClicks clicks)...")
         logger.info("startTuning: ${targets.size} targets, $totalClicks clicks, thenPlay=$thenPlay")
 
+        // Visit blocks in angular order so the camera sweeps smoothly instead of jumping around.
+        val look = PlayerController.currentLookAngles()
+        val orderedTargets = if (look == null) targets else orderByAngularProximity(targets, look.first, look.second) {
+            PlayerController.aimAnglesFor(it.pos)
+        }
+
+        // Marks from earlier failed runs must not hide blocks that may simply have hit a transient
+        // problem; deterministic failures are marked again by this run.
+        NoteBlockRegistry.clearUntunable(orderedTargets.map { it.pos })
+
+        val clickIntervalTicks = ConfigManager.config.tuningClickIntervalTicks
+        TuningTraceFile.begin(
+            "tuning run: ${orderedTargets.size} targets, $totalClicks est. clicks, intervalTicks=$clickIntervalTicks, " +
+                "fastTuning=${ConfigManager.config.fastTuning}, rotateDuringTuning=${ConfigManager.config.rotateDuringTuning}, " +
+                "ping=${PlayerController.currentPingMs()}ms"
+        )
+        BlockBardLogBuffer.info("Tuner", "Per-click trace: ${TuningTraceFile.path}")
+
         val newTuner = NoteBlockTuner(
-            targets           = targets,
+            targets           = orderedTargets,
             worldNoteReader   = { pos ->
                 mc.level?.getBlockState(pos)?.let { state ->
                     if (state.block == net.minecraft.world.level.block.Blocks.NOTE_BLOCK)
@@ -959,8 +984,13 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
             diagnoseFailState = { pos, _, _ ->
                 PlayerController.diagnoseBlockInteractability(pos)
             },
-            onBlockFailed     = { target, failState, _, _ ->
+            clickGapMs        = clickIntervalTicks * 50L,
+            fastClickGapMs    = maxOf(1, clickIntervalTicks / 2) * 50L,
+            onTrace           = { line -> TuningTraceFile.write(line) },
+            onBlockUntunable  = { target, failState ->
                 NoteBlockRegistry.markUntunable(target.pos, failState)
+            },
+            onBlockFailed     = { target, failState, _, _ ->
                 kyrielie.blockbard.client.render.ManualTuningHighlighter.add(
                     target.pos,
                     target.instrument,
@@ -1914,6 +1944,9 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
         private const val QUEUE_DISPLAY_LIMIT = 500
 
         var activeTuner: NoteBlockTuner? = null
+
+        /** True while a tuner run is in progress (used to block actions that would disturb it). */
+        fun isTuningActive(): Boolean = activeTuner?.isActive == true
         var currentScreen: MainScreen? = null
 
         fun onClientTick(mc: net.minecraft.client.Minecraft) {
