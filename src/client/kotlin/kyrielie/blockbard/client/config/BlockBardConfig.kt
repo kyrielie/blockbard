@@ -185,6 +185,7 @@ object ConfigManager {
             config.sanitize()
             // Files from before repeat/shuffle existed carry only loopMode; migrate once and persist.
             if (config.migrateLoopSettings()) save()
+            applyRuntimeConfig()
         } catch (e: Exception) {
             logger.warn("Config parse failed, resetting to defaults: ${e.message}", e)
             config = BlockBardConfig()
@@ -196,5 +197,10 @@ object ConfigManager {
     fun save() {
         configFile.parentFile?.mkdirs()
         configFile.writeText(gson.toJson(config))
+        applyRuntimeConfig()
+    }
+
+    fun applyRuntimeConfig() {
+        kyrielie.blockbard.organ.ArpeggioScheduler.dynamicRetuningEnabled = config.dynamicRetuning
     }
 }

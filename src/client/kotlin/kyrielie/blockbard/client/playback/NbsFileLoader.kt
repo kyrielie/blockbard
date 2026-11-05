@@ -334,6 +334,9 @@ object NbsPlayer {
             stop()
             currentNbs = nbs
             currentTick = clamped
+            val tempo = if (nbs.tempo > 0f) nbs.tempo else 10f
+            val seekMs = (clamped.toDouble() / tempo * 1000.0).toLong()
+            DynamicRetuneManager.onSeek(seekMs)
             if (wasPlaying) {
                 play(nbs, clamped)
             } else if (wasPaused) {
@@ -342,6 +345,13 @@ object NbsPlayer {
                 isPaused = true
             }
         }
+    }
+
+    fun currentPositionMs(): Long {
+        val nbs = currentNbs ?: return -1L
+        if (!isPlaying && !isPaused) return -1L
+        val tempo = if (nbs.tempo > 0f) nbs.tempo else 10f
+        return (currentTick.toDouble() / tempo * 1000.0).toLong()
     }
 
     fun getDurationSeconds(): Double {

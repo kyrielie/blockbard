@@ -6,6 +6,8 @@ import kyrielie.blockbard.client.gui.PlaybackHud
 import kyrielie.blockbard.client.input.KeyboardInputHandler
 import kyrielie.blockbard.client.input.MidiInputHandler
 import kyrielie.blockbard.client.playback.ClientPlayQueue
+import kyrielie.blockbard.client.playback.MidiFilePlayer
+import kyrielie.blockbard.client.playback.NbsPlayer
 import kyrielie.blockbard.client.playback.TuningController
 import kyrielie.blockbard.client.playback.PlaybackCoordinator
 import kyrielie.blockbard.client.player.KickDiagnostics
@@ -66,6 +68,13 @@ object BlockBardClient : ClientModInitializer {
             PlayerController.playNoteAt(pos, request)
         }
         ArpeggioScheduler.dynamicRetuningEnabled = cfg.dynamicRetuning
+        ArpeggioScheduler.songTimeProvider = {
+            when {
+                MidiFilePlayer.isActive() -> MidiFilePlayer.currentPositionMs()
+                NbsPlayer.isPlaying || NbsPlayer.isPaused -> NbsPlayer.currentPositionMs()
+                else -> -1L
+            }
+        }
         ClientPlayQueue.applyConfig(cfg)
         // Playback-thread song-end callbacks; the decision itself runs from the END_CLIENT_TICK below.
         PlaybackCoordinator.install()

@@ -10,6 +10,7 @@ import kyrielie.blockbard.client.playback.NbsFileLoader
 import kyrielie.blockbard.client.playback.NbsPlayer
 import kyrielie.blockbard.client.playback.SongAudioPreviewer
 import kyrielie.blockbard.client.playback.ClientPlayQueue
+import kyrielie.blockbard.client.playback.DynamicRetuneManager
 import kyrielie.blockbard.client.playback.TuningController
 import kyrielie.blockbard.client.playback.PlaybackCoordinator
 import kyrielie.blockbard.client.playback.PlaybackHost
@@ -1064,8 +1065,8 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
             }
 
             if (timelineNotes.isNotEmpty()) {
-                val plan = TimelineVoiceAllocator.compilePlan(timelineNotes, reachable)
-                ArpeggioScheduler.loadRetuneSchedule(plan.retuneTasks)
+                val plan = TimelineVoiceAllocator.compilePlan(timelineNotes, reachable, ConfigManager.config.dynamicRetuningMaxClicks)
+                DynamicRetuneManager.loadPlan(plan)
                 val stats = plan.stats
                 logger.info("Dynamic Retuning Plan loaded: ${stats.lookaheadRetunesScheduled} rest retunes for ${stats.totalNotes} notes across ${stats.physicalBlocksUsed} blocks")
                 if (stats.lookaheadRetunesScheduled > 0) {

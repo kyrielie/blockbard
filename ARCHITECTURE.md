@@ -76,6 +76,7 @@ src/
       PlaybackCoordinator.kt    ← song-end and auto-advance decisions, ticked from END_CLIENT_TICK (works with the GUI closed); PlaybackHost interface
       TuningController.kt       ← owns the tuner run, the organ assignment and the tune-then-play chain; ticked by PlaybackCoordinator
       NbsFileLoader.kt          ← .nbs binary parser AND NbsPlayer; tick getters and live tempoMultiplier parity
+      DynamicRetuneManager.kt   ← manager for active dynamic performance plan and synchronized lookahead rest-period retuning schedule on seeks
       SongMetadataCache.kt      ← async duration, tempo, and track summary metadata caching
       SongAudioPreviewer.kt     ← client-side local sound auditioning without placing blocks or packets
     player/
@@ -102,6 +103,7 @@ src/
       NoteBlockRegistry.kt      ← singleton Map<BlockPos, NoteBlockEntry>
       NoteBlockTuner.kt         ← TuneTarget + tuning state machine (TUNING/VERIFYING/DONE/FAILED); delegates pacing to TuningEngine
       OrganAssignmentSolver.kt  ← pure min-cost organ assignment solver weighting notes by song frequency
+      TimelineVoiceAllocator.kt ← pre-computes lookahead voice allocation and rest-period retuning schedules; pure generic engine for unit testing outside Minecraft classloader
       TuningEngine.kt           ← pure closed-loop click pacing (confirmation, timeout/backoff, stall guard, evidence); no MC types
       OrganMap.kt               ← Map<BlockPos, ReachInfo> built by PlayerController.centerOnOrgan()
     playback/

@@ -106,7 +106,7 @@ graph TD
 | **P22** | `cross-timbre-0click` | Optional cross-instrument matching at 0 clicks for identical pitches | **OPTIONAL** | Configurable toggle |
 | **P23** | `reach-overlay` | Hologram working vs non-working checks, out-of-reach crimson tint, silenced obstruction check, standPos cuboid and drift detection, 1.0f alpha visibility fix | **DONE** | Tested & verified in `OrganOverlayRenderer.kt` |
 | **P24** | `show-problems` | "Show Problems" screen inspector; toggle for `ManualTuningHighlighter`; `/bb problems` command | **DONE** | Tested & verified in `OrganProblemsScreen.kt` & `OrganProblemCollector.kt` |
-| **P25–P28** | `dynamic-retuning` | Song-relative `PlaybackClock` retune tasks, ghost-note cap via `dynamicRetuningMaxClicks`, YACL sync | **PLANNED** | Allocation & clock tests |
+| **P25–P28** | `dynamic-retuning` | Song-relative `PlaybackClock` retune tasks, ghost-note cap via `dynamicRetuningMaxClicks`, seek recompilation, YACL sync | **DONE** | 5 unit tests (`TimelineVoiceAllocatorTest`), all 167 tests passing |
 | **P29** | `polish-release` | Documentation updates, final code cleanup, release notes | **PLANNED** | Full test & build pass |
 
 ---
@@ -173,8 +173,11 @@ graph TD
 
 ---
 
-### Track E: Dynamic Retuning Rework (Passes 25–28)
+### Track E: Dynamic Retuning Rework (Passes 25–28) [DONE]
 1. **Pass 25–28 — Timed On-The-Fly Retuning**:
-   * Sync retune scheduling with song-relative wall clock (`PlaybackClock`).
-   * Enforce ghost-note limit through `dynamicRetuningMaxClicks` (default 2).
-   * Integrate dynamic retuning toggle and parameters into YACL config save lifecycle.
+   * Fixed clock desync: wired song-relative `songTimeProvider` into `ArpeggioScheduler` consuming position from `MidiFilePlayer.currentPositionMs()` and `NbsPlayer.currentPositionMs()`.
+   * Enforced ghost-note budget cap through `dynamicRetuningMaxClicks` (default 2 clicks), preventing audible click bursts during song rest periods.
+   * Extracted pure `compileGenericPlan` in `TimelineVoiceAllocator` allowing 100% JVM testability without Minecraft classloader dependency crashes (Decision D1).
+   * Implemented `DynamicRetuneManager` for seek lifecycle management, re-filtering tasks on seek/replay.
+   * Added `ConfigManager.applyRuntimeConfig()` synchronizing runtime scheduler parameters on config load/save.
+   * Added 5 unit tests in `TimelineVoiceAllocatorTest.kt`.

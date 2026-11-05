@@ -327,6 +327,10 @@ object MidiFilePlayer {
             val wasPaused = isPaused
             stop()
             currentTick = clamped
+            val midi = loadedMidi
+            if (midi != null) {
+                DynamicRetuneManager.onSeek(midi.tempoMap.tickToMs(clamped))
+            }
             if (wasPlaying) {
                 play(clamped)
             } else if (wasPaused) {
@@ -335,6 +339,12 @@ object MidiFilePlayer {
                 isPaused = true
             }
         }
+    }
+
+    fun currentPositionMs(): Long {
+        val midi = loadedMidi ?: return -1L
+        if (!isPlaying && !isPaused) return -1L
+        return midi.tempoMap.tickToMs(currentTick)
     }
 
     fun getDurationSeconds(): Double {

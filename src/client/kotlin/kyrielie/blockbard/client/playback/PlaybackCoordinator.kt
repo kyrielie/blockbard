@@ -153,6 +153,7 @@ object PlaybackCoordinator {
         TuningController.abort()
         MidiFilePlayer.stop()
         NbsPlayer.stop()
+        DynamicRetuneManager.clear()
         queue.stop()
     }
 
