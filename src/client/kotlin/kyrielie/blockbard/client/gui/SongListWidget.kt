@@ -3,11 +3,14 @@ package kyrielie.blockbard.client.gui
 import kyrielie.blockbard.client.config.ConfigManager
 import kyrielie.blockbard.client.library.MidiLibrary
 import kyrielie.blockbard.client.playback.SongMetadataCache
+import kyrielie.blockbard.client.util.InstrumentItemHelper
+import kyrielie.blockbard.util.blockBelowHint
 import net.minecraft.client.Minecraft
 import net.minecraft.client.gui.GuiGraphicsExtractor
 import net.minecraft.client.gui.components.ObjectSelectionList
 import net.minecraft.client.input.MouseButtonEvent
 import net.minecraft.network.chat.Component
+import net.minecraft.world.level.block.state.properties.NoteBlockInstrument
 import java.io.File
 
 class SongListWidget(
@@ -109,29 +112,65 @@ class SongListWidget(
             val badgeColor = if (isNbs) opaque(0xFFCC44) else opaque(0x55FFFF)
             graphics.text(font, badge, x + 16, y + 2, badgeColor)
 
-            // File name
-            val nameColor = if (isSelected) opaque(0xAAFFAA) else if (hovered) opaque(0xFFFFFF) else opaque(0xDDDDDD)
-            val maxChars = ((w - 90) / 6).coerceIn(15, 60)
-            val name = file.nameWithoutExtension.take(maxChars)
-            graphics.text(font, name, x + 46, y + 2, nameColor)
-
             // Queue buttons: "Next" plays after the current song, "Last" goes to the end of the queue
             val lastX = x + w - 26
             val nextX = x + w - 54
-            val rowHovered = mouseY >= y + 1 && mouseY <= y + 13
-            val lastHovered = rowHovered && mouseX >= lastX - 2 && mouseX <= x + w
-            val nextHovered = rowHovered && mouseX >= nextX - 2 && mouseX < lastX - 2
+            val rowHovered = mouseY >= y + 1 && mouseY <= y + 25
+            val lastHovered = rowHovered && mouseX >= lastX - 2 && mouseX <= x + w && mouseY <= y + 13
+            val nextHovered = rowHovered && mouseX >= nextX - 2 && mouseX < lastX - 2 && mouseY <= y + 13
             graphics.text(font, "Next", nextX, y + 2, if (nextHovered) opaque(0x55FF55) else opaque(0x77AA77))
             graphics.text(font, "Last", lastX, y + 2, if (lastHovered) opaque(0x55FF55) else opaque(0x77AA77))
 
             // File size
             val kb = file.length() / 1024
             val sizeStr = "${kb}KB"
-            graphics.text(font, sizeStr, nextX - font.width(sizeStr) - 6, y + 2, opaque(0x888888))
+            val sizeW = font.width(sizeStr)
+            val sizeX = nextX - sizeW - 6
+            graphics.text(font, sizeStr, sizeX, y + 2, opaque(0x888888))
 
-            // Metadata subtext; replaced by a hint while a queue button is hovered
             val meta = SongMetadataCache.get(file)
+            val instruments = meta?.instruments ?: emptyList()
+
+            // Instrument block previews
+            val iconsRight = sizeX - 6
+            val maxIconSpace = (iconsRight - (x + 160)).coerceAtLeast(0)
+            val maxVisibleIcons = (maxIconSpace / 18).coerceIn(0, 6)
+            val visibleInsts = instruments.take(maxVisibleIcons)
+            var hoveredInst: NoteBlockInstrument? = null
+
+            if (visibleInsts.isNotEmpty()) {
+                val totalIconsW = visibleInsts.size * 18
+                var iconX = iconsRight - totalIconsW
+                val iconY = y + 5
+                for (inst in visibleInsts) {
+                    val stack = InstrumentItemHelper.itemStackFor(inst)
+                    graphics.item(stack, iconX, iconY)
+                    if (rowHovered && mouseX >= iconX && mouseX < iconX + 16 && mouseY >= iconY && mouseY < iconY + 16) {
+                        hoveredInst = inst
+                        graphics.fill(iconX - 1, iconY - 1, iconX + 17, iconY, 0xFFFFFFFF.toInt())
+                        graphics.fill(iconX - 1, iconY + 16, iconX + 17, iconY + 17, 0xFFFFFFFF.toInt())
+                        graphics.fill(iconX - 1, iconY, iconX, iconY + 16, 0xFFFFFFFF.toInt())
+                        graphics.fill(iconX + 16, iconY, iconX + 17, iconY + 16, 0xFFFFFFFF.toInt())
+                    }
+                    iconX += 18
+                }
+                if (instruments.size > maxVisibleIcons) {
+                    val extra = "+${instruments.size - maxVisibleIcons}"
+                    graphics.text(font, extra, iconsRight + 1, y + 10, opaque(0x888888))
+                }
+            }
+
+            // File name
+            val nameColor = if (isSelected) opaque(0xAAFFAA) else if (hovered) opaque(0xFFFFFF) else opaque(0xDDDDDD)
+            val titleLimitX = if (visibleInsts.isNotEmpty()) iconsRight - (visibleInsts.size * 18) - 6 else sizeX - 6
+            val maxTitleW = (titleLimitX - (x + 46)).coerceAtLeast(40)
+            val maxChars = (maxTitleW / 6).coerceIn(12, 60)
+            val name = file.nameWithoutExtension.take(maxChars)
+            graphics.text(font, name, x + 46, y + 2, nameColor)
+
+            // Metadata subtext; replaced by a hint while a queue button or instrument icon is hovered
             val hint = when {
+                hoveredInst != null -> "${hoveredInst.name}: requires ${hoveredInst.blockBelowHint}"
                 nextHovered -> "Next: play this right after the current song"
                 lastHovered -> "Last: add this to the end of your queue"
                 else -> null
@@ -140,6 +179,7 @@ class SongListWidget(
             val folderPrefix = if (relFolder.isNotEmpty()) "📁 $relFolder  ·  " else ""
             val subtext = hint ?: (folderPrefix + (meta?.summaryString ?: "Analyzing..."))
             val subtextColor = when {
+                hoveredInst != null -> opaque(0xFFFFAA)
                 hint != null -> opaque(0x88DD88)
                 meta != null -> opaque(0xAAAAAA)
                 else -> opaque(0x666666)

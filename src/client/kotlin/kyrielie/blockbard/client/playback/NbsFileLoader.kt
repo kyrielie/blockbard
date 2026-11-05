@@ -61,7 +61,9 @@ data class NbsFile(
     val version: Byte,
     val tempo: Float,       // ticks per second
     val notes: List<NbsNote>,
-    val title: String
+    val title: String,
+    val author: String = "",
+    val originalAuthor: String = ""
 ) {
     val durationMs: Long get() {
         val lastTick = notes.maxOfOrNull { it.tick } ?: 0
@@ -96,8 +98,8 @@ object NbsFileLoader {
 
             val layerCount = stream.readLEUShort("layer count")
             val title = stream.readNBSString("title")
-            stream.readNBSString("author")
-            stream.readNBSString("original author")
+            val author = stream.readNBSString("author")
+            val originalAuthor = stream.readNBSString("original author")
             stream.readNBSString("description")
             val tempoRaw = stream.readLEShort("tempo").toInt() // ticks per second × 100
             val tempo = if (tempoRaw > 0) tempoRaw / 100f else 20.0f
@@ -139,7 +141,7 @@ object NbsFileLoader {
                 }
             }
 
-            val rawNbs = NbsFile(file, version, tempo, notes, title)
+            val rawNbs = NbsFile(file, version, tempo, notes, title, author, originalAuthor)
             return SongResampler.resample(rawNbs)
         }
     }

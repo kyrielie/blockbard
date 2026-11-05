@@ -1,5 +1,6 @@
 package kyrielie.blockbard.client.playback
 
+import net.minecraft.world.level.block.state.properties.NoteBlockInstrument
 import org.slf4j.LoggerFactory
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
@@ -9,7 +10,10 @@ data class SongMetadata(
     val durationSeconds: Int,
     val bpm: Int,
     val distinctNotes: Int,
-    val isNbs: Boolean
+    val isNbs: Boolean,
+    val title: String? = null,
+    val author: String? = null,
+    val instruments: List<NoteBlockInstrument> = emptyList()
 ) {
     val durationFormatted: String
         get() {
@@ -19,7 +23,10 @@ data class SongMetadata(
         }
 
     val summaryString: String
-        get() = "$durationFormatted • $bpm BPM • $distinctNotes notes"
+        get() {
+            val authorPart = if (!author.isNullOrBlank()) "by $author  ·  " else ""
+            return "$authorPart$durationFormatted  ·  $bpm BPM  ·  $distinctNotes notes"
+        }
 }
 
 object SongMetadataCache {
@@ -60,7 +67,27 @@ object SongMetadataCache {
                 val durationSecs = (lastTick / tempo).toInt()
                 val bpm = (tempo * 6f).toInt() // approx BPM (20 tps = 120 bpm)
                 val distinct = nbs.notes.map { it.key to it.instrument }.distinct().size
-                SongMetadata(durationSecs, bpm, distinct, isNbs = true)
+                val author = when {
+                    nbs.author.isNotBlank() && nbs.originalAuthor.isNotBlank() && !nbs.author.equals(nbs.originalAuthor, ignoreCase = true) ->
+                        "${nbs.author} (orig: ${nbs.originalAuthor})"
+                    nbs.author.isNotBlank() -> nbs.author
+                    nbs.originalAuthor.isNotBlank() -> nbs.originalAuthor
+                    else -> null
+                }
+                val instruments = nbs.notes
+                    .mapNotNull { nbsInstrumentToBlock(it.instrument) }
+                    .distinct()
+                    .sortedBy { it.ordinal }
+
+                SongMetadata(
+                    durationSeconds = durationSecs,
+                    bpm = bpm,
+                    distinctNotes = distinct,
+                    isNbs = true,
+                    title = nbs.title.ifBlank { null },
+                    author = author,
+                    instruments = instruments
+                )
             }
             "mid", "midi" -> {
                 val midi = MidiFilePlayer.parse(file)
@@ -70,7 +97,20 @@ object SongMetadataCache {
                 val usPerBeat = midi.tempoMap.events.firstOrNull()?.usPerBeat ?: 500000
                 val bpm = (60_000_000.0 / usPerBeat.coerceAtLeast(1)).toInt()
                 val distinct = midi.distinctNotes.size
-                SongMetadata(durationSecs, bpm, distinct, isNbs = false)
+                val instruments = midi.events
+                    .map { it.instrument }
+                    .distinct()
+                    .sortedBy { it.ordinal }
+
+                SongMetadata(
+                    durationSeconds = durationSecs,
+                    bpm = bpm,
+                    distinctNotes = distinct,
+                    isNbs = false,
+                    title = midi.title,
+                    author = midi.author,
+                    instruments = instruments
+                )
             }
             else -> null
         }

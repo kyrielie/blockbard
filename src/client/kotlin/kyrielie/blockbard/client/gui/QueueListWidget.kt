@@ -1,13 +1,16 @@
 package kyrielie.blockbard.client.gui
 
 import kyrielie.blockbard.client.playback.SongMetadataCache
+import kyrielie.blockbard.client.util.InstrumentItemHelper
 import kyrielie.blockbard.playback.QueueRow
 import kyrielie.blockbard.playback.QueueSource
+import kyrielie.blockbard.util.blockBelowHint
 import net.minecraft.client.Minecraft
 import net.minecraft.client.gui.GuiGraphicsExtractor
 import net.minecraft.client.gui.components.ObjectSelectionList
 import net.minecraft.client.input.MouseButtonEvent
 import net.minecraft.network.chat.Component
+import net.minecraft.world.level.block.state.properties.NoteBlockInstrument
 import java.io.File
 
 /**
@@ -111,12 +114,6 @@ class QueueListWidget(
             val badgeColor = if (isNbs) opaque(0xFFCC44) else opaque(0x55FFFF)
             graphics.text(font, badge, x + 24, y + 3, badgeColor)
 
-            // Track name
-            val nameColor = if (hovered) opaque(0xFFFFFF) else opaque(0xDDDDDD)
-            val maxChars = ((w - 110) / 6).coerceIn(15, 65)
-            val name = file.nameWithoutExtension.take(maxChars)
-            graphics.text(font, name, x + 58, y + 3, nameColor)
-
             // Duration / Metadata on right
             val meta = SongMetadataCache.get(file)
             val durationText = meta?.durationSeconds?.let { s ->
@@ -127,10 +124,50 @@ class QueueListWidget(
 
             val durW = font.width(durationText)
             val rightOffset = if (isUserQueued) 70 else 30
-            graphics.text(font, durationText, x + w - durW - rightOffset, y + 3, opaque(0xAAAAAA))
+            val durX = x + w - durW - rightOffset
+            graphics.text(font, durationText, durX, y + 3, opaque(0xAAAAAA))
+
+            val instruments = meta?.instruments ?: emptyList()
+
+            // Instrument block previews
+            val iconsRight = durX - 6
+            val maxIconSpace = (iconsRight - (x + 180)).coerceAtLeast(0)
+            val maxVisibleIcons = (maxIconSpace / 18).coerceIn(0, 6)
+            val visibleInsts = instruments.take(maxVisibleIcons)
+            var hoveredInst: NoteBlockInstrument? = null
+
+            if (visibleInsts.isNotEmpty()) {
+                val totalIconsW = visibleInsts.size * 18
+                var iconX = iconsRight - totalIconsW
+                val iconY = y + 5
+                for (inst in visibleInsts) {
+                    val stack = InstrumentItemHelper.itemStackFor(inst)
+                    graphics.item(stack, iconX, iconY)
+                    if (mouseX >= iconX && mouseX < iconX + 16 && mouseY >= iconY && mouseY < iconY + 16) {
+                        hoveredInst = inst
+                        graphics.fill(iconX - 1, iconY - 1, iconX + 17, iconY, 0xFFFFFFFF.toInt())
+                        graphics.fill(iconX - 1, iconY + 16, iconX + 17, iconY + 17, 0xFFFFFFFF.toInt())
+                        graphics.fill(iconX - 1, iconY, iconX, iconY + 16, 0xFFFFFFFF.toInt())
+                        graphics.fill(iconX + 16, iconY, iconX + 17, iconY + 16, 0xFFFFFFFF.toInt())
+                    }
+                    iconX += 18
+                }
+                if (instruments.size > maxVisibleIcons) {
+                    val extra = "+${instruments.size - maxVisibleIcons}"
+                    graphics.text(font, extra, iconsRight + 1, y + 10, opaque(0x888888))
+                }
+            }
+
+            // Track name
+            val nameColor = if (hovered) opaque(0xFFFFFF) else opaque(0xDDDDDD)
+            val titleLimitX = if (visibleInsts.isNotEmpty()) iconsRight - (visibleInsts.size * 18) - 6 else durX - 6
+            val maxTitleW = (titleLimitX - (x + 58)).coerceAtLeast(40)
+            val maxChars = (maxTitleW / 6).coerceIn(12, 65)
+            val name = file.nameWithoutExtension.take(maxChars)
+            graphics.text(font, name, x + 58, y + 3, nameColor)
 
             val rowHovered = mouseY >= y + 2 && mouseY <= y + 12
-            var hint: String? = null
+            var hint: String? = if (hoveredInst != null) "${hoveredInst.name}: requires ${hoveredInst.blockBelowHint}" else null
             if (!isUserQueued) {
                 val promoteX = x + w - 22
                 val promoteHovered = rowHovered && mouseX >= promoteX - 2 && mouseX <= x + w

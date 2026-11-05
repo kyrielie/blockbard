@@ -288,11 +288,44 @@ object BlockBardCommands {
                     if (active.isEmpty()) {
                         ctx.source.sendFeedback(Component.literal("§b[BlockBard] §fNo noteblocks currently require manual tuning."))
                     } else {
-                        ctx.source.sendFeedback(Component.literal("§b[BlockBard] §e${active.size} block(s) highlighted for manual tuning:"))
+                        ctx.source.sendFeedback(Component.literal("§b[BlockBard] §e${active.size} block(s) highlighted for manual tuning (enabled=${kyrielie.blockbard.client.render.ManualTuningHighlighter.isEnabled}):"))
                         active.forEach { (pos, info) ->
                             val targetMidi = kyrielie.blockbard.util.noteIndexToMidi(info.instrument, info.targetNote)
                             val name = kyrielie.blockbard.util.midiNoteToName(targetMidi)
                             ctx.source.sendFeedback(Component.literal("  §7- §f${pos.x}, ${pos.y}, ${pos.z} §6(${info.instrument.name}) §f-> §e$name §c[${info.failState.tag}]"))
+                        }
+                    }
+                    1
+                }
+                .then(ClientCommands.literal("toggle").executes { ctx ->
+                    kyrielie.blockbard.client.render.ManualTuningHighlighter.isEnabled = !kyrielie.blockbard.client.render.ManualTuningHighlighter.isEnabled
+                    val on = kyrielie.blockbard.client.render.ManualTuningHighlighter.isEnabled
+                    ctx.source.sendFeedback(Component.literal("§b[BlockBard] §fManual tuning highlights ${if (on) "§aenabled" else "§cdisabled"}."))
+                    1
+                })
+                .then(ClientCommands.literal("clear").executes { ctx ->
+                    val count = kyrielie.blockbard.client.render.ManualTuningHighlighter.count()
+                    kyrielie.blockbard.client.render.ManualTuningHighlighter.clear()
+                    ctx.source.sendFeedback(Component.literal("§b[BlockBard] §fCleared $count manual tuning highlight(s)."))
+                    1
+                })
+            )
+
+            // /blockbard problems
+            root.then(ClientCommands.literal("problems")
+                .executes { ctx ->
+                    val problems = kyrielie.blockbard.client.organ.OrganProblemCollector.collect()
+                    if (problems.isEmpty()) {
+                        ctx.source.sendFeedback(Component.literal("§b[BlockBard] §aNo organ problems detected! All blocks are reachable and in tune."))
+                    } else {
+                        ctx.source.sendFeedback(Component.literal("§b[BlockBard] §eFound ${problems.size} organ problem(s):"))
+                        problems.forEach { p ->
+                            val prefix = when (p.severity) {
+                                kyrielie.blockbard.client.organ.ProblemSeverity.ERROR   -> "§c[ERROR]"
+                                kyrielie.blockbard.client.organ.ProblemSeverity.WARNING -> "§6[WARN]"
+                                kyrielie.blockbard.client.organ.ProblemSeverity.INFO    -> "§b[INFO]"
+                            }
+                            ctx.source.sendFeedback(Component.literal("  $prefix §f${p.title}: §7${p.details} §e(💡 ${p.suggestion})"))
                         }
                     }
                     1

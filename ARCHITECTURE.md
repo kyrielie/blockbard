@@ -48,9 +48,10 @@ src/
       BlockBardYaclConfig.kt    ← Yet Another Config Lib (YACL) GUI configuration screen
     gui/
       MainScreen.kt             ← primary tabbed GUI (Files, Queue, Organ, Logs, playback transport & controls)
-      QueueListWidget.kt        ← "up next" list: single click highlights, double-click plays now; Top, up, down and remove apply to user-queued rows, "+Q" copies a playlist row into the user queue
-      SongListWidget.kt         ← searchable song list widget with favorite stars and format badges
+      QueueListWidget.kt        ← "up next" list: single click highlights, double-click plays now; Top, up, down and remove apply to user-queued rows, "+Q" copies a playlist row into the user queue; displays required instrument block icons and author metadata
+      SongListWidget.kt         ← searchable song list widget with favorite stars, format badges, required instrument block icons, and author metadata
       LogListWidget.kt          ← in-GUI log entry viewer with search and copy-to-clipboard
+      OrganProblemsScreen.kt    ← dedicated organ problem inspector (untunable, occluded, out-of-reach, unplayable notes, suggestions, and highlight controls)
       VirtualKeyboardWidget.kt  ← interactive on-screen piano keyboard widget for live note triggering
       MaterialsShoppingOverlay.kt← survival materials item-stack HUD overlay (shows items needed/in inventory)
       PlaybackHud.kt            ← HUD overlay via HudElementRegistry (checks both MidiFilePlayer and NbsPlayer state)
@@ -66,6 +67,7 @@ src/
       OrganReadinessChecker.kt  ← coverage pre-flight check (MIDI requirements vs. NoteBlockRegistry)
     organ/
       OrganScanner.kt           ← client world scan (cube or spherical) → NoteBlockRegistry.update()
+      OrganProblemCollector.kt  ← aggregates manual tuning failures, occluded blocks, silenced blocks, unreachable blocks, and unplayable note material hints
     playback/
       MidiFilePlayer.kt         ← loads .mid via MidiChannelResolver, dynamic tempo tracking, timed dispatch
       MidiTempoMap.kt           ← dynamic tempo map for handling accelerandos/ritardandos
@@ -86,6 +88,7 @@ src/
       ManualTuningHighlighter.kt← in-world billboard highlighter over blocks that failed automated tuning
       OrganBlueprintBuilder.kt  ← in-world 3D ghost block hologram showing optimal layout for placing missing instruments
     util/
+      InstrumentItemHelper.kt   ← maps NoteBlockInstrument to corresponding block ItemStack for GUI previews
       TuningTraceFile.kt        ← JSON-lines tuning trace logging for diagnostic export
 
   main/kotlin/kyrielie/blockbard/

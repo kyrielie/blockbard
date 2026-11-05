@@ -148,6 +148,12 @@ object ArpeggioScheduler {
     var dynamicRetuneDelegate: ((BlockPos, NoteRequest) -> Boolean)? = null
     var dynamicRetuningEnabled: Boolean = false
 
+    /**
+     * Provider of the current song playback position in milliseconds (0..durationMs).
+     * Returns -1L if no song is active. When null, falls back to wall-clock time (for standalone tests).
+     */
+    var songTimeProvider: (() -> Long)? = null
+
     var onNoteDispatched: ((midiNote: Int, instrument: NoteBlockInstrument?) -> Unit)? = null
 
     /**
@@ -386,14 +392,15 @@ object ArpeggioScheduler {
         }
 
         // Rest-period lookahead dynamic retuning
-        if (queue.isEmpty() && dynamicRetuningEnabled && lookaheadRetunes.isNotEmpty()) {
+        val songTimeMs = songTimeProvider?.invoke() ?: now
+        if (queue.isEmpty() && dynamicRetuningEnabled && lookaheadRetunes.isNotEmpty() && songTimeMs >= 0L) {
             val task = lookaheadRetunes.first()
             val currentNote = NoteBlockRegistry.get(task.pos)?.noteIndex ?: task.startNoteIndex
             val needed = clicksNeeded(currentNote, task.targetNoteIndex)
 
-            if (needed <= 0 || now > task.deadlineMs) {
+            if (needed <= 0 || songTimeMs > task.deadlineMs) {
                 lookaheadRetunes.removeFirst()
-            } else if (now >= task.startMs && interactBudget >= 1f) {
+            } else if (songTimeMs >= task.startMs && interactBudget >= 1f) {
                 val converged = rotationConvergedDelegate?.invoke(task.pos) ?: true
                 if (converged) {
                     val retuneRequest = NoteRequest(
@@ -407,7 +414,7 @@ object ArpeggioScheduler {
                         interactBudget -= 1f
                         val newNote = (currentNote + 1) % 25
                         NoteBlockRegistry.updateTunedNote(task.pos, newNote)
-                        logger.debug("lookahead retune click on ${task.pos} (${task.instrument.name}): $currentNote -> $newNote (target ${task.targetNoteIndex})")
+                        logger.debug("lookahead retune click on ${task.pos} (${task.instrument.name}): $currentNote -> $newNote (target ${task.targetNoteIndex}) at songTime=${songTimeMs}ms")
                         if (newNote == task.targetNoteIndex) {
                             lookaheadRetunes.removeFirst()
                         }
@@ -433,9 +440,11 @@ object ArpeggioScheduler {
             return@synchronized pos
         }
         if (dynamicRetuningEnabled && lookaheadRetunes.isNotEmpty()) {
-            val now = System.currentTimeMillis()
-            val nextRetune = lookaheadRetunes.firstOrNull()?.takeIf { now >= it.startMs && now <= it.deadlineMs }
-            if (nextRetune != null) return@synchronized nextRetune.pos
+            val songTimeMs = songTimeProvider?.invoke() ?: System.currentTimeMillis()
+            if (songTimeMs >= 0L) {
+                val nextRetune = lookaheadRetunes.firstOrNull()?.takeIf { songTimeMs >= it.startMs && songTimeMs <= it.deadlineMs }
+                if (nextRetune != null) return@synchronized nextRetune.pos
+            }
         }
         null
     }

@@ -29,7 +29,9 @@ data class LoadedMidi(
      * and later assigned separately rather than collapsed into one pitch bucket.
      */
     val noteUsageCounts: Map<NotePitch, Int>,
-    val tempoMap: MidiTempoMap = MidiTempoMap.build(emptyList(), ticksPerBeat)
+    val tempoMap: MidiTempoMap = MidiTempoMap.build(emptyList(), ticksPerBeat),
+    val title: String? = null,
+    val author: String? = null
 )
 
 /** Duration of the sequence in milliseconds at 1x tempo. */
@@ -101,21 +103,52 @@ object MidiFilePlayer {
         val sequence = MidiSystem.getSequence(file)
         var tempoUs = 500000  // default 120 BPM
         val tempoChanges = mutableListOf<Pair<Long, Int>>()
+        var midiTitle: String? = null
+        var midiAuthor: String? = null
 
         // Tempo (MetaMessage 0x51) is not a channel-voice message, so MidiChannelResolver
         // (which only collects ShortMessages) doesn't see it — read it directly here.
+        // Also extract sequence name (0x03), copyright (0x02), and text/credits (0x01).
         sequence.tracks.forEach { track ->
             for (i in 0 until track.size()) {
                 val event = track.get(i)
                 val msg = event.message
-                if (msg is MetaMessage && msg.type == 0x51) {
-                    val d = msg.data
-                    if (d.size >= 3) {
-                        val us = ((d[0].toInt() and 0xFF) shl 16) or
-                                ((d[1].toInt() and 0xFF) shl 8) or
-                                (d[2].toInt() and 0xFF)
-                        tempoUs = us
-                        tempoChanges.add(event.tick to us)
+                if (msg is MetaMessage) {
+                    when (msg.type) {
+                        0x51 -> {
+                            val d = msg.data
+                            if (d.size >= 3) {
+                                val us = ((d[0].toInt() and 0xFF) shl 16) or
+                                        ((d[1].toInt() and 0xFF) shl 8) or
+                                        (d[2].toInt() and 0xFF)
+                                tempoUs = us
+                                tempoChanges.add(event.tick to us)
+                            }
+                        }
+                        0x01 -> { // Text event
+                            if (midiAuthor == null) {
+                                val text = parseMetaString(msg.data)
+                                if (text.isNotBlank() && isLikelyAuthor(text)) {
+                                    midiAuthor = cleanAuthorString(text)
+                                }
+                            }
+                        }
+                        0x02 -> { // Copyright notice
+                            if (midiAuthor == null) {
+                                val text = parseMetaString(msg.data)
+                                if (text.isNotBlank()) {
+                                    midiAuthor = cleanAuthorString(text)
+                                }
+                            }
+                        }
+                        0x03 -> { // Sequence / track name
+                            if (midiTitle == null) {
+                                val text = parseMetaString(msg.data)
+                                if (text.isNotBlank() && !text.startsWith("Track", ignoreCase = true)) {
+                                    midiTitle = text
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -151,9 +184,31 @@ object MidiFilePlayer {
             events = sortedEvents,
             distinctNotes = sortedEvents.map { it.midiNote }.toSet(),
             noteUsageCounts = usageCounts,
-            tempoMap = tempoMap
+            tempoMap = tempoMap,
+            title = midiTitle,
+            author = midiAuthor
         )
     }
+
+    private fun parseMetaString(data: ByteArray): String =
+        try {
+            val s = String(data, Charsets.UTF_8).trim()
+            if (s.any { it.isLetterOrDigit() }) s else String(data, Charsets.ISO_8859_1).trim()
+        } catch (_: Exception) {
+            String(data, Charsets.ISO_8859_1).trim()
+        }
+
+    private fun isLikelyAuthor(text: String): Boolean {
+        val lower = text.lowercase()
+        return lower.contains("by ") || lower.contains("author") || lower.contains("composer") ||
+               lower.contains("arrang") || lower.contains("sequenc") || lower.contains("transcrib") ||
+               lower.contains("credit")
+    }
+
+    private fun cleanAuthorString(text: String): String =
+        text.removePrefix("©").removePrefix("(c)").removePrefix("(C)")
+            .replace(Regex("(?i)^(by|author|composer|sequenced by|arranged by|transcribed by)[:\\s]+"), "")
+            .trim()
 
     fun load(file: File): LoadedMidi {
         val midi = parse(file)

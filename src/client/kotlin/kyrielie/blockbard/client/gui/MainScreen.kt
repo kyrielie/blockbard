@@ -212,6 +212,7 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
     private var organScanMessage: String = "Press Scan to detect noteblocks"
     private var readinessMessage: String = ""
     private var scanTicker = 0
+    private var problemsBtn: Button? = null
 
     // ── Scale playback ─────────────────────────────────────────────────────────
     private var scaleNotes: List<NoteBlockEntry> = emptyList()
@@ -455,6 +456,16 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
             btn.message = Component.literal(if (on) "Stage: ON" else "Stage: OFF")
             chat("Stage blueprint guide ${if (on) "enabled" else "disabled"}")
         }.pos(438, organBtnY).size(58, 16).build()))
+
+        val probBtnX = if (width >= 575) 498 else (width - 80).coerceAtLeast(10)
+        val probBtnY = if (width >= 575) organBtnY else 46
+        val problemCount = kyrielie.blockbard.client.organ.OrganProblemCollector.count()
+        val probLabel = if (problemCount > 0) "Problems ($problemCount)" else "Problems"
+        val pBtn = Button.builder(Component.literal(probLabel)) {
+            minecraft.gui.setScreen(OrganProblemsScreen(this))
+        }.pos(probBtnX, probBtnY).size(if (problemCount > 0) 76 else 62, 16).build()
+        problemsBtn = pBtn
+        tab2(addRenderableWidget(pBtn))
 
         // Virtual Piano Keyboard Widget
         val kbW = (width - 20).coerceAtMost(480)
@@ -1223,6 +1234,14 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
         }
 
         // The tuner itself is ticked by PlaybackCoordinator from END_CLIENT_TICK.
+
+        problemsBtn?.let { btn ->
+            val count = kyrielie.blockbard.client.organ.OrganProblemCollector.count()
+            val label = if (count > 0) "Problems ($count)" else "Problems"
+            if (btn.message.string != label) {
+                btn.message = Component.literal(label)
+            }
+        }
 
         if (::playPauseBtn.isInitialized) {
             val isPlaying = (MidiFilePlayer.isActive() && !MidiFilePlayer.isPaused) || (NbsPlayer.isPlaying && !NbsPlayer.isPaused)

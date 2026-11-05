@@ -105,7 +105,7 @@ graph TD
 | **P21** | `aim-sweeping` | Sort tune targets by angular proximity (yaw sweep) to reduce player head whipping | **DONE** | `AimOrderingTest` & `TuningController` aim integration |
 | **P22** | `cross-timbre-0click` | Optional cross-instrument matching at 0 clicks for identical pitches | **OPTIONAL** | Configurable toggle |
 | **P23** | `reach-overlay` | Hologram working vs non-working checks, out-of-reach crimson tint, silenced obstruction check, standPos cuboid and drift detection, 1.0f alpha visibility fix | **DONE** | Tested & verified in `OrganOverlayRenderer.kt` |
-| **P24** | `show-problems` | "Show Problems" screen inspector; toggle for `ManualTuningHighlighter` | **PLANNED** | UI inspection |
+| **P24** | `show-problems` | "Show Problems" screen inspector; toggle for `ManualTuningHighlighter`; `/bb problems` command | **DONE** | Tested & verified in `OrganProblemsScreen.kt` & `OrganProblemCollector.kt` |
 | **P25–P28** | `dynamic-retuning` | Song-relative `PlaybackClock` retune tasks, ghost-note cap via `dynamicRetuningMaxClicks`, YACL sync | **PLANNED** | Allocation & clock tests |
 | **P29** | `polish-release` | Documentation updates, final code cleanup, release notes | **PLANNED** | Full test & build pass |
 
