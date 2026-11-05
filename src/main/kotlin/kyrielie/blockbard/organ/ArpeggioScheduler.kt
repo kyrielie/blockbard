@@ -71,6 +71,10 @@ object ArpeggioScheduler {
      * Allows polyphony and rapid note repetitions to alternate round-robin across physical blocks.
      */
     var voicePools: Map<NotePitch, List<BlockPos>> = emptyMap()
+        set(value) = synchronized(lock) {
+            field = value
+            voiceIndices.clear()
+        }
 
     private val voiceIndices = mutableMapOf<NotePitch, Int>()
 
@@ -213,7 +217,7 @@ object ArpeggioScheduler {
         val exactPitch = NotePitch(effectiveMidi, request.instrument)
         val exactPool = voicePools[exactPitch]
         if (!exactPool.isNullOrEmpty()) {
-            val idx = voiceIndices.getOrDefault(exactPitch, 0)
+            val idx = voiceIndices.getOrDefault(exactPitch, 0) % exactPool.size
             voiceIndices[exactPitch] = (idx + 1) % exactPool.size
             return TargetResolution(exactPool[idx])
         }
@@ -221,7 +225,7 @@ object ArpeggioScheduler {
         val agnosticPitch = NotePitch(effectiveMidi, null)
         val agnosticPool = voicePools[agnosticPitch]
         if (!agnosticPool.isNullOrEmpty()) {
-            val idx = voiceIndices.getOrDefault(agnosticPitch, 0)
+            val idx = voiceIndices.getOrDefault(agnosticPitch, 0) % agnosticPool.size
             voiceIndices[agnosticPitch] = (idx + 1) % agnosticPool.size
             return TargetResolution(agnosticPool[idx])
         }

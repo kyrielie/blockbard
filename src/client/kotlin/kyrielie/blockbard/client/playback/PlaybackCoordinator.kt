@@ -6,15 +6,12 @@ import org.slf4j.LoggerFactory
 import java.io.File
 
 /**
- * What the coordinator needs from whatever can load, tune and start a song. Today that is the
- * most recent [kyrielie.blockbard.client.gui.MainScreen] instance, which stays registered after
- * the screen closes (the tuner lifecycle moves out of the screen in the next pass, after which
- * the coordinator will not need a host for this).
+ * What the coordinator and [TuningController] need from whatever can load a song and start
+ * playback. Today that is the most recent [kyrielie.blockbard.client.gui.MainScreen] instance,
+ * which stays registered after the screen closes. The tuner run itself no longer lives in the
+ * screen; only loading a song and starting playback still do.
  */
 interface PlaybackHost {
-    /** True while a tuner run is in progress. */
-    val isTuning: Boolean
-
     /** Library file for a song id; a placeholder path when the file is gone. */
     fun fileForId(id: SongId): File
 
@@ -27,8 +24,11 @@ interface PlaybackHost {
     /** Auto-advance to the same song (Repeat ONE): already loaded and tuned, just play again. */
     fun replayCurrent()
 
-    /** Cancel any tuner run and the tune-then-play chain that depends on it. */
-    fun abortTuning()
+    /** Start playback of the loaded song (the organ is tuned, or nothing needed tuning). */
+    fun startPlayback()
+
+    /** A tuner run finished successfully; refresh whatever the host shows about the organ. */
+    fun onTuningComplete()
 
     /** The queue changed; refresh any cached display. */
     fun onQueueChanged()
@@ -70,10 +70,11 @@ object PlaybackCoordinator {
         NbsPlayer.onFinished = ended
     }
 
-    fun isTuning(): Boolean = host?.isTuning == true
+    fun isTuning(): Boolean = TuningController.isActive
 
     /** Client thread, every tick. */
     fun tick() {
+        TuningController.tick()
         if (songEnded) {
             songEnded = false
             handleSongEnded()
@@ -87,7 +88,7 @@ object PlaybackCoordinator {
             return
         }
         // Wait for a tune-then-play chain and for the previous song to be fully idle.
-        if (h.isTuning || MidiFilePlayer.isActive() || NbsPlayer.isPlaying) return
+        if (TuningController.isActive || MidiFilePlayer.isActive() || NbsPlayer.isPlaying) return
 
         advanceArmed = false
         val next = advanceFile
@@ -149,7 +150,7 @@ object PlaybackCoordinator {
     /** Stop button and `/bb stop`: stop everything and forget what was about to start. */
     fun stop() {
         cancelAdvance()
-        host?.abortTuning()
+        TuningController.abort()
         MidiFilePlayer.stop()
         NbsPlayer.stop()
         queue.stop()

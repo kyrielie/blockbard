@@ -119,7 +119,7 @@ object ManualTuningHighlighter {
             if (liveNote == info.targetNote) continue
 
             val box = AABB(pos)
-            CuboidGizmo(box, boxStyle, false).emit(primitives, 0f)
+            CuboidGizmo(box, boxStyle, false).emit(primitives, 1.0f)
 
             val needed = if (liveNote != null) clicksNeeded(liveNote, info.targetNote) else 0
             val targetMidi = noteIndexToMidi(info.instrument, info.targetNote)
@@ -128,7 +128,7 @@ object ManualTuningHighlighter {
 
             val label = "Tune to $targetName (+$needed clicks) [${info.failState.tag}]"
             val textStyle = TextGizmo.Style.forColorAndCentered(0xFFFFFF33.toInt()).withScale(1.0f)
-            TextGizmo(textCenter, label, textStyle).emit(primitives, 0f)
+            TextGizmo(textCenter, label, textStyle).emit(primitives, 1.0f)
         }
 
         // alwaysOnTop = true allows seeing the occluded noteblock through intervening walls

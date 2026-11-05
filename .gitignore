@@ -113,9 +113,13 @@ replay_*.log
 repomix-output.xml
 *.repomix.xml
 
-# logs
+# logs & crashlogs
 logs/
 *.log
+crashlogs/
+**/crashlogs/
+crash-reports/
+**/crash-reports/
 
 # archives / zips (don't commit binary archives)
 *.zip
@@ -123,7 +127,9 @@ logs/
 *.tar
 *.7z
 
-# Local development references and private docs
+# Local development references, plans, and private docs
+plans/
+*.plan.md
 LOCAL_DEV_REFERENCES.md
 *.local.md
 BLOCKBARD_PLAN.md

@@ -80,7 +80,7 @@ object BlockBardCommands {
 
             // /blockbard center
             root.then(ClientCommands.literal("center").executes { ctx ->
-                val msg = if (kyrielie.blockbard.client.gui.MainScreen.isTuningActive()) {
+                val msg = if (kyrielie.blockbard.client.playback.PlaybackCoordinator.isTuning()) {
                     "§cCannot re-center while tuning."
                 } else {
                     when (val res = PlayerController.centerOnOrgan()) {

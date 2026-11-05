@@ -72,6 +72,7 @@ src/
       PlaybackClock.kt          ← tempo-continuous wall-clock mapping shared by MidiFilePlayer and NbsPlayer
       ClientPlayQueue.kt        ← the one live PlayQueue (outlives MainScreen), applyConfig(), and songIdOf(File)
       PlaybackCoordinator.kt    ← song-end and auto-advance decisions, ticked from END_CLIENT_TICK (works with the GUI closed); PlaybackHost interface
+      TuningController.kt       ← owns the tuner run, the organ assignment and the tune-then-play chain; ticked by PlaybackCoordinator
       NbsFileLoader.kt          ← .nbs binary parser AND NbsPlayer; tick getters and live tempoMultiplier parity
       SongMetadataCache.kt      ← async duration, tempo, and track summary metadata caching
       SongAudioPreviewer.kt     ← client-side local sound auditioning without placing blocks or packets
@@ -80,6 +81,10 @@ src/
       ProtocolMovementGuard.kt  ← 26.2+ protocol guard enforcing single position packet per tick; safe look-only downgrading
       SoundVerifier.kt          ← zero-mixin playback verification via Minecraft SoundEventListener; logs hits/misses/timeouts
       KickDiagnostics.kt        ← disconnect postmortem via ClientPlayConnectionEvents.DISCONNECT; correlates disconnect screen reason
+    render/
+      OrganOverlayRenderer.kt   ← in-world augmented reality hologram over all organ noteblocks around the player (working vs non-working checks: silenced, out-of-reach, occluded/untunable, in-tune, needs-tuning, spare; organ center standPos cuboid)
+      ManualTuningHighlighter.kt← in-world billboard highlighter over blocks that failed automated tuning
+      OrganBlueprintBuilder.kt  ← in-world 3D ghost block hologram showing optimal layout for placing missing instruments
     util/
       TuningTraceFile.kt        ← JSON-lines tuning trace logging for diagnostic export
 
@@ -145,7 +150,7 @@ NoteBlockRegistry        (singleton, Map<BlockPos, NoteBlockEntry>)
       │         ▼
       │   NoteBlockTuner (TUNING → VERIFYING → DONE/FAILED state machine; calls PlayerController.interactWith per right-click)
       │
-      └── ArpeggioScheduler.assignment = result.assignment   ← wired by MainScreen.startTuning()
+      └── ArpeggioScheduler.assignment = result.assignment   ← wired by TuningController.assign()
                 │  consulted at playback time by ArpeggioScheduler.resolvePos()
                 │  fallback chain: resolvedPos → assignment[exact NotePitch] → assignment[pitch-only NotePitch] → NoteBlockRegistry.findBestFor() live lookup
                 ▼
@@ -471,7 +476,7 @@ reports completion).
 
 Rotation ownership: `BlockBardClient`'s `START_CLIENT_TICK` handler primes playback rotation
 from `ArpeggioScheduler.peekNextPos()` only while no tuner is active
-(`MainScreen.activeTuner?.isActive`). While a tuner runs it is the sole writer of
+(`TuningController.isActive`). While a tuner runs it is the sole writer of
 `PlayerController.primedRotation`. `/bb play` does not check for an active tuner, so notes
 queued meanwhile may be delayed by the rotation gate (unverified); the gate in the GUI paths
 already prevents this case.
@@ -562,18 +567,33 @@ Additions beyond the plan's API sketch: `stop()`, `startFromUpcoming`, `contextO
 ### `PlaybackCoordinator` (`client/playback/PlaybackCoordinator.kt`)
 
 Decides what happens when a song ends, whether or not the GUI is open. It is installed once at client init (`install()` wires the playback-thread
-callbacks) and ticked from `END_CLIENT_TICK` in `BlockBardClient`, right after `MainScreen.onClientTick`.
+callbacks) and ticked from `END_CLIENT_TICK` in `BlockBardClient`. Its tick first ticks `TuningController`.
 
 - **Thread rule:** `MidiFilePlayer.onFinished` and `NbsPlayer.onFinished` (playback thread) only set `songEnded`. `tick()` (client thread) consumes it and is the only
   place the `PlayQueue` is asked what follows a finished song.
 - **Song end:** `handleSongEnded()` asks `queue.onSongFinished()` (skipping up to 5 files that no longer exist, then going idle) and arms an advance. The armed advance waits
   until no tuner is active and both players are idle, then calls the host: `beginAdvance(file)` (select, retune, then play) for a different song, or `replayCurrent()`
   for the same song again (Repeat ONE or a one-song playlist), which needs no retune.
-- **Host:** the work of loading, tuning and playing still lives in `MainScreen`, which implements `PlaybackHost` and registers itself in `init()`.
-  The registration is kept after the screen closes, so auto-advance works with the GUI closed (the same way the companion `onClientTick` already finishes a tune-then-play
-  with the screen closed). Until a screen has been opened once in a session there is no host: a song that ends then simply goes idle. The tuner lifecycle and the
-  screen-owned load state move out of `MainScreen` in the next pass, after which the host dependency goes away.
-- **`pendingAutoPlay`** in `MainScreen` now means only "start playback when the current tuner run finishes" (the tune-then-play chain). It is no longer used to arm an advance.
+- **Host:** loading a song and starting playback still live in `MainScreen`, which implements `PlaybackHost` (`fileForId`, `startQueuedSong`, `beginAdvance`, `replayCurrent`,
+  `startPlayback`, `onTuningComplete`, `onQueueChanged`) and registers itself in `init()`. The registration is kept after the screen closes, so auto-advance works with the GUI closed.
+  Until a screen has been opened once in a session there is no host: a song that ends then simply goes idle. The tuner run no longer needs the host except to start playback
+  and refresh the organ info afterwards.
+
+### `TuningController` (`client/playback/TuningController.kt`)
+
+Owns the tuner run so it behaves the same with the GUI open or closed. Client thread only.
+
+- **State:** `tuner`, `isActive`, `assignment` (the organ assignment for the song last tuned for or played), `statusMsg`, `error`, `coverageMessage`, and the private play-after-tune flag.
+  The screen reads these; it holds no tuner, assignment or auto-play state of its own.
+- **`start(source, thenPlay)`:** `MainScreen.startTuning` decides the `Source` (`Song(label, noteUsageCounts)` for the loaded MIDI or NBS, or `Chromatic`) and calls this. It does the
+  refusals (creative or spectator mode, hotbar and offhand, no Center, nothing in reach), assignment, target ordering, trace file and tuner construction. The play-after-tune flag is set
+  only when a run actually starts (a refused start no longer leaves it armed).
+- **`tick()`** (from `PlaybackCoordinator.tick`): ticks the tuner. On success it rescans, calls `host.onTuningComplete()` and, if requested, `host.startPlayback()`. On failure it records
+  `error`, warns in chat and drops the play-after-tune request.
+- **`abort()`:** cancels the run and the play-after-tune request (called by `PlaybackCoordinator.stop()`); it does not clear `error`, the Stop button does via `clearError()`.
+- **`assign(noteUsageCounts, reachable)`:** the shared assignment step used by tuning and by `startPlayback` when no assignment exists yet; also builds the coverage message
+  (`formatCoverageMessage` in `util/CoverageMessage.kt`, pure and unit-tested).
+- Tuner ticking moved from the screen's `tick()` and the companion `MainScreen.onClientTick` to END_CLIENT_TICK for both cases. Chat feedback without a screen goes through `client/util/Notifier.kt`.
 - **Stop** (Stop button and `/bb stop`) calls `PlaybackCoordinator.stop()`: cancels a pending advance, aborts any tuner run (so `/bb stop` now really stops tuning, as its message says), stops both players
   and clears now-playing.
 - **`/bb play`** calls `beginExternalPlay(file)` first. It refuses while a tuner is running (starting playback mid-tune would fight the tuner for rotation and block interactions), and otherwise registers the song with the queue
@@ -598,8 +618,8 @@ callbacks) and ticked from `END_CLIENT_TICK` in `BlockBardClient`, right after `
 6. `ClientTickEvents.START_CLIENT_TICK` — primes rotation toward the next pending note
    (`ArpeggioScheduler.peekNextPos()?.let { PlayerController.primeRotation(it) }`)
 7. `PlaybackCoordinator.install()` — wires the playback-thread song-end callbacks
-   `ClientTickEvents.END_CLIENT_TICK` — polls the GUI/HUD keybindings, ticks the closed-screen tuner (`MainScreen.onClientTick`),
-   `PlaybackCoordinator.tick()` (song end and auto-advance), then `ArpeggioScheduler.onTick()` (the actual dispatch-gated-on-convergence step)
+   `ClientTickEvents.END_CLIENT_TICK` — polls the GUI/HUD keybindings,
+   `PlaybackCoordinator.tick()` (ticks `TuningController`, then song end and auto-advance), then `ArpeggioScheduler.onTick()` (the actual dispatch-gated-on-convergence step)
 8. `MidiInputHandler.autoConnect()` — logs the input devices Java can see, then attempts to open the saved `midiDeviceName`
    (no-op with an INFO line when unset; set it with `/bb midi connect <name>`). `MidiInputHandler.tickRetry()` runs from
    `END_CLIENT_TICK` and retries a saved-but-unconnected device every 10 s. Its receiver

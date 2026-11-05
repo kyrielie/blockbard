@@ -6,6 +6,7 @@ import kyrielie.blockbard.client.gui.PlaybackHud
 import kyrielie.blockbard.client.input.KeyboardInputHandler
 import kyrielie.blockbard.client.input.MidiInputHandler
 import kyrielie.blockbard.client.playback.ClientPlayQueue
+import kyrielie.blockbard.client.playback.TuningController
 import kyrielie.blockbard.client.playback.PlaybackCoordinator
 import kyrielie.blockbard.client.player.KickDiagnostics
 import kyrielie.blockbard.client.player.MAX_ROTATION_DEGREES_PER_TICK
@@ -104,11 +105,11 @@ object BlockBardClient : ClientModInitializer {
         // Prime rotation in START_CLIENT_TICK -- fires before LocalPlayer.tick() calls
         // sendPosition(), so each tick's eased rotation step is included in that tick's
         // movement packet. Drives playback rotation only. Tuning primes its own rotation
-        // through MainScreen's primeRotation lambda (isTuning = true); both write the single
+        // through TuningController's primeRotation lambda (isTuning = true); both write the single
         // PlayerController.primedRotation field, so while a tuner is active it owns rotation
         // and this handler stays out of the way.
         ClientTickEvents.START_CLIENT_TICK.register { _ ->
-            if (MainScreen.activeTuner?.isActive == true) return@register
+            if (TuningController.isActive) return@register
             ArpeggioScheduler.peekNextPos()?.let { PlayerController.primeRotation(it) }
         }
 
@@ -147,8 +148,7 @@ object BlockBardClient : ClientModInitializer {
                 logger.info("O pressed -- Organ overlay visible=$on")
             }
             MidiInputHandler.tickRetry()
-            MainScreen.onClientTick(mc)
-            // Song end and auto-advance, with or without the GUI open.
+            // Tuner run, song end and auto-advance, with or without the GUI open.
             PlaybackCoordinator.tick()
             ArpeggioScheduler.onTick()
             kyrielie.blockbard.client.player.ProtocolMovementGuard.onClientTickEnd()

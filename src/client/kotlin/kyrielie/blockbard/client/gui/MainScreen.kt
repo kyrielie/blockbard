@@ -9,6 +9,7 @@ import kyrielie.blockbard.client.playback.NbsFileLoader
 import kyrielie.blockbard.client.playback.NbsPlayer
 import kyrielie.blockbard.client.playback.SongAudioPreviewer
 import kyrielie.blockbard.client.playback.ClientPlayQueue
+import kyrielie.blockbard.client.playback.TuningController
 import kyrielie.blockbard.client.playback.PlaybackCoordinator
 import kyrielie.blockbard.client.playback.PlaybackHost
 import kyrielie.blockbard.client.playback.songIdOf
@@ -26,7 +27,6 @@ import kyrielie.blockbard.playback.QueueRow
 import kyrielie.blockbard.playback.QueueSource
 import kyrielie.blockbard.playback.RepeatMode
 import kyrielie.blockbard.playback.SongId
-import kyrielie.blockbard.client.util.TuningTraceFile
 import kyrielie.blockbard.util.BlockBardLogBuffer
 import kyrielie.blockbard.util.DebugLog
 import kyrielie.blockbard.util.LogLevel
@@ -35,7 +35,6 @@ import kyrielie.blockbard.util.clicksNeeded
 import kyrielie.blockbard.util.isPitched
 import kyrielie.blockbard.util.midiBase
 import kyrielie.blockbard.util.midiNoteToName
-import kyrielie.blockbard.util.orderByAngularProximity
 import net.fabricmc.loader.api.FabricLoader
 import net.minecraft.client.gui.GuiGraphicsExtractor
 import net.minecraft.client.gui.components.AbstractWidget
@@ -156,21 +155,14 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
     private var selectedIndex: Int = -1
 
     // ── Tuning ─────────────────────────────────────────────────────────────────
-    private var tuner: NoteBlockTuner? = null
-    private var assignment: OrganAssignment? = null
-    private var tuneStatusMsg: String = ""
-    private var tuningError: String? = null
+    // The tuner run, the organ assignment and the tune-then-play chain live in TuningController.
     private var loadedNbs: NbsFile? = null
 
-    // ── Loop / auto-advance (Tier 4) ───────────────────────────────────────────
-    // What comes after a song ends is decided by PlaybackCoordinator (client thread). Here,
-    // pendingAutoPlay only means "when the current tuner run finishes, start playback"
-    // (the tune-then-play chain). Only written from the client thread.
-    @Volatile private var pendingAutoPlay: Boolean = false
+    // What comes after a song ends is decided by PlaybackCoordinator, and the tune-then-play
+    // chain by TuningController; the screen holds no auto-advance state.
 
     // ── Status messages ────────────────────────────────────────────────────────
     private var organScanMessage: String = "Press Scan to detect noteblocks"
-    private var coverageMessage: String = ""
     private var readinessMessage: String = ""
     private var scanTicker = 0
 
@@ -362,7 +354,7 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
 
         tab2(addRenderableWidget(Button.builder(Component.literal("Center")) {
             logger.info("Center clicked")
-            if (isTuningActive()) {
+            if (TuningController.isActive) {
                 // Re-centering rebuilds the organ map and may move the player mid-tune.
                 chat("Cannot re-center while tuning; wait for it to finish or cancel it.")
             } else {
@@ -465,8 +457,7 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
         jb(addRenderableWidget(Button.builder(Component.literal("⏹")) {
             PlaybackCoordinator.stop()
             stopScale()
-            pendingAutoPlay = false
-            tuningError = null
+            TuningController.clearError()
             updateQueueDisplay()
             chat("Stopped")
         }.tooltip(Tooltip.create(Component.literal("Stop playback, clear queue schedule, and reset to 0:00"))).pos(jbX + 102, row1Y).size(28, 16).build()))
@@ -794,9 +785,6 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
 
     // ── PlaybackHost ───────────────────────────────────────────────────────────
 
-    override val isTuning: Boolean
-        get() = tuner?.isActive == true || activeTuner?.isActive == true
-
     override fun beginAdvance(file: File) {
         selectFile(file)
         // NoteBlockTuner skips blocks already at their target note, so for songs sharing most
@@ -816,255 +804,34 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
         updateQueueDisplay()
     }
 
+    override fun onTuningComplete() {
+        organScanMessage = "Tuning complete! Press Play."
+        updateOrganInfo()
+    }
+
     // ── Tuning ─────────────────────────────────────────────────────────────────
 
+    /**
+     * Works out what to tune for (the loaded song, or the chromatic scale) and hands the run to
+     * [TuningController], which owns the tuner, the assignment and the play-after-tune chain.
+     */
     private fun startTuning(forceChromatic: Boolean = false, thenPlay: Boolean = false) {
-        SongAudioPreviewer.stopPreview()
-        val mc = minecraft
-        val player = mc.player ?: run { chatWarn("No player"); return }
-
-        val gameMode = mc.gameMode?.playerMode
-        if (gameMode == GameType.CREATIVE || gameMode == GameType.SPECTATOR) {
-            chatWarn("Cannot tune in ${gameMode.getName()} mode")
-            return
-        }
-
-        // Auto-select empty hotbar slot if main hand is holding an item
-        if (!player.mainHandItem.isEmpty) {
-            val emptySlot = (0..8).firstOrNull { player.inventory.getItem(it).isEmpty }
-            if (emptySlot != null) {
-                player.inventory.selectedSlot = emptySlot
-                player.connection.send(net.minecraft.network.protocol.game.ServerboundSetCarriedItemPacket(emptySlot))
-                logger.info("startTuning: switched to empty hotbar slot $emptySlot")
-            } else {
-                chatWarn("Hotbar has no empty slots -- clear a slot before tuning")
-                return
-            }
-        }
-        if (!player.offhandItem.isEmpty) {
-            chatWarn("Empty your offhand before tuning")
-            return
-        }
-
-        val map = PlayerController.organMap ?: run {
-            chatWarn("Run Center first!")
-            return
-        }
-
-        val reachable = NoteBlockRegistry.allPlayable().filter { map.isReachable(it.pos) }
-        if (reachable.isEmpty()) {
-            chatWarn("No reachable noteblocks -- run Scan then Center first")
-            return
-        }
-
-        fun assignAndReport(noteUsageCounts: Map<NotePitch, Int>): List<TuneTarget> {
-            val result = MidiToOrganMapper.buildAssignment(noteUsageCounts, reachable)
-            assignment = result
-            ArpeggioScheduler.assignment = result.assignment
-            ArpeggioScheduler.voicePools = result.voicePools
-            if (result.unplayable.isNotEmpty()) {
-                val names = result.unplayable.map { it.displayName() }
-                chatWarn("${names.size} notes unplayable: ${names.take(6).joinToString()}")
-            }
-            updateCoverageMessage(result)
-            val targets = MidiToOrganMapper.computeTuneTargets(result, reachable)
-            kyrielie.blockbard.client.render.OrganOverlayRenderer.activeTargets = targets.associate { it.pos to it.targetNote }
-            return targets
-        }
-
         val midi = if (forceChromatic) null else MidiFilePlayer.loadedMidi
         val nbs = if (forceChromatic) null else loadedNbs?.takeIf { it.file == selectedFile }
-        val targets: List<TuneTarget>
-
-        if (midi != null) {
-            logger.info("startTuning: MIDI mode -- ${reachable.size} reachable, ${midi.distinctNotes.size} distinct notes")
-            targets = assignAndReport(midi.noteUsageCounts)
-        } else if (nbs != null) {
-            val noteUsageCounts = nbs.notes
-                .mapNotNull { note ->
-                    val inst = nbsInstrumentToBlock(note.instrument) ?: return@mapNotNull null
-                    val midi = if (!inst.isPitched) inst.midiBase else inst.midiBase + (note.key - 33)
-                    NotePitch(midi, inst)
-                }
-                .groupingBy { it }
-                .eachCount()
-            logger.info("startTuning: NBS mode -- ${reachable.size} reachable, ${noteUsageCounts.size} distinct pairs")
-            targets = assignAndReport(noteUsageCounts)
-        } else {
-            // Full Chromatic Scale Tuning (0..24 for each instrument in reach)
-            logger.info("startTuning: chromatic mode -- ${reachable.size} blocks across instruments")
-            chat("Tuning organ to chromatic scale (0..24 for each instrument)...")
-            val sorted = reachable.sortedBy { it.distanceFromPlayer }
-            targets = sorted.groupBy { it.instrument }.flatMap { (inst, blocksForInstrument) ->
-                val instTargets = mutableListOf<TuneTarget>()
-                val maxPitches = minOf(25, blocksForInstrument.size)
-                val pitchesToCover = (0 until maxPitches).toMutableSet()
-                val available = blocksForInstrument.toMutableList()
-
-                // Pass 1: Keep blocks that already match a pitch in 0..24 (0 clicks)
-                for (pitch in 0 until maxPitches) {
-                    val exact = available.filter { it.noteIndex == pitch }.minByOrNull { it.distanceFromPlayer }
-                    if (exact != null) {
-                        instTargets.add(TuneTarget(exact.pos, exact.noteIndex, pitch, inst))
-                        pitchesToCover.remove(pitch)
-                        available.remove(exact)
-                    }
-                }
-
-                // Pass 2: Assign missing pitches to available blocks needing the fewest clicks
-                for (pitch in pitchesToCover.sorted()) {
-                    val best = available.minWithOrNull(
-                        compareBy(
-                            { clicksNeeded(it.noteIndex, pitch) },
-                            { it.distanceFromPlayer }
-                        )
-                    )
-                    if (best != null) {
-                        instTargets.add(TuneTarget(best.pos, best.noteIndex, pitch, inst))
-                        available.remove(best)
-                    }
-                }
-
-                // Pass 3: Excess blocks beyond 25 keep their existing note (0 clicks, don't retune!)
-                for (excess in available) {
-                    instTargets.add(TuneTarget(excess.pos, excess.noteIndex, excess.noteIndex, inst))
-                }
-
-                instTargets
-            }
-            assignment = null
-            ArpeggioScheduler.assignment = emptyMap()
-            ArpeggioScheduler.voicePools = emptyMap()
-            coverageMessage = "Chromatic scale: ${targets.size} blocks"
+        val source = when {
+            midi != null -> TuningController.Source.Song("MIDI", midi.noteUsageCounts)
+            nbs != null -> TuningController.Source.Song("NBS", nbsNoteUsageCounts(nbs))
+            else -> TuningController.Source.Chromatic
         }
-
-        val totalClicks = targets.sumOf { it.estimatedClicks }
-        if (targets.isEmpty() || totalClicks == 0) {
-            chat("Organ is in tune!")
-            logger.info("startTuning: 0 clicks needed -- skipping tuner")
-            if (thenPlay) startPlayback()
-            return
-        }
-
-        chat("Tuning ${targets.size} blocks (~$totalClicks clicks)...")
-        logger.info("startTuning: ${targets.size} targets, $totalClicks clicks, thenPlay=$thenPlay")
-
-        // Visit blocks in angular order so the camera sweeps smoothly instead of jumping around.
-        val look = PlayerController.currentLookAngles()
-        val orderedTargets = if (look == null) targets else orderByAngularProximity(targets, look.first, look.second) {
-            PlayerController.aimAnglesFor(it.pos)
-        }
-
-        // Marks from earlier failed runs must not hide blocks that may simply have hit a transient
-        // problem; deterministic failures are marked again by this run.
-        NoteBlockRegistry.clearUntunable(orderedTargets.map { it.pos })
-
-        val clickIntervalTicks = ConfigManager.config.tuningClickIntervalTicks
-        TuningTraceFile.begin(
-            "tuning run: ${orderedTargets.size} targets, $totalClicks est. clicks, intervalTicks=$clickIntervalTicks, " +
-                "fastTuning=${ConfigManager.config.fastTuning}, rotateDuringTuning=${ConfigManager.config.rotateDuringTuning}, " +
-                "ping=${PlayerController.currentPingMs()}ms"
-        )
-        BlockBardLogBuffer.info("Tuner", "Per-click trace: ${TuningTraceFile.path}")
-
-        val newTuner = NoteBlockTuner(
-            targets           = orderedTargets,
-            worldNoteReader   = { pos ->
-                mc.level?.getBlockState(pos)?.let { state ->
-                    if (state.block == net.minecraft.world.level.block.Blocks.NOTE_BLOCK)
-                        state.getValue(net.minecraft.world.level.block.NoteBlock.NOTE)
-                    else null
-                }
-            },
-            interactBlock     = { pos -> PlayerController.interactWith(pos) },
-            pingMs            = { PlayerController.currentPingMs() },
-            fastTuning        = ConfigManager.config.fastTuning,
-            primeRotation     = { pos -> PlayerController.primeRotation(pos, isTuning = true) },
-            rotationConverged = { pos -> PlayerController.rotationConverged(pos, isTuning = true) },
-            diagnoseFailState = { pos, _, _ ->
-                PlayerController.diagnoseBlockInteractability(pos)
-            },
-            clickGapMs        = clickIntervalTicks * 50L,
-            fastClickGapMs    = maxOf(1, clickIntervalTicks / 2) * 50L,
-            onTrace           = { line -> TuningTraceFile.write(line) },
-            onBlockUntunable  = { target, failState ->
-                NoteBlockRegistry.markUntunable(target.pos, failState)
-            },
-            onBlockFailed     = { target, failState, _, _ ->
-                kyrielie.blockbard.client.render.ManualTuningHighlighter.add(
-                    target.pos,
-                    target.instrument,
-                    target.targetNote,
-                    failState
-                )
-            },
-            onProgress        = { done, total, msg ->
-                tuneStatusMsg = "$done/$total -- $msg"
-                logger.debug("tuner progress: $tuneStatusMsg")
-            }
-        )
-        tuner = newTuner
-        activeTuner = newTuner
-        currentScreen = this
-
-        pendingAutoPlay = thenPlay
-
-        newTuner.start()
+        TuningController.start(source, thenPlay)
     }
 
-    override fun abortTuning() {
-        if (tuner?.isActive == true || activeTuner?.isActive == true) {
-            chat("Tuning cancelled")
-            logger.info("abortTuning: tuner cancelled")
-        }
-        tuner = null
-        activeTuner = null
-        pendingAutoPlay = false
-        tuneStatusMsg = ""
-        kyrielie.blockbard.client.render.OrganOverlayRenderer.activeTargets = emptyMap()
-    }
-
-    private fun updateCoverageMessage(result: OrganAssignment) {
-        val covered = result.assignment.size
-        val total   = covered + result.unplayable.size
-
-        // Group unplayable notes by instrument and include block-below material hints.
-        // No .take(4) limit -- Tier 6a: full instrument list displayed across multiple
-        // lines via word-wrap in extractRenderState.
-        val byInstrument = result.unplayable
-            .filter { it.instrument != null }
-            .groupBy { it.instrument!! }
-            .mapValues { (_, notes) -> notes.map { it.midiNote }.distinct().size }
-        val anyInstrumentCount = result.unplayable.count { it.instrument == null }
-
-        val shiftedCount = result.shifts.count { it.value != 0 }
-
-        coverageMessage = buildString {
-            append("$covered/$total notes covered")
-            if (shiftedCount > 0) {
-                append(". ⚠ $shiftedCount note(s) octave-shifted")
-            }
-            if (byInstrument.isNotEmpty()) {
-                append(". Add: ")
-                append(byInstrument.entries.joinToString { (inst, count) ->
-                    "$count ${inst.name} (${inst.blockBelowHint})"
-                })
-            }
-            if (anyInstrumentCount > 0) {
-                append(". $anyInstrumentCount note(s) unplayable on any instrument")
-            }
-        }
-        if (shiftedCount > 0) {
-            val shiftDetails = result.shifts.filter { it.value != 0 }
-                .map { (note, shift) -> "${note.displayName()} (${if (shift > 0) "+$shift" else "$shift"} st)" }
-                .take(6).joinToString()
-            logger.warn("coverage: $shiftedCount notes octave-shifted due to organ pitch limits: $shiftDetails")
-            PlaybackHud.lastShiftMessage = "⚠ $shiftedCount notes octave-shifted ($shiftDetails)"
-        } else {
-            PlaybackHud.lastShiftMessage = ""
-        }
-        logger.info("coverage: $coverageMessage")
-    }
+    private fun nbsNoteUsageCounts(nbs: NbsFile): Map<NotePitch, Int> =
+        nbs.notes.mapNotNull { note ->
+            val inst = nbsInstrumentToBlock(note.instrument) ?: return@mapNotNull null
+            val midi = if (!inst.isPitched) inst.midiBase else inst.midiBase + (note.key - 33)
+            NotePitch(midi, inst)
+        }.groupingBy { it }.eachCount()
 
     // ── Scale playback ─────────────────────────────────────────────────────────
 
@@ -1126,7 +893,7 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
                 chatWarn("Select a song first")
                 return
             }
-        tuningError = null
+        TuningController.clearError()
         if (selectedFile != file) {
             selectFile(file, stopPlayback = true)
         }
@@ -1164,40 +931,32 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
         }
     }
 
-    private fun startPlayback() {
+    override fun startPlayback() {
         SongAudioPreviewer.stopPreview()
         val file = selectedFile ?: run { chatWarn("No file selected"); return }
         logger.info("startPlayback: ${file.name}")
 
         // Ensure organ assignment is computed so ArpeggioScheduler maps notes to blocks
-        if (assignment == null) {
+        if (TuningController.assignment == null) {
             val map = PlayerController.organMap
             val reachable = if (map != null) NoteBlockRegistry.allPlayable().filter { map.isReachable(it.pos) } else emptyList()
             if (reachable.isNotEmpty()) {
                 val noteUsageCounts: Map<NotePitch, Int> = if (file.extension.lowercase() == "nbs") {
                     val nbs = loadedNbs ?: try { NbsFileLoader.load(file).also { loadedNbs = it } } catch (e: Exception) { null }
-                    nbs?.notes?.mapNotNull { note ->
-                        val inst = nbsInstrumentToBlock(note.instrument) ?: return@mapNotNull null
-                        val midi = if (!inst.isPitched) inst.midiBase else inst.midiBase + (note.key - 33)
-                        NotePitch(midi, inst)
-                    }?.groupingBy { it }?.eachCount() ?: emptyMap()
+                    nbs?.let { nbsNoteUsageCounts(it) } ?: emptyMap()
                 } else {
                     val midi = MidiFilePlayer.loadedMidi ?: try { MidiFilePlayer.load(file) } catch (e: Exception) { null }
                     midi?.noteUsageCounts ?: emptyMap()
                 }
                 if (noteUsageCounts.isNotEmpty()) {
-                    val result = MidiToOrganMapper.buildAssignment(noteUsageCounts, reachable)
-                    assignment = result
-                    ArpeggioScheduler.assignment = result.assignment
-                    ArpeggioScheduler.voicePools = result.voicePools
-                    updateCoverageMessage(result)
+                    TuningController.assign(noteUsageCounts, reachable)
                 }
             }
         }
 
         // Tier 6d: warn about missing coverage so the player knows to expect silent notes,
         // but do not block -- they chose to play, let them.
-        val unplayableCount = assignment?.unplayable?.size ?: 0
+        val unplayableCount = TuningController.assignment?.unplayable?.size ?: 0
         if (unplayableCount > 0) {
             chatWarn("$unplayableCount notes will be silent -- organ incomplete (see Files tab)")
         }
@@ -1270,7 +1029,7 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
             NbsPlayer.stop()
         }
         readinessMessage = ""
-        coverageMessage = ""
+        TuningController.coverageMessage = ""
         var loadFailed = false
 
         if (file.extension.lowercase() in listOf("mid", "midi")) {
@@ -1382,7 +1141,7 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
         super.tick()
 
         // Auto-rescan -- skipped during active playback or tuning
-        val playbackOrTuningActive = MidiFilePlayer.isActive() || NbsPlayer.isPlaying || tuner?.isActive == true
+        val playbackOrTuningActive = MidiFilePlayer.isActive() || NbsPlayer.isPlaying || TuningController.isActive
         scanTicker++
         if (scanTicker >= 20 * ConfigManager.config.autoRescanIntervalSeconds) {
             scanTicker = 0
@@ -1392,39 +1151,7 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
             }
         }
 
-        // Tuner tick
-        val t = tuner
-        if (t != null) {
-            t.onTick()
-
-            if (t.isDone) {
-                tuner = null
-                activeTuner = null
-                tuneStatusMsg = ""
-                tuningError = null
-                organScanMessage = "Tuning complete! Press Play."
-                chat("Tuning complete!")
-                logger.info("tick: tuning complete, pendingAutoPlay=$pendingAutoPlay")
-                OrganScanner.scan()
-                updateOrganInfo()
-
-                // Tier 4: if startTuning() was called via selectiveRetuneAndPlay chain,
-                // start playback now that tuning is verified.
-                if (pendingAutoPlay) {
-                    pendingAutoPlay = false
-                    startPlayback()
-                }
-            } else if (t.isFailed) {
-                val reason = t.failureReason ?: "Verification failed after retries"
-                tuningError = reason
-                tuner = null
-                activeTuner = null
-                tuneStatusMsg = ""
-                pendingAutoPlay = false
-                chatWarn("Tuning: $reason. Highlighted in world for manual tuning.")
-                logger.warn("tick: tuning finished with manual tuning required: $reason")
-            }
-        }
+        // The tuner itself is ticked by PlaybackCoordinator from END_CLIENT_TICK.
 
         if (::playPauseBtn.isInitialized) {
             val isPlaying = (MidiFilePlayer.isActive() && !MidiFilePlayer.isPaused) || (NbsPlayer.isPlaying && !NbsPlayer.isPaused)
@@ -1535,7 +1262,7 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
         val isPlaying = (MidiFilePlayer.isActive() && !MidiFilePlayer.isPaused) || (NbsPlayer.isPlaying && !NbsPlayer.isPaused)
         val isPaused = MidiFilePlayer.isPaused || NbsPlayer.isPaused
         val isPreview = SongAudioPreviewer.isPlaying
-        val isTuning = tuner?.isActive == true
+        val isTuning = TuningController.isActive
 
         // Spinning vinyl record animation
         val discFrames = listOf("◐", "◓", "◑", "◒")
@@ -1547,7 +1274,7 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
         // Status badge
         val (statusText, statusBg) = when {
             isTuning            -> Pair("TUNING", 0xFFAA00)
-            tuningError != null -> Pair("FAILED", 0xFF5555)
+            TuningController.error != null -> Pair("FAILED", 0xFF5555)
             isPlaying           -> Pair("PLAYING", 0x55FF77)
             isPaused            -> Pair("PAUSED", 0xFFFF55)
             isPreview           -> Pair("PREVIEW", 0x55FFFF)
@@ -1662,14 +1389,9 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
         val bottomY = if (vk != null) vk.y + vk.height + 8 else height - 42
         graphics.text(font, "Play via mouse click, MIDI device, or PC keyboard (QWERTY layout). Greyed out notes are missing.", 10, bottomY, opaque(0xAAAAAA))
 
-        val t = tuner
-        if (t != null && bottomY + 12 < height - 24) {
-            val stateLabel = when (t.state) {
-                TunerState.TUNING    -> "Tuning..."
-                TunerState.VERIFYING -> "Verifying..."
-                else                 -> ""
-            }
-            graphics.text(font, "$stateLabel ${t.confirmedBlocks}/${t.total} $tuneStatusMsg", 10, bottomY + 12, opaque(0x44FF88))
+        val progress = TuningController.progressLine()
+        if (progress != null && bottomY + 12 < height - 24) {
+            graphics.text(font, progress, 10, bottomY + 12, opaque(0x44FF88))
         }
 
         // Bottom status
@@ -1677,7 +1399,7 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
             MidiFilePlayer.isActive() && !MidiFilePlayer.isPaused -> "PLAYING ${selectedFile?.name ?: ""}"
             NbsPlayer.isPlaying && !NbsPlayer.isPaused            -> "PLAYING ${selectedFile?.name ?: ""}"
             MidiFilePlayer.isPaused || NbsPlayer.isPaused         -> "PAUSED"
-            tuner?.isActive == true                               -> "TUNING"
+            TuningController.isActive                             -> "TUNING"
             else                                                  -> "IDLE"
         }
         graphics.text(font, status, 10, height - 20, opaque(0xAAFFAA))
@@ -1942,36 +1664,5 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
 
         /** Most rows read from the queue for display; counts are taken from the full queue. */
         private const val QUEUE_DISPLAY_LIMIT = 500
-
-        var activeTuner: NoteBlockTuner? = null
-
-        /** True while a tuner run is in progress (used to block actions that would disturb it). */
-        fun isTuningActive(): Boolean = activeTuner?.isActive == true
-        var currentScreen: MainScreen? = null
-
-        fun onClientTick(mc: net.minecraft.client.Minecraft) {
-            val t = activeTuner ?: return
-            // If MainScreen is not currently open, continue ticking the tuner
-            if (mc.gui.screen() !is MainScreen) {
-                t.onTick()
-                if (t.isDone) {
-                    activeTuner = null
-                    mc.player?.sendSystemMessage(Component.literal("§b[BlockBard] §fTuning complete!"))
-                    OrganScanner.scan()
-                    currentScreen?.let { screen ->
-                        if (screen.pendingAutoPlay) {
-                            screen.pendingAutoPlay = false
-                            screen.startPlayback()
-                        }
-                    }
-                } else if (t.isFailed) {
-                    activeTuner = null
-                    currentScreen?.let {
-                        it.pendingAutoPlay = false
-                    }
-                    mc.player?.sendSystemMessage(Component.literal("§b[BlockBard] §cTuning failed -- check logs for details"))
-                }
-            }
-        }
     }
 }

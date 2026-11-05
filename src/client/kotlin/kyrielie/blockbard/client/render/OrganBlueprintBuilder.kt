@@ -198,11 +198,11 @@ object OrganBlueprintBuilder {
             if (renderedCount++ > maxRender) break
 
             val box = AABB(node.pos)
-            CuboidGizmo(box, ghostStyle, false).emit(primitives, 0f)
+            CuboidGizmo(box, ghostStyle, false).emit(primitives, 1.0f)
 
             val textCenter = Vec3(node.pos.x + 0.5, node.pos.y + 1.15, node.pos.z + 0.5)
             val label = "§b${node.instrument.name}\n§eBase: ${node.instrument.blockBelowHint}"
-            TextGizmo(textCenter, label, textStyle).emit(primitives, 0f)
+            TextGizmo(textCenter, label, textStyle).emit(primitives, 1.0f)
         }
 
         primitives.submit(collector, camera, false)
