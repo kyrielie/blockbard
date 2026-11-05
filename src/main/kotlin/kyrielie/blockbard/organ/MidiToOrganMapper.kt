@@ -41,104 +41,64 @@ object MidiToOrganMapper {
 
     /**
      * @param noteUsageCounts how many times each (midiNote, instrument) pair occurs in
-     * the song -- used only to prioritize assignment order (most-used notes get first
-     * pick of blocks).
+     * the song -- used to weight assignment priority (prominent melody lines receive
+     * priority physical note blocks over infrequent background notes).
      */
     fun buildAssignment(
         noteUsageCounts: Map<NotePitch, Int>,
         reachableBlocks: List<NoteBlockEntry>
     ): OrganAssignment {
-        val assignment = mutableMapOf<NotePitch, BlockPos>()
-        val unplayable = mutableListOf<NotePitch>()
-        val shifts = mutableMapOf<NotePitch, Int>()
-        val usedPositions = mutableSetOf<BlockPos>()
-
         val sortedNotes = noteUsageCounts.entries.sortedByDescending { it.value }.map { it.key }
         logger.info("buildAssignment: ${sortedNotes.size} distinct notes, ${reachableBlocks.size} reachable blocks")
 
-        // Pass 1: Exact matches (0 clicks needed).
-        // If an available reachable block is ALREADY tuned to the exact pitch needed for a note,
-        // assign it immediately. This preserves the organ's existing tuning and prevents
-        // unnecessary retuning across songs (minimal tuning like DiscJockey).
-        val unassignedNotes = mutableListOf<NotePitch>()
-        for (note in sortedNotes) {
-            val midiNote = note.midiNote
-            val available = reachableBlocks.filter { it.pos !in usedPositions }
-            val instrumentFiltered = if (note.instrument != null) {
-                available.filter { it.instrument == note.instrument }
-            } else {
-                available
-            }
-
-            val exactMatch = instrumentFiltered
-                .filter { it.instrument.coversNatively(midiNote) && it.noteIndex == (midiNote - it.instrument.midiBase) }
-                .minByOrNull { it.distanceFromPlayer }
-
-            if (exactMatch != null) {
-                assignment[note] = exactMatch.pos
-                usedPositions.add(exactMatch.pos)
-                shifts[note] = 0
-                logger.debug("  ${note.displayName()} -> ${exactMatch.pos} (${exactMatch.instrument.name}, exact 0-click match)")
-            } else {
-                unassignedNotes.add(note)
-            }
+        if (noteUsageCounts.isEmpty()) {
+            return OrganAssignment(emptyMap(), emptyList(), emptyMap())
+        }
+        if (reachableBlocks.isEmpty()) {
+            return OrganAssignment(emptyMap(), sortedNotes, emptyMap())
         }
 
-        // Pass 2: Minimal-click assignment for notes that didn't have an exact match.
-        // For each remaining note, find the available block that requires the fewest clicks,
-        // prioritizing:
-        // 1. Same authored instrument (natively covering the note, 0 semitone shift)
-        // 2. Instrument shift (different instrument natively covering the exact MIDI note, 0 shift)
-        // 3. Octave shift fallback (transposed by ±12 or ±24 semitones)
-        for (note in unassignedNotes) {
-            val midiNote = note.midiNote
-            val available = reachableBlocks.filter { it.pos !in usedPositions }
+        val noteSpecs = sortedNotes.map { pitch ->
+            OrganAssignmentSolver.NoteSpec(
+                key = pitch,
+                midiNote = pitch.midiNote,
+                instrumentName = pitch.instrument?.name,
+                weight = noteUsageCounts[pitch] ?: 1
+            )
+        }
 
-            // 1. Prefer native coverage on the authored instrument if available
-            // Prioritize blocks that are tunable from the standing spot over known untunable/occluded blocks
-            val nativeCandidate = if (note.instrument != null) {
-                available
-                    .filter { it.instrument == note.instrument && it.instrument.coversNatively(midiNote) }
-                    .minWithOrNull(
-                        compareBy(
-                            { NoteBlockRegistry.isUntunable(it.pos) },
-                            { clicksNeeded(it.noteIndex, midiNote - it.instrument.midiBase) },
-                            { it.distanceFromPlayer }
-                        )
-                    )
-            } else {
-                available
-                    .filter { it.instrument.coversNatively(midiNote) }
-                    .minWithOrNull(
-                        compareBy(
-                            { NoteBlockRegistry.isUntunable(it.pos) },
-                            { clicksNeeded(it.noteIndex, midiNote - it.instrument.midiBase) },
-                            { it.distanceFromPlayer }
-                        )
-                    )
-            }
+        val blockSpecs = reachableBlocks.map { entry ->
+            OrganAssignmentSolver.BlockSpec(
+                id = entry.pos,
+                instrumentName = entry.instrument.name,
+                midiBase = entry.instrument.midiBase,
+                currentNoteIndex = entry.noteIndex,
+                distanceFromPlayer = entry.distanceFromPlayer,
+                isUntunable = NoteBlockRegistry.isUntunable(entry.pos)
+            )
+        }
 
-            if (nativeCandidate != null) {
-                assignment[note] = nativeCandidate.pos
-                usedPositions.add(nativeCandidate.pos)
-                shifts[note] = 0
-                val clicks = clicksNeeded(nativeCandidate.noteIndex, midiNote - nativeCandidate.instrument.midiBase)
-                logger.debug("  ${note.displayName()} -> ${nativeCandidate.pos} (${nativeCandidate.instrument.name}, native, clicks=$clicks)")
-                continue
-            }
+        val solved = OrganAssignmentSolver.solve(
+            notes = noteSpecs,
+            blocks = blockSpecs,
+            shiftMode = InstrumentShifter.mode,
+            maxOctaveShift = InstrumentShifter.maxOctaveShift
+        )
 
-            // 2. Instrument Shift across ALL available instruments: find another instrument that
-            // natively covers this exact pitch with 0 octave shift!
-            val shiftResult = InstrumentShifter.findBest(midiNote, available)
-            if (shiftResult != null) {
-                assignment[note] = shiftResult.entry.pos
-                usedPositions.add(shiftResult.entry.pos)
-                shifts[note] = shiftResult.semitoneShift
-                logger.debug("  ${note.displayName()} -> ${shiftResult.entry.pos} (${shiftResult.entry.instrument.name}, shift=${shiftResult.semitoneShift})")
-                continue
-            }
+        val assignment = solved.matched.toMutableMap()
+        val unplayable = solved.unplayable.toMutableList()
+        val shifts = solved.shifts.toMutableMap()
+        val usedPositions = assignment.values.toMutableSet()
 
-            unplayable.add(note)
+        for ((note, pos) in assignment) {
+            val shift = shifts[note] ?: 0
+            val entry = reachableBlocks.firstOrNull { it.pos == pos }
+            val clicks = if (entry != null && entry.instrument.coversNatively(note.midiNote + shift)) {
+                clicksNeeded(entry.noteIndex, (note.midiNote + shift) - entry.instrument.midiBase)
+            } else 0
+            logger.debug("  ${note.displayName()} -> $pos (${entry?.instrument?.name ?: "?"}, shift=$shift, clicks=$clicks)")
+        }
+        for (note in unplayable) {
             logger.warn("  ${note.displayName()} UNPLAYABLE -- no suitable block found")
         }
 
@@ -152,10 +112,13 @@ object MidiToOrganMapper {
         val unassignedBlocks = reachableBlocks.filter { it.pos !in usedPositions }
         for (unused in unassignedBlocks) {
             val matchingNote = sortedNotes.firstOrNull { note ->
-                note.instrument == unused.instrument &&
+                val shift = shifts[note] ?: 0
+                val effectiveMidi = note.midiNote + shift
+                val noteInst = note.instrument
+                (noteInst == null || unused.instrument == noteInst) &&
                 assignment.containsKey(note) &&
-                unused.instrument.coversNatively(note.midiNote + (shifts[note] ?: 0)) &&
-                unused.noteIndex == (note.midiNote + (shifts[note] ?: 0) - unused.instrument.midiBase)
+                unused.instrument.coversNatively(effectiveMidi) &&
+                unused.noteIndex == (effectiveMidi - unused.instrument.midiBase)
             }
             if (matchingNote != null) {
                 voicePools.getOrPut(matchingNote) { mutableListOf() }.add(unused.pos)

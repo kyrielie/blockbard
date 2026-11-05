@@ -13,14 +13,14 @@ data class TuneTarget(
     val pos: BlockPos,
     val snapshotNote: Int,  // noteIndex at scan time -- used only for initial click estimate
     val targetNote: Int,    // 0-24, required noteIndex after tuning
-    val instrument: NoteBlockInstrument
+    val instrument: NoteBlockInstrument? = null
 ) {
     /** Estimated clicks from snapshot. Actual clicks are driven by live world reads. */
     val estimatedClicks: Int get() = clicksNeeded(snapshotNote, targetNote)
     val appearsAlreadyTuned: Boolean get() = snapshotNote == targetNote
 }
 
-enum class TunerState { IDLE, TUNING, VERIFYING, DONE, FAILED }
+enum class TunerState { IDLE, TUNING, VERIFYING, DONE, DONE_PARTIAL, FAILED }
 
 /**
  * Categorized failstates for noteblock tuning failures.
@@ -53,6 +53,8 @@ class NoteBlockTuner(
     private val worldNoteReader: (BlockPos) -> Int?,
     private val interactBlock: (BlockPos) -> Boolean,
     private val pingMs: () -> Int = { 0 },
+    private val reachDistance: () -> Double = { 4.5 },
+    private val isCreative: () -> Boolean = { false },
     private val maxRetries: Int = 3,
     private val primeRotation: ((BlockPos) -> Unit)? = null,
     private val rotationConverged: ((BlockPos) -> Boolean)? = null,
@@ -90,11 +92,35 @@ class NoteBlockTuner(
     private var confirmedCount: Int = 0
     private var alreadyTunedAtStart: Int = 0
     private var retryCount: Int = 0
+    private var totalClicksSent: Int = 0
+
+    var lastSummary: TunerSummary? = null
+        private set
 
     var pendingRotationPos: BlockPos? = null
         private set
 
     private fun timeoutMs(): Long = maxOf(MIN_TIMEOUT_MS, pingMs() * 2L + 250L)
+
+    private fun logRunSummary(now: Long) {
+        val elapsedSeconds = if (startedAtMs > 0L) maxOf(0L, now - startedAtMs) / 1000.0 else 0.0
+        val failCounts = failedTargets.values.groupingBy { it }.eachCount()
+        val summary = TunerSummary(
+            targets = total,
+            clicks = totalClicksSent,
+            retries = retryCount,
+            timeSeconds = elapsedSeconds,
+            pingMs = pingMs(),
+            reachDistance = reachDistance(),
+            isCreative = isCreative(),
+            failCounts = failCounts
+        )
+        lastSummary = summary
+        val line = summary.format()
+        logger.info(line)
+        BlockBardLogBuffer.info("Tuner", line)
+        onTrace?.invoke(line)
+    }
 
     fun start() {
         if (targets.isEmpty()) {
@@ -102,6 +128,7 @@ class NoteBlockTuner(
             BlockBardLogBuffer.info("Tuner", "No targets to tune -- completed.")
             state = TunerState.DONE
             onProgress(0, 0, "Nothing to tune.")
+            logRunSummary(clock())
             return
         }
 
@@ -132,8 +159,10 @@ class NoteBlockTuner(
             if (needed > 0) {
                 needClicks++
                 totalClicks += needed
-                val targetMidi = noteIndexToMidi(t.instrument, t.targetNote)
-                val msg = "${t.pos} (${t.instrument.name}) liveNote=$liveNote -> target=${t.targetNote} (${midiNoteToName(targetMidi)}) needs $needed clicks"
+                val targetMidi = t.instrument?.let { noteIndexToMidi(it, t.targetNote) }
+                val targetName = targetMidi?.let { midiNoteToName(it) } ?: "note=${t.targetNote}"
+                val instName = t.instrument?.name ?: "?"
+                val msg = "${t.pos} ($instName) liveNote=$liveNote -> target=${t.targetNote} ($targetName) needs $needed clicks"
                 logger.debug("Tuner: $msg")
                 BlockBardLogBuffer.debug("Tuner", msg)
             }
@@ -147,6 +176,7 @@ class NoteBlockTuner(
             state = TunerState.DONE
             confirmedCount = total
             onProgress(total, total, "Organ is already in tune!")
+            logRunSummary(now)
             return
         }
 
@@ -163,7 +193,7 @@ class NoteBlockTuner(
 
     fun onTick() {
         if (state == TunerState.IDLE) { start(); return }
-        if (state == TunerState.DONE || state == TunerState.FAILED) return
+        if (state == TunerState.DONE || state == TunerState.DONE_PARTIAL || state == TunerState.FAILED) return
 
         val now = clock()
         when (state) {
@@ -204,27 +234,50 @@ class NoteBlockTuner(
             if (!rotationConverged.invoke(key)) return
         }
 
-        if (interactBlock(key)) engine.onClickSent(key, now) else engine.onClickRejected(key, now)
+        if (interactBlock(key)) {
+            totalClicksSent++
+            engine.onClickSent(key, now)
+        } else {
+            engine.onClickRejected(key, now)
+        }
     }
 
-    /** All blocks are DONE or FAILED: confirm late arrivals, then verify or fail. */
+    /** All blocks are DONE or FAILED in the engine: confirm late arrivals, then verify working blocks or fail. */
     private fun finishTuning(now: Long) {
         // A block the engine gave up on may still have been applied late; trust the live note.
         engine.failedKeys.forEach { pos ->
             if (worldNoteReader(pos) == targetByPos.getValue(pos).targetNote) engine.markDone(pos)
         }
-        val stillFailed = engine.failedKeys
-        if (stillFailed.isNotEmpty()) {
-            failTuning(stillFailed)
+        val failedKeys = engine.failedKeys
+        for (pos in failedKeys) {
+            val target = targetByPos.getValue(pos)
+            val worldNote = worldNoteReader(pos)
+            val failState = classify(target, worldNote, engine.evidence(pos))
+            failedTargets[target] = failState
+            onBlockFailed?.invoke(target, failState, worldNote, target.targetNote)
+            if (TuningFailPolicy.marksUntunable(failState, engine.anyConfirmation)) {
+                onBlockUntunable?.invoke(target, failState)
+            }
+            logFailstateReport(target, worldNote, failState)
+        }
+
+        val workingTargets = targets.filter { it !in failedTargets.keys }
+        if (workingTargets.isEmpty()) {
+            failTuning(failedKeys)
             return
         }
+
         val pingWait = verifyWindowMs()
         verifyStartedAt = now
         state = TunerState.VERIFYING
-        val verifyMsg = "All blocks read in tune ($total blocks) -- confirming with server in ${pingWait}ms"
+        val verifyMsg = if (failedTargets.isEmpty()) {
+            "All blocks read in tune ($total blocks) -- confirming with server in ${pingWait}ms"
+        } else {
+            "${workingTargets.size}/$total blocks read in tune (${failedTargets.size} failed) -- confirming with server in ${pingWait}ms"
+        }
         logger.info("NoteBlockTuner: $verifyMsg")
         BlockBardLogBuffer.info("Tuner", verifyMsg)
-        onProgress(total, total, "Verifying with server...")
+        onProgress(workingTargets.size, total, "Verifying with server...")
     }
 
     private fun verifyWindowMs(): Long = maxOf(200L, pingMs() * 2L + 150L)
@@ -234,7 +287,8 @@ class NoteBlockTuner(
 
         val missing = mutableListOf<BlockPos>()
         val regressed = mutableListOf<Pair<BlockPos, Int>>()
-        for (t in targets) {
+        val workingTargets = targets.filter { it !in failedTargets.keys }
+        for (t in workingTargets) {
             val live = worldNoteReader(t.pos)
             when {
                 live == null -> missing.add(t.pos)
@@ -242,21 +296,64 @@ class NoteBlockTuner(
                 else -> regressed.add(t.pos to live)
             }
         }
-        confirmedCount = total - missing.size - regressed.size
+        confirmedCount = targets.count { worldNoteReader(it.pos) == it.targetNote }
 
         if (missing.isEmpty() && regressed.isEmpty()) {
-            state = TunerState.DONE
-            val skipped = alreadyTunedAtStart
-            val doneMsg = "Tuning complete! All $total blocks confirmed in tune ($skipped already correct, ${total - skipped} tuned)."
-            logger.info("NoteBlockTuner: $doneMsg")
-            BlockBardLogBuffer.info("Tuner", doneMsg)
-            onProgress(total, total, doneMsg)
+            if (failedTargets.isEmpty()) {
+                state = TunerState.DONE
+                val skipped = alreadyTunedAtStart
+                val doneMsg = "Tuning complete! All $total blocks confirmed in tune ($skipped already correct, ${total - skipped} tuned)."
+                logger.info("NoteBlockTuner: $doneMsg")
+                BlockBardLogBuffer.info("Tuner", doneMsg)
+                onProgress(total, total, doneMsg)
+            } else {
+                state = TunerState.DONE_PARTIAL
+                val doneMsg = "Tuning partially complete! $confirmedCount/$total blocks confirmed in tune, ${failedTargets.size} failed."
+                val failSummary = failedTargets.entries.groupBy { it.value }
+                    .map { (st, list) -> "${list.size} ${st.tag}" }.joinToString(", ")
+                failureReason = "$confirmedCount/$total tuned. ${failedTargets.size} block(s) require manual tuning ($failSummary)"
+                logger.warn("NoteBlockTuner: $doneMsg ($failSummary)")
+                BlockBardLogBuffer.warn("Tuner", doneMsg)
+                onProgress(confirmedCount, total, doneMsg)
+            }
+            logRunSummary(now)
             return
         }
 
         retryCount++
         if (missing.isNotEmpty() || retryCount > maxRetries) {
-            failTuning(missing + regressed.map { it.first })
+            val newlyFailed = missing + regressed.map { it.first }
+            for (pos in newlyFailed) {
+                val target = targetByPos.getValue(pos)
+                val worldNote = worldNoteReader(pos)
+                val failState = classify(target, worldNote, engine.evidence(pos))
+                failedTargets[target] = failState
+                onBlockFailed?.invoke(target, failState, worldNote, target.targetNote)
+                if (TuningFailPolicy.marksUntunable(failState, engine.anyConfirmation)) {
+                    onBlockUntunable?.invoke(target, failState)
+                }
+                logFailstateReport(target, worldNote, failState)
+            }
+
+            confirmedCount = targets.count { worldNoteReader(it.pos) == it.targetNote }
+            val failSummary = failedTargets.entries.groupBy { it.value }
+                .map { (st, list) -> "${list.size} ${st.tag}" }.joinToString(", ")
+            val failMsg = "$confirmedCount/$total tuned. ${failedTargets.size} block(s) require manual tuning ($failSummary)"
+            failureReason = failMsg
+
+            if (confirmedCount > 0) {
+                state = TunerState.DONE_PARTIAL
+                val partialMsg = "Tuning partially complete: $confirmedCount/$total blocks confirmed in tune. ${failedTargets.size} require manual tuning ($failSummary)"
+                logger.warn("NoteBlockTuner: $partialMsg")
+                BlockBardLogBuffer.warn("Tuner", partialMsg)
+                onProgress(confirmedCount, total, "Partial success: $confirmedCount/$total tuned")
+            } else {
+                state = TunerState.FAILED
+                logger.warn("NoteBlockTuner: Tuning stopped: $failMsg")
+                BlockBardLogBuffer.error("Tuner", "Tuning stopped: $failMsg")
+                onProgress(confirmedCount, total, "Requires manual tuning: $failSummary")
+            }
+            logRunSummary(clock())
             return
         }
 
@@ -273,10 +370,6 @@ class NoteBlockTuner(
     }
 
     private fun failTuning(positions: List<BlockPos>) {
-        state = TunerState.FAILED
-        failedTargets.clear()
-        pendingRotationPos = null
-
         for (pos in positions) {
             val target = targetByPos.getValue(pos)
             val worldNote = worldNoteReader(pos)
@@ -287,24 +380,41 @@ class NoteBlockTuner(
             if (TuningFailPolicy.marksUntunable(failState, engine.anyConfirmation)) {
                 onBlockUntunable?.invoke(target, failState)
             }
-
-            val targetName = midiNoteToName(noteIndexToMidi(target.instrument, target.targetNote))
-            val currentDesc = if (worldNote != null) "$worldNote (${midiNoteToName(noteIndexToMidi(target.instrument, worldNote))})" else "missing"
-            val ev = engine.evidence(pos)
-            val evidenceDesc = if (ev != null) " [clicks=${ev.clicksSent} confirmed=${ev.confirmations} timeouts=${ev.timeouts} rejects=${ev.rejects}]" else ""
-            val report = "[${failState.tag}] $pos (${target.instrument.name}) current=$currentDesc -> target=$targetName: ${failState.description}$evidenceDesc"
-            logger.warn("NoteBlockTuner failstate: $report")
-            BlockBardLogBuffer.error("Tuner", report)
+            logFailstateReport(target, worldNote, failState)
         }
 
         confirmedCount = targets.count { worldNoteReader(it.pos) == it.targetNote }
+        pendingRotationPos = null
+
         val failSummary = failedTargets.entries.groupBy { it.value }
             .map { (st, list) -> "${list.size} ${st.tag}" }.joinToString(", ")
-        val failMsg = "Tuning stopped: $confirmedCount/$total tuned. ${failedTargets.size} block(s) require manual tuning ($failSummary)"
+        val failMsg = "$confirmedCount/$total tuned. ${failedTargets.size} block(s) require manual tuning ($failSummary)"
         failureReason = failMsg
-        logger.warn("NoteBlockTuner: $failMsg")
-        BlockBardLogBuffer.error("Tuner", failMsg)
-        onProgress(confirmedCount, total, "Requires manual tuning: $failSummary")
+
+        if (confirmedCount > 0) {
+            state = TunerState.DONE_PARTIAL
+            val partialMsg = "Tuning partially complete: $confirmedCount/$total tuned. ${failedTargets.size} require manual tuning ($failSummary)"
+            logger.warn("NoteBlockTuner: $partialMsg")
+            BlockBardLogBuffer.warn("Tuner", partialMsg)
+            onProgress(confirmedCount, total, "Partial success: $confirmedCount/$total tuned")
+        } else {
+            state = TunerState.FAILED
+            logger.warn("NoteBlockTuner: Tuning stopped: $failMsg")
+            BlockBardLogBuffer.error("Tuner", "Tuning stopped: $failMsg")
+            onProgress(confirmedCount, total, "Requires manual tuning: $failSummary")
+        }
+        logRunSummary(clock())
+    }
+
+    private fun logFailstateReport(target: TuneTarget, worldNote: Int?, failState: TuningFailState) {
+        val targetName = target.instrument?.let { midiNoteToName(noteIndexToMidi(it, target.targetNote)) } ?: "note=${target.targetNote}"
+        val currentDesc = if (worldNote != null) (target.instrument?.let { "$worldNote (${midiNoteToName(noteIndexToMidi(it, worldNote))})" } ?: "$worldNote") else "missing"
+        val instName = target.instrument?.name ?: "?"
+        val ev = engine.evidence(target.pos)
+        val evidenceDesc = if (ev != null) " [clicks=${ev.clicksSent} confirmed=${ev.confirmations} timeouts=${ev.timeouts} rejects=${ev.rejects}]" else ""
+        val report = "[${failState.tag}] ${target.pos} ($instName) current=$currentDesc -> target=$targetName: ${failState.description}$evidenceDesc"
+        logger.warn("NoteBlockTuner failstate: $report")
+        BlockBardLogBuffer.error("Tuner", report)
     }
 
     /**
@@ -330,7 +440,9 @@ class NoteBlockTuner(
     }
 
     val isDone: Boolean get() = state == TunerState.DONE
+    val isPartial: Boolean get() = state == TunerState.DONE_PARTIAL
     val isFailed: Boolean get() = state == TunerState.FAILED
+    val isSuccessful: Boolean get() = isDone || isPartial
     val isActive: Boolean get() = state == TunerState.TUNING || state == TunerState.VERIFYING
     val confirmedBlocks: Int get() = confirmedCount
 

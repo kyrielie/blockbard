@@ -78,6 +78,18 @@ object ArpeggioScheduler {
 
     private val voiceIndices = mutableMapOf<NotePitch, Int>()
 
+    /**
+     * Removes failed block positions from active assignment and voice pools so discordant notes
+     * are not played on blocks that failed to reach their target pitch.
+     */
+    fun unassign(failedPositions: Set<BlockPos>) = synchronized(lock) {
+        if (failedPositions.isEmpty()) return@synchronized
+        assignment = assignment.filterValues { it !in failedPositions }
+        voicePools = voicePools.mapValues { (_, pool) -> pool.filter { it !in failedPositions } }
+            .filterValues { it.isNotEmpty() }
+        voiceIndices.clear()
+    }
+
     /** Requests older than this are dropped to prevent note build-up after lag. */
     var staleTimeoutMs: Long = 200L
 

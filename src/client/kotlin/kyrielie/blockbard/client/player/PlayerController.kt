@@ -67,6 +67,18 @@ object PlayerController {
         return mc.connection?.getPlayerInfo(player.gameProfile.id)?.latency ?: 0
     }
 
+    /** Returns live player interaction range dynamically (e.g. 4.5 survival, 5.0 creative, or modified). */
+    fun currentReachDistance(): Double {
+        val player = Minecraft.getInstance().player ?: return REACH_DISTANCE
+        return player.blockInteractionRange()
+    }
+
+    /** True if the current player is in creative mode. */
+    fun isCreative(): Boolean {
+        val player = Minecraft.getInstance().player ?: return false
+        return player.isCreative
+    }
+
     fun logEnvironmentBanner(context: String) {
         val mc = Minecraft.getInstance()
         val brand = mc.player?.connection?.serverBrand()
@@ -151,7 +163,7 @@ object PlayerController {
                     val reachable = playableBlocks.count { entry ->
                         val target = Vec3(entry.pos.x + 0.5, entry.pos.y + 0.5, entry.pos.z + 0.5)
                         val dist = target.distanceTo(candEye)
-                        if (dist > (REACH_DISTANCE + 0.5)) false
+                        if (dist > (currentReachDistance() + 0.5)) false
                         else if (reachThrough) true
                         else {
                             val level = mc.level
@@ -239,7 +251,7 @@ object PlayerController {
             val target = Vec3(entry.pos.x + 0.5, entry.pos.y + 0.5, entry.pos.z + 0.5)
             val delta = target.subtract(actualEyePos)
             val distance = delta.length()
-            val withinDist = distance <= (REACH_DISTANCE + 0.5)
+            val withinDist = distance <= (currentReachDistance() + 0.5)
             val isReachable = if (!withinDist) {
                 false
             } else if (reachThrough) {
@@ -387,7 +399,7 @@ object PlayerController {
             }
         }
 
-        val maxReach = REACH_DISTANCE + 0.5
+        val maxReach = currentReachDistance() + 0.5
 
         // First attempt: direct ray towards the center of the block.
         // If clear, it hits the optimal front-facing face directly.
@@ -491,7 +503,7 @@ object PlayerController {
             return null
         }
 
-        val maxReach = REACH_DISTANCE + 0.5
+        val maxReach = currentReachDistance() + 0.5
 
         // Multi-face visible raycasting inspired by Mineflayer (ray_trace & digging)
         val (target, hitFace) = findBestVisibleFace(world, player, eyePos, pos) ?: run {
@@ -672,7 +684,7 @@ object PlayerController {
         val eyePos = player.eyePosition
         val target = Vec3(pos.x + 0.5, pos.y + 0.5, pos.z + 0.5)
         val dist = target.distanceTo(eyePos)
-        if (dist > (REACH_DISTANCE + 0.5)) {
+        if (dist > (currentReachDistance() + 0.5)) {
             return TuningFailState.OUT_OF_REACH
         }
 

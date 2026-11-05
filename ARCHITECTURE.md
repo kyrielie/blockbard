@@ -91,12 +91,14 @@ src/
   main/kotlin/kyrielie/blockbard/
     organ/
       ArpeggioScheduler.kt      ← token-bucket rate-limited tick queue (Paper 8/310ms limiter); per-note rotation convergence gating; multi-voice round robin; dynamic retuning delegate; dispatchHistory ring buffer
+      HungarianAlgorithm.kt     ← pure Kuhn-Munkres (Hungarian) O(n²m) algorithm for optimal bipartite min-cost matching
       InstrumentShifter.kt      ← ShiftMode resolution (EXACT_ONLY/INSTRUMENT_SHIFT/OCTAVE_SHIFT/BEST_EFFORT)
       MidiToOrganMapper.kt      ← (midiNote, instrument) → BlockPos assignment; defines NotePitch and multi-voice pools
       MobHeadBlocks.kt          ← MOB_HEAD_BLOCKS constant set
       NoteBlockEntry.kt         ← data class (pos, instrument, noteIndex, midiNote, status)
       NoteBlockRegistry.kt      ← singleton Map<BlockPos, NoteBlockEntry>
       NoteBlockTuner.kt         ← TuneTarget + tuning state machine (TUNING/VERIFYING/DONE/FAILED); delegates pacing to TuningEngine
+      OrganAssignmentSolver.kt  ← pure min-cost organ assignment solver weighting notes by song frequency
       TuningEngine.kt           ← pure closed-loop click pacing (confirmation, timeout/backoff, stall guard, evidence); no MC types
       OrganMap.kt               ← Map<BlockPos, ReachInfo> built by PlayerController.centerOnOrgan()
     playback/
@@ -134,10 +136,9 @@ OrganScanner.scan()
 NoteBlockRegistry        (singleton, Map<BlockPos, NoteBlockEntry>)
       │
       ├── queried by MidiToOrganMapper.buildAssignment(noteUsageCounts, reachableBlocks)
-      │         │  noteUsageCounts: Map<NotePitch, Int> — NotePitch(midiNote, instrument?)
-      │         │  native-match preferred by fewest tuning clicks (not just distance),
-      │         │  prunes excess blocks beyond 25 per instrument,
-      │         │  then InstrumentShifter for notes with no exact-instrument match
+      │         │  delegates to pure OrganAssignmentSolver (Kuhn-Munkres HungarianAlgorithm),
+      │         │  weighting missing notes by song frequency, minimizing total tuning clicks,
+      │         │  preferring native timbre over instrument shifts, and avoiding untunable blocks
       │         ▼
       │   OrganAssignment { assignment: Map<NotePitch, BlockPos>, unplayable: List<NotePitch>, shifts: Map<NotePitch, Int> }
       │         │

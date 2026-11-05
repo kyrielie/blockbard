@@ -190,6 +190,8 @@ object TuningController {
             },
             interactBlock     = { pos -> PlayerController.interactWith(pos) },
             pingMs            = { PlayerController.currentPingMs() },
+            reachDistance     = { PlayerController.currentReachDistance() },
+            isCreative        = { PlayerController.isCreative() },
             fastTuning        = ConfigManager.config.fastTuning,
             primeRotation     = { pos -> PlayerController.primeRotation(pos, isTuning = true) },
             rotationConverged = { pos -> PlayerController.rotationConverged(pos, isTuning = true) },
@@ -203,12 +205,15 @@ object TuningController {
                 NoteBlockRegistry.markUntunable(target.pos, failState)
             },
             onBlockFailed     = { target, failState, _, _ ->
-                ManualTuningHighlighter.add(
-                    target.pos,
-                    target.instrument,
-                    target.targetNote,
-                    failState
-                )
+                val inst = target.instrument ?: NoteBlockRegistry.get(target.pos)?.instrument
+                if (inst != null) {
+                    ManualTuningHighlighter.add(
+                        target.pos,
+                        inst,
+                        target.targetNote,
+                        failState
+                    )
+                }
             },
             onProgress        = { done, total, msg ->
                 statusMsg = "$done/$total -- $msg"
@@ -225,12 +230,26 @@ object TuningController {
         val t = tuner ?: return
         t.onTick()
 
-        if (t.isDone) {
+        if (t.isDone || t.isPartial) {
+            val partial = t.isPartial
+            val failedPos = t.failedTargets.keys.map { it.pos }.toSet()
+            if (partial && failedPos.isNotEmpty()) {
+                ArpeggioScheduler.unassign(failedPos)
+            }
+
+            val failedCount = t.failedTargets.size
             tuner = null
             statusMsg = ""
-            error = null
-            Notifier.info("Tuning complete!")
-            logger.info("tuning complete, playAfterTune=$playAfterTune")
+            error = if (partial) t.failureReason else null
+
+            if (partial) {
+                Notifier.warn("Tuned ${t.confirmedBlocks}/${t.total} blocks ($failedCount require manual tuning).")
+                logger.warn("tuning completed with partial success: ${t.confirmedBlocks}/${t.total} tuned, $failedCount failed")
+            } else {
+                Notifier.info("Tuning complete!")
+                logger.info("tuning complete, playAfterTune=$playAfterTune")
+            }
+
             OrganScanner.scan()
             val host = PlaybackCoordinator.host
             host?.onTuningComplete()
@@ -245,7 +264,7 @@ object TuningController {
             tuner = null
             statusMsg = ""
             playAfterTune = false
-            Notifier.warn("Tuning: $reason. Highlighted in world for manual tuning.")
+            Notifier.warn("Tuning failed: $reason. Highlighted in world for manual tuning.")
             logger.warn("tuning finished with manual tuning required: $reason")
         }
     }
