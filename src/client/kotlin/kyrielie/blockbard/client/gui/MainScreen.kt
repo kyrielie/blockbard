@@ -1,5 +1,6 @@
 package kyrielie.blockbard.client.gui
 
+import com.mojang.blaze3d.platform.InputConstants
 import kyrielie.blockbard.client.BlockBardClient
 import kyrielie.blockbard.client.config.BlockBardConfig
 import kyrielie.blockbard.client.config.ConfigManager
@@ -15,6 +16,7 @@ import kyrielie.blockbard.client.playback.PlaybackHost
 import kyrielie.blockbard.client.playback.songIdOf
 import kyrielie.blockbard.client.playback.nbsInstrumentToBlock
 import kyrielie.blockbard.client.input.KeyboardInputHandler
+import kyrielie.blockbard.client.library.MidiLibrary
 import kyrielie.blockbard.client.midi.OrganReadinessChecker
 import kyrielie.blockbard.organ.*
 import kyrielie.blockbard.client.organ.OrganScanner
@@ -116,38 +118,83 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
     private var queueContextRemaining: Int = 0
     private var nextUpTitle: String? = null
 
-    // ── File list ──────────────────────────────────────────────────────────────
-    private val midisDir: File by lazy {
-        FabricLoader.getInstance().configDir.resolve("blockbard/midis").toFile().also { dir ->
-            if (!dir.exists()) {
-                dir.mkdirs()
-                dir.resolve("README.txt").writeText(
-                    "Drop .mid or .nbs files here and click 'Refresh' in BlockBard."
-                )
-            }
-        }
-    }
+    // ── File list & Playlists ──────────────────────────────────────────────────
+    private val midisDir: File get() = MidiLibrary.root
 
     private var midiFiles: List<File> = emptyList()
     private var searchQuery: String = ""
     private var activeFilter: String = ConfigManager.config.activeFilter
+    private var selectedPlaylist: String = ConfigManager.config.selectedPlaylist
     private var isScrubbing: Boolean = false
     private var filterButtons: MutableMap<String, Button> = mutableMapOf()
+    private var playlistButton: Button? = null
+
+    private fun isShiftDown(): Boolean =
+        InputConstants.isKeyDown(InputConstants.KEY_LSHIFT) || InputConstants.isKeyDown(InputConstants.KEY_RSHIFT)
+
+    private fun updatePlaylistButton() {
+        val folder = selectedPlaylist
+        val displayName = if (folder.isEmpty()) "All" else folder
+        val truncated = if (displayName.length > 11) displayName.take(10) + "…" else displayName
+        playlistButton?.message = Component.literal("Playlist: $truncated")
+        playlistButton?.setTooltip(Tooltip.create(Component.literal("Playlist: $displayName\nClick to advance, Shift-click to retreat")))
+    }
+
+    private fun cyclePlaylist(reverse: Boolean) {
+        val list = MidiLibrary.playlists
+        if (list.isEmpty()) return
+        val currentIndex = list.indexOf(selectedPlaylist).let { if (it < 0) 0 else it }
+        val nextIndex = if (reverse) {
+            (currentIndex - 1 + list.size) % list.size
+        } else {
+            (currentIndex + 1) % list.size
+        }
+        setPlaylist(list[nextIndex])
+    }
+
+    private fun setPlaylist(folder: String) {
+        selectedPlaylist = folder
+        ConfigManager.config.selectedPlaylist = folder
+        ConfigManager.save()
+        updatePlaylistButton()
+
+        val playlistSongs = MidiLibrary.songsInPlaylist(folder)
+        queue.setContext(playlistSongs.map { it.id })
+
+        if (selectedFile == null || (selectedFile !in playlistSongs.map { it.file })) {
+            selectedFile = playlistSongs.firstOrNull()?.file
+        }
+
+        if (::songListWidget.isInitialized) {
+            songListWidget.setFiles(displayedFiles, selectedFile)
+        }
+        updateQueueDisplay()
+        val name = if (folder.isEmpty()) "All" else folder
+        chat("Playlist: $name (${playlistSongs.size} tracks)")
+    }
 
     private val displayedFiles: List<File>
         get() {
-            var list = midiFiles
+            var list = if (selectedPlaylist.isEmpty()) {
+                midiFiles
+            } else {
+                val prefix = "$selectedPlaylist/"
+                midiFiles.filter { MidiLibrary.idForFile(it).startsWith(prefix) }
+            }
             list = when (activeFilter) {
-                "FAV" -> list.filter { ConfigManager.config.isFavorite(it.name) }
+                "FAV" -> list.filter { ConfigManager.config.isFavorite(MidiLibrary.idForFile(it)) }
                 "MID" -> list.filter { it.extension.lowercase() in listOf("mid", "midi") }
                 "NBS" -> list.filter { it.extension.lowercase() == "nbs" }
                 else  -> list
             }
             if (searchQuery.isNotBlank()) {
-                list = list.filter { it.name.contains(searchQuery, ignoreCase = true) }
+                list = list.filter {
+                    it.name.contains(searchQuery, ignoreCase = true) ||
+                    MidiLibrary.idForFile(it).contains(searchQuery, ignoreCase = true)
+                }
             }
             return list.sortedWith(
-                compareByDescending<File> { ConfigManager.config.isFavorite(it.name) }
+                compareByDescending<File> { ConfigManager.config.isFavorite(MidiLibrary.idForFile(it)) }
                     .thenBy { it.name.lowercase() }
             )
         }
@@ -221,7 +268,9 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
         // ── Tab 0: Files ──────────────────────────────────────────────────────
         fun <T : AbstractWidget> tab0(w: T): T { tabContent[0]!!.add(w); return w }
 
-        val searchBox = EditBox(font, 10, 26, width - 236, 16, Component.literal("Search"))
+        val pillY = 26
+        val searchW = (width - 396).coerceAtLeast(60)
+        val searchBox = EditBox(font, 10, pillY, searchW, 16, Component.literal("Search"))
         searchBox.setHint(Component.literal("Search tracks..."))
         searchBox.value = searchQuery
         searchBox.setResponder { text ->
@@ -232,12 +281,23 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
         }
         tab0(addRenderableWidget(searchBox))
 
+        val playlistBtn = tab0(addRenderableWidget(Button.builder(Component.literal("Playlist: All")) {
+            cyclePlaylist(isShiftDown())
+        }.tooltip(Tooltip.create(Component.literal("Playlist: All\nClick to advance, Shift-click to retreat")))
+            .pos(width - 380, pillY).size(102, 16).build()))
+        playlistButton = playlistBtn
+        updatePlaylistButton()
+
+        tab0(addRenderableWidget(Button.builder(Component.literal("Folder")) {
+            MidiLibrary.openFolder()
+        }.tooltip(Tooltip.create(Component.literal("Open the midis folder in your file manager")))
+            .pos(width - 274, pillY).size(62, 16).build()))
+
         tab0(addRenderableWidget(Button.builder(Component.literal("Queue view")) {
             queueView()
         }.tooltip(Tooltip.create(Component.literal("Add every song shown in the list (after filter and search) to the end of your queue")))
-            .pos(width - 222, 26).size(76, 16).build()))
+            .pos(width - 208, pillY).size(66, 16).build()))
 
-        val pillY = 26
         val allBtn = tab0(addRenderableWidget(Button.builder(Component.literal(if (activeFilter == "ALL") "[All]" else "All")) {
             setFilter("ALL")
         }.pos(width - 136, pillY).size(28, 16).build()))
@@ -274,7 +334,7 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
                 playSelectedSong()
             },
             onToggleFavorite = { file ->
-                ConfigManager.config.toggleFavorite(file.name)
+                ConfigManager.config.toggleFavorite(MidiLibrary.idForFile(file))
                 ConfigManager.save()
                 songListWidget.setFiles(displayedFiles, selectedFile)
             },
@@ -588,12 +648,17 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
     }
 
     private fun refreshFiles() {
-        midiFiles = (midisDir.listFiles { f ->
-            f.extension.lowercase() in listOf("mid", "midi", "nbs")
-        } ?: emptyArray()).toList().sortedBy { it.name }
-        // The context is the whole library, not the filtered view. refreshContext keeps the
-        // current song and the shuffle order when only some files changed.
-        queue.refreshContext(midiFiles.map(::songIdOf))
+        MidiLibrary.scan()
+        midiFiles = MidiLibrary.files
+
+        val validPlaylists = MidiLibrary.playlists
+        if (selectedPlaylist !in validPlaylists) {
+            selectedPlaylist = ""
+            ConfigManager.config.selectedPlaylist = ""
+        }
+
+        val playlistSongs = MidiLibrary.songsInPlaylist(selectedPlaylist)
+        queue.refreshContext(playlistSongs.map { it.id })
 
         // If a track is already playing or paused, preserve it as the active selection without stopping playback
         val activePlayingFile = MidiFilePlayer.loadedMidi?.file ?: loadedNbs?.file ?: NbsPlayer.currentNbs?.file
@@ -601,17 +666,22 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
 
         if (activePlayingFile != null && isPlaybackActive) {
             selectedFile = activePlayingFile
-            selectedIndex = midiFiles.indexOfFirst { it.name.equals(activePlayingFile.name, ignoreCase = true) }
+            val activeId = songIdOf(activePlayingFile)
+            selectedIndex = midiFiles.indexOfFirst { songIdOf(it) == activeId }
         } else if (selectedFile == null && midiFiles.isNotEmpty()) {
             val last = ConfigManager.config.lastPlayedTrack
-            val match = midiFiles.firstOrNull { it.name.equals(last, ignoreCase = true) } ?: midiFiles.first()
-            selectFile(match, stopPlayback = false)
+            val match = if (last != null) {
+                midiFiles.firstOrNull { songIdOf(it) == last || it.name.equals(last, ignoreCase = true) }
+            } else null
+            selectFile(match ?: midiFiles.first(), stopPlayback = false)
         }
+
+        updatePlaylistButton()
 
         if (::songListWidget.isInitialized) {
             songListWidget.setFiles(displayedFiles, selectedFile)
         }
-        logger.info("refreshFiles: found ${midiFiles.size} files in ${midisDir.absolutePath}")
+        logger.info("refreshFiles: found ${midiFiles.size} files in ${midisDir.absolutePath}, playlist='$selectedPlaylist'")
     }
 
     private fun updateOrganInfo() {
@@ -626,7 +696,7 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
 
     /** Library file for a song id; a placeholder path when the file is gone so the row still shows. */
     override fun fileForId(id: SongId): File =
-        midiFiles.firstOrNull { songIdOf(it) == id } ?: midisDir.resolve(id)
+        MidiLibrary.fileForId(id)
 
     /** Starts [id] as the next track. Returns false and warns when the file no longer exists. */
     override fun startQueuedSong(id: SongId): Boolean {
@@ -765,10 +835,10 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
         queueUserCount = queue.userQueue.size
         queueContextRemaining = (queue.contextOrder.size - (queue.contextCursor + 1)).coerceAtLeast(0)
         val byId = midiFiles.associateBy { songIdOf(it) }
-        nextUpTitle = rows.firstOrNull()?.let { (byId[it.id] ?: midisDir.resolve(it.id)).nameWithoutExtension }
+        nextUpTitle = rows.firstOrNull()?.let { (byId[it.id] ?: MidiLibrary.fileForId(it.id)).nameWithoutExtension }
         if (::queueListWidget.isInitialized) {
             queueListWidget.setQueue(
-                rows.mapIndexed { index, row -> QueueItem(index, row, byId[row.id] ?: midisDir.resolve(row.id)) }
+                rows.mapIndexed { index, row -> QueueItem(index, row, byId[row.id] ?: MidiLibrary.fileForId(row.id)) }
             )
         }
     }
@@ -1020,7 +1090,8 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
     private fun selectFile(file: File, stopPlayback: Boolean = false) {
         SongAudioPreviewer.stopPreview()
         selectedFile = file
-        selectedIndex = midiFiles.indexOfFirst { it.name.equals(file.name, ignoreCase = true) }
+        val fileId = songIdOf(file)
+        selectedIndex = midiFiles.indexOfFirst { songIdOf(it) == fileId }
         if (::songListWidget.isInitialized && songListWidget.getSelectedFile() != file) {
             songListWidget.setFiles(displayedFiles, selectedFile)
         }
@@ -1463,12 +1534,17 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
     override fun onFilesDrop(files: List<Path>) {
         var imported = 0
         var lastFile: File? = null
+        val targetDir = if (selectedPlaylist.isNotEmpty()) {
+            MidiLibrary.root.resolve(selectedPlaylist).also { it.mkdirs() }
+        } else {
+            MidiLibrary.root
+        }
         for (path in files) {
             val file = path.toFile()
             val ext = file.extension.lowercase()
             if (ext in listOf("mid", "midi", "nbs")) {
                 try {
-                    val dest = midisDir.resolve(file.name)
+                    val dest = targetDir.resolve(file.name)
                     file.copyTo(dest, overwrite = true)
                     imported++
                     lastFile = dest
@@ -1480,11 +1556,20 @@ class MainScreen(private val parent: Screen? = null, initialTab: Int = 0) : Scre
         if (imported > 0) {
             refreshFiles()
             lastFile?.let { selectFile(it) }
-            chat("Imported $imported track(s) from drag-and-drop")
-            logger.info("onFilesDrop: imported $imported files, selected ${lastFile?.name}")
+            val destName = if (selectedPlaylist.isEmpty()) "library root" else "'$selectedPlaylist'"
+            chat("Imported $imported track(s) into $destName")
+            logger.info("onFilesDrop: imported $imported files into $destName, selected ${lastFile?.name}")
         } else {
             chatWarn("Dropped files must be .mid or .nbs")
         }
+    }
+
+    override fun mouseScrolled(mouseX: Double, mouseY: Double, horizontalAmount: Double, verticalAmount: Double): Boolean {
+        if (activeTab == 0 && playlistButton?.isMouseOver(mouseX, mouseY) == true) {
+            cyclePlaylist(verticalAmount < 0)
+            return true
+        }
+        return super.mouseScrolled(mouseX, mouseY, horizontalAmount, verticalAmount)
     }
 
     override fun mouseClicked(event: MouseButtonEvent, doubleClick: Boolean): Boolean {

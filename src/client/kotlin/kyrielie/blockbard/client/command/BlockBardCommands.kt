@@ -34,27 +34,13 @@ object BlockBardCommands {
 
     private val logger = LoggerFactory.getLogger("BlockBard/Commands")
 
-    private val midisDir: File by lazy {
-        FabricLoader.getInstance().configDir.resolve("blockbard/midis").toFile().also {
-            if (!it.exists()) it.mkdirs()
-        }
-    }
-
     private fun getAvailableSongFiles(): List<File> =
-        midisDir.listFiles()
-            ?.filter { it.isFile && (it.extension.equals("mid", true) || it.extension.equals("midi", true) || it.extension.equals("nbs", true)) }
-            ?.sortedBy { it.name.lowercase() }
-            ?: emptyList()
+        kyrielie.blockbard.client.library.MidiLibrary.files.ifEmpty {
+            kyrielie.blockbard.client.library.MidiLibrary.scan().files
+        }
 
-    private fun findSongFile(name: String): File? {
-        val files = getAvailableSongFiles()
-        // Exact name match
-        files.firstOrNull { it.name.equals(name, ignoreCase = true) }?.let { return it }
-        // Match without extension
-        files.firstOrNull { it.nameWithoutExtension.equals(name, ignoreCase = true) }?.let { return it }
-        // Contains match
-        return files.firstOrNull { it.name.contains(name, ignoreCase = true) }
-    }
+    private fun findSongFile(name: String): File? =
+        kyrielie.blockbard.client.library.MidiLibrary.findSongFile(name)
 
     fun register() {
         ClientCommandRegistrationCallback.EVENT.register { dispatcher, _ ->
@@ -179,7 +165,9 @@ object BlockBardCommands {
             root.then(ClientCommands.literal("play")
                 .then(ClientCommands.argument("song", StringArgumentType.greedyString())
                     .suggests { _, builder ->
-                        SharedSuggestionProvider.suggest(getAvailableSongFiles().map { it.name }, builder)
+                        val ids = kyrielie.blockbard.client.library.MidiLibrary.songs.map { it.id }
+                        val names = getAvailableSongFiles().map { it.name }
+                        SharedSuggestionProvider.suggest((ids + names).distinct(), builder)
                     }
                     .executes { ctx ->
                         val songName = StringArgumentType.getString(ctx, "song")

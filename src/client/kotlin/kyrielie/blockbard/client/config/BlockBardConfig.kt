@@ -1,5 +1,7 @@
 package kyrielie.blockbard.client.config
 
+import kyrielie.blockbard.library.ScannedSong
+import kyrielie.blockbard.library.SongIdMigration
 import kyrielie.blockbard.organ.ShiftMode
 import kyrielie.blockbard.playback.LoopSettings
 import kyrielie.blockbard.playback.RepeatMode
@@ -71,6 +73,7 @@ data class BlockBardConfig(
     // Favorites & filter state
     var favorites: MutableList<String> = mutableListOf(),
     var activeFilter: String = "ALL", // ALL, FAVORITES, MIDI, NBS
+    var selectedPlaylist: String = "", // "" for All, or relative folder path (e.g. "classical")
     // Dynamic on-the-fly retuning
     var dynamicRetuning: Boolean = false,
     var dynamicRetuningMaxClicks: Int = 2,
@@ -79,16 +82,40 @@ data class BlockBardConfig(
     // Send feedback to chat (false = only in debug buffer & logs)
     var enableChatFeedback: Boolean = false
 ) {
-    fun isFavorite(fileName: String): Boolean = favorites.contains(fileName)
+    fun isFavorite(id: String): Boolean =
+        favorites.contains(id) || favorites.contains(id.substringAfterLast('/'))
 
-    fun toggleFavorite(fileName: String): Boolean {
-        return if (favorites.contains(fileName)) {
-            favorites.remove(fileName)
+    fun toggleFavorite(id: String): Boolean {
+        val bare = id.substringAfterLast('/')
+        val isFav = favorites.contains(id) || favorites.contains(bare)
+        return if (isFav) {
+            favorites.remove(id)
+            favorites.remove(bare)
             false
         } else {
-            favorites.add(fileName)
+            favorites.add(id)
             true
         }
+    }
+
+    /**
+     * Idempotently migrates [favorites] and [lastPlayedTrack] from legacy bare filenames
+     * to relative paths based on scanned library songs.
+     * Returns true if any value was updated.
+     */
+    fun migrateSongIds(scannedSongs: List<ScannedSong>): Boolean {
+        var changed = false
+        val newFavorites = SongIdMigration.migrateIds(favorites, scannedSongs)
+        if (newFavorites != favorites) {
+            favorites = newFavorites.toMutableList()
+            changed = true
+        }
+        val newLastPlayed = SongIdMigration.migrateId(lastPlayedTrack, scannedSongs)
+        if (newLastPlayed != lastPlayedTrack) {
+            lastPlayedTrack = newLastPlayed
+            changed = true
+        }
+        return changed
     }
     fun shiftModeEnum(): ShiftMode = try {
         ShiftMode.valueOf(shiftMode)

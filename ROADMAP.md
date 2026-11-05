@@ -1,8 +1,8 @@
 # BlockBard Architecture & Development Roadmap
 
 **Minecraft Version**: 26.3 (Fabric Loader 0.19.5, Fabric Language Kotlin 2.4.0, Java 25)  
-**Last Updated**: November 2026 (Pass 15 & Pass 23 completed)  
-**Test Suite**: 68 tests passing (`./gradlew test --no-daemon`)
+**Last Updated**: November 2026 (Pass 15, Pass 16, Pass 17 & Pass 23 completed)  
+**Test Suite**: 83 tests passing (`./gradlew test --no-daemon`)
 
 ---
 
@@ -97,9 +97,9 @@ graph TD
 | **P13** | `queue-ui` | Queue row actions (Next, Last, Move to Top, Promote) | **DONE** | GUI functional |
 | **P14** | `coordinator-p1` | `PlaybackCoordinator` extracted; closed-screen auto-advance; `/bb play` tuner gate | **DONE** | Integrated in client tick |
 | **P15** | `tuner-extraction` | Extracted `TuningController.kt`; decoupled screen from tuner; `CoverageMessage`; fixed `ArpeggioScheduler` voice pool bounds | **DONE** | All 68 tests passing |
-| **P16** | `library-scanner` | Consolidate `midisDir`; implement `LibraryScanner` with cycle detection; "Open Folder" button | **NEXT** | Unit tests for scanner |
-| **P17** | `folder-playlists` | Folder playlists, relative path `SongId`, playlist cycle button, ID migration | **PLANNED** | Migration & scanner tests |
-| **P18** | `tuner-telemetry` | Per-run diagnostic log line; query live `player.blockInteractionRange()` | **PLANNED** | Log output inspection |
+| **P16** | `library-scanner` | Consolidate `midisDir`; implement `LibraryScanner` with cycle detection; "Open Folder" button via `Blaze3D.openPath` | **DONE** | 8 unit tests in `LibraryScannerTest` (75 total passing) |
+| **P17** | `folder-playlists` | Folder playlists, relative path `SongId`, playlist cycle button, ID migration | **DONE** | Migration & scanner tests (83 passing) |
+| **P18** | `tuner-telemetry` | Per-run diagnostic log line; query live `player.blockInteractionRange()` | **NEXT** | Log output inspection |
 | **P19** | `tuner-resilience` | Per-block fail isolation; `DONE_PARTIAL` playback; dynamic reach limit (+0.5 creative) | **PLANNED** | Unit / simulation tests |
 | **P20** | `min-cost-mapper` | Hungarian algorithm (bipartite matching) for note block tuning with note usage weights | **PLANNED** | Optimality unit tests |
 | **P21** | `aim-sweeping` | Sort tune targets by angular proximity (yaw sweep) to reduce player head whipping | **PLANNED** | `AimOrderingTest` |

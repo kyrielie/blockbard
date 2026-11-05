@@ -1,6 +1,7 @@
 package kyrielie.blockbard.client.gui
 
 import kyrielie.blockbard.client.config.ConfigManager
+import kyrielie.blockbard.client.library.MidiLibrary
 import kyrielie.blockbard.client.playback.SongMetadataCache
 import net.minecraft.client.Minecraft
 import net.minecraft.client.gui.GuiGraphicsExtractor
@@ -46,7 +47,7 @@ class SongListWidget(
             for (file in files) {
                 val entry = SongEntry(file)
                 addEntry(entry)
-                if (file == currentSelected || file.name.equals(currentSelected?.name, ignoreCase = true)) {
+                if (file == currentSelected || (currentSelected != null && MidiLibrary.idForFile(file) == MidiLibrary.idForFile(currentSelected))) {
                     selectedEntry = entry
                 }
             }
@@ -97,7 +98,7 @@ class SongListWidget(
             }
 
             // Star icon
-            val isFav = ConfigManager.config.isFavorite(file.name)
+            val isFav = ConfigManager.config.isFavorite(MidiLibrary.idForFile(file))
             val star = if (isFav) "★" else "☆"
             val starColor = if (isFav) opaque(0xFFFF55) else opaque(0x777777)
             graphics.text(font, star, x + 4, y + 2, starColor)
@@ -135,7 +136,9 @@ class SongListWidget(
                 lastHovered -> "Last: add this to the end of your queue"
                 else -> null
             }
-            val subtext = hint ?: meta?.summaryString ?: "Analyzing..."
+            val relFolder = MidiLibrary.idForFile(file).substringBeforeLast('/', "")
+            val folderPrefix = if (relFolder.isNotEmpty()) "📁 $relFolder  ·  " else ""
+            val subtext = hint ?: (folderPrefix + (meta?.summaryString ?: "Analyzing..."))
             val subtextColor = when {
                 hint != null -> opaque(0x88DD88)
                 meta != null -> opaque(0xAAAAAA)

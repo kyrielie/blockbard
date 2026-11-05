@@ -521,7 +521,7 @@ and remains unchanged.
 
 Pure model of what plays next. `MainScreen` drives it through `client/playback/ClientPlayQueue.kt`,
 which holds the one live instance (it outlives the screen) and `songIdOf(File)`, the single
-file-to-`SongId` mapping (the file name until the folder-playlist pass). Only the client thread may touch an instance.
+file-to-`SongId` mapping (normalized forward-slash relative path within the library). Only the client thread may touch an instance.
 
 Concepts: a **context** (the song ids of the selected playlist, in caller-supplied order),
 an **order** (that list, or a stored shuffle permutation), a **cursor** (index of the last

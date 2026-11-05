@@ -1,15 +1,15 @@
 package kyrielie.blockbard.client.playback
 
 import kyrielie.blockbard.client.config.BlockBardConfig
+import kyrielie.blockbard.client.library.MidiLibrary
 import kyrielie.blockbard.playback.PlayQueue
 import kyrielie.blockbard.playback.SongId
 import java.io.File
 
 /**
- * Maps a library file to its [SongId]. The single mapping point: until the folder-playlist pass
- * the id is the file name.
+ * Maps a library file to its [SongId]. Normalized forward-slash relative path within the library.
  */
-fun songIdOf(file: File): SongId = file.name
+fun songIdOf(file: File): SongId = MidiLibrary.idForFile(file)
 
 /**
  * The one live [PlayQueue] for the client session. It outlives [kyrielie.blockbard.client.gui.MainScreen],
